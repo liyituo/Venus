@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PC Agent Daemon — 控制台</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2128; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e;
+    --idle: #22c55e; --busy: #f59e0b; --stopped: #ef4444; --offline: #6b7280;
+    --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 14px; min-height: 100vh;
+  }
+
+  /* ---------- 顶部状态栏 ---------- */
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { font-size: 16px; font-weight: 700; letter-spacing: .5px; white-space: nowrap; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 14px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel2);
+    font-weight: 700; font-size: 13px; min-width: 96px; justify-content: center;
+  }
+  .status-badge .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--offline); }
+  .status-badge.idle    .dot { background: var(--idle); box-shadow: 0 0 8px var(--idle); }
+  .status-badge.busy    .dot { background: var(--busy); box-shadow: 0 0 8px var(--busy); animation: pulse 1s infinite; }
+  .status-badge.stopped .dot { background: var(--stopped); box-shadow: 0 0 8px var(--stopped); animation: pulse .6s infinite; }
+  .status-badge.offline .dot { background: var(--offline); }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  .spacer { flex: 1; }
+  button {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 14px; cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: filter .15s, transform .05s;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.25); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.danger {
+    background: var(--stopped); border-color: var(--stopped); color: #fff;
+    font-size: 15px; padding: 8px 22px; letter-spacing: 1px;
+  }
+  button.danger:disabled { background: #7f1d1d; border-color: #7f1d1d; }
+  button.reset { border-color: #16a34a; color: #4ade80; }
+  label.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; user-select: none; }
+
+  /* ---------- 主体布局 ---------- */
+  main { display: flex; gap: 14px; padding: 14px; align-items: flex-start; }
+  #screenWrap {
+    flex: 1; position: relative; background: #000;
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 480px;
+  }
+  #screen {
+    max-width: 100%; max-height: calc(100vh - 130px);
+    cursor: crosshair; user-select: none; display: block;
+  }
+  #screen:not([src]) { visibility: hidden; }
+  #loading {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.55); color: var(--muted); font-size: 15px; letter-spacing: 1px;
+    z-index: 2;
+  }
+  #loading.hidden { display: none; }
+  .spinner {
+    width: 22px; height: 22px; margin-right: 10px; border-radius: 50%;
+    border: 3px solid var(--border); border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #hint {
+    position: absolute; left: 12px; bottom: 10px; z-index: 3;
+    background: rgba(13,17,23,.75); border: 1px solid var(--border);
+    color: var(--muted); font-size: 12px; padding: 5px 10px; border-radius: 6px;
+    pointer-events: none;
+  }
+
+  /* ---------- 侧栏 ---------- */
+  aside { width: 300px; display: flex; flex-direction: column; gap: 14px; flex-shrink: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .panel h3 { font-size: 13px; color: var(--muted); margin-bottom: 10px; font-weight: 600; }
+  .kv { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv b { font-weight: 600; }
+  .kv span { color: var(--muted); }
+
+  .field { display: flex; gap: 8px; margin-bottom: 10px; }
+  input[type=text] {
+    flex: 1; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { padding: 4px 10px; font-size: 12px; font-family: Consolas, monospace; }
+  .note { color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 8px; }
+  .note code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+
+  /* ---------- Toast ---------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(20px);
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 18px; font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity .25s, transform .25s; z-index: 99; max-width: 80vw;
+  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  #toast.ok   { border-color: var(--idle); color: #86efac; }
+  #toast.err  { border-color: var(--stopped); color: #fca5a5; }
+
+  @media (max-width: 900px) { main { flex-direction: column; } aside { width: 100%; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">🖥️ PC Agent Daemon <small>网页控制电脑</small></div>
+  <div class="status-badge offline" id="badge"><span class="dot"></span><span id="badgeText">Offline</span></div>
+  <div class="spacer"></div>
+  <label class="check"><input type="checkbox" id="autoRefresh" checked> 自动刷新</label>
+  <button id="btnRefresh">刷新画面</button>
+  <button class="reset" id="btnReset">恢复 (Reset)</button>
+  <button class="danger" id="btnStop">紧急止停 (STOP)</button>
+</header>
+
+<main>
+  <div id="screenWrap">
+    <img id="screen" alt="PC 屏幕画面" draggable="false">
+    <div id="loading"><span class="spinner"></span>正在获取屏幕…</div>
+    <div id="hint">点击画面 = 在对应位置点击电脑 · 可用 <b>Ctrl+Alt+Shift+X</b> 热键紧急止停</div>
+  </div>
+
+  <aside>
+    <div class="panel">
+      <h3>Daemon 状态</h3>
+      <div class="kv"><b>状态模式</b><span id="infoMode">—</span></div>
+      <div class="kv"><b>排队任务</b><span id="infoQueued">—</span></div>
+      <div class="kv"><b>屏幕分辨率</b><span id="infoScreen">—</span></div>
+      <div class="kv"><b>最近动作</b><span id="infoLast">—</span></div>
+      <div class="kv"><b>运行时长</b><span id="infoUptime">—</span></div>
+      <div class="kv"><b>FAILSAFE</b><span>已启用（甩鼠标到屏幕角落）</span></div>
+    </div>
+
+    <div class="panel">
+      <h3>命令面板</h3>
+      <div class="field">
+        <input type="text" id="inputText" placeholder="输入文字（换行自动按 Enter）" autocomplete="off">
+        <button id="btnType">输入</button>
+      </div>
+      <div class="field">
+        <input type="text" id="inputKey" placeholder="按键，如 enter / ctrl+c" autocomplete="off">
+        <button id="btnKey">按键</button>
+      </div>
+      <div class="chips">
+        <button class="chip" data-key="enter">Enter</button>
+        <button class="chip" data-key="esc">Esc</button>
+        <button class="chip" data-key="tab">Tab</button>
+        <button class="chip" data-key="space">Space</button>
+        <button class="chip" data-key="ctrl+c">Ctrl+C</button>
+        <button class="chip" data-key="ctrl+v">Ctrl+V</button>
+        <button class="chip" data-key="ctrl+a">Ctrl+A</button>
+        <button class="chip" data-key="alt+tab">Alt+Tab</button>
+      </div>
+      <label class="check" style="margin-top:6px"><input type="checkbox" id="dblClick"> 画面点击使用双击</label>
+    </div>
+  </aside>
+</main>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const screenImg = $('screen');
+let localBusy = false;      // 前端提交动作期间的本地忙标记
+let toastTimer = null;
+
+/* ---------------- API ---------------- */
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+function sendAction(payload, silent = false) {
+  localBusy = true;
+  api('/api/v1/execute', { method: 'POST', body: JSON.stringify(payload) })
+    .then((r) => {
+      if (!silent) {
+        const pos = r.position ? ` @ (${r.position.join(', ')})` : '';
+        toast(`✓ ${r.action} 执行完成${pos}`, 'ok');
+      }
+    })
+    .catch((err) => toast(`✗ 执行失败：${err.message}`, 'err'))
+    .finally(() => {
+      localBusy = false;
+      refreshScreen();
+      pollStatus();
+    });
+}
+
+/* ---------------- 屏幕画面 ---------------- */
+function refreshScreen() {
+  const url = `/api/v1/screenshot?t=${Date.now()}`;
+  $('loading').classList.remove('hidden');
+  const preload = new Image();
+  preload.onload = () => {
+    screenImg.src = url;
+    $('loading').classList.add('hidden');
+    $('infoScreen').textContent = `${preload.naturalWidth} × ${preload.naturalHeight}`;
+  };
+  preload.onerror = () => {
+    $('loading').classList.add('hidden');
+    toast('✗ 截图获取失败（Daemon 未运行？）', 'err');
+  };
+  preload.src = url;
+}
+
+// 点击画面 → 计算屏幕绝对坐标 → 发送 click 指令（Daemon 忙时自动排队）
+screenImg.addEventListener('click', (e) => {
+  if (!screenImg.naturalWidth) return;
+  const rect = screenImg.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  // 画面被等比缩放：按自然尺寸/显示尺寸换算回真实屏幕坐标
+  const x = Math.round(px * screenImg.naturalWidth / screenImg.clientWidth);
+  const y = Math.round(py * screenImg.naturalHeight / screenImg.clientHeight);
+  if (x < 0 || y < 0 || x >= screenImg.naturalWidth || y >= screenImg.naturalHeight) return;
+  const waitMsg = localBusy ? '（Daemon 忙，已自动排队）' : '';
+  toast(`点击屏幕 (${x}, ${y})${waitMsg}…`, 'ok');
+  sendAction({ action: 'click', x, y, clicks: $('dblClick').checked ? 2 : 1 }, true);
+});
+
+/* ---------------- 状态轮询 ---------------- */
+const MODE_INFO = {
+  idle:    'Idle（空闲）',
+  busy:    'Busy（执行中）',
+  stopped: 'Stopped（已止停）',
+  offline: 'Offline（离线）',
+};
+
+function setBadge(mode) {
+  const badge = $('badge');
+  badge.className = `status-badge ${mode}`;
+  // Busy 时附加当前动作与排队数
+  if (mode === 'busy' && lastStatus) {
+    let t = 'Busy（执行中';
+    if (lastStatus.current_action) t += ` · ${lastStatus.current_action}`;
+    if (lastStatus.queued) t += ` · 排队${lastStatus.queued}`;
+    $('badgeText').textContent = t + '）';
+  } else {
+    $('badgeText').textContent = MODE_INFO[mode] || mode;
+  }
+  $('infoMode').textContent = MODE_INFO[mode] || mode;
+  $('btnStop').disabled = (mode === 'stopped');
+  $('btnReset').disabled = (mode !== 'stopped');
+}
+
+let lastStatus = null;
+async function pollStatus() {
+  try {
+    lastStatus = await api('/api/v1/status');
+    setBadge(lastStatus.mode);
+    $('infoQueued').textContent = lastStatus.queued ?? '—';
+    $('infoScreen').textContent = `${lastStatus.screen_size.width} × ${lastStatus.screen_size.height}`;
+    $('infoLast').textContent = lastStatus.last_action
+      ? `${lastStatus.last_action} @ ${new Date(lastStatus.last_action_at * 1000).toLocaleTimeString('zh-CN')}`
+      : '—';
+    $('infoUptime').textContent = `${lastStatus.uptime}s`;
+  } catch {
+    lastStatus = null;
+    setBadge('offline');
+  }
+}
+
+/* ---------------- 止停 / 恢复 ---------------- */
+$('btnStop').addEventListener('click', async () => {
+  if (!confirm('确认紧急止停？将拒绝所有后续指令，直到点击"恢复"。')) return;
+  try {
+    const r = await api('/api/v1/stop', { method: 'POST' });
+    toast(`⛔ 已紧急止停（取消排队任务 ${r.canceled_pending} 个）`, 'err');
+  } catch (err) {
+    toast(`✗ ${err.message}`, 'err');
+  }
+  pollStatus();
+});
+
+$('btnReset').addEventListener('click', async () => {
+  try {
+    await api('/api/v1/reset', { method: 'POST' });
+    toast('✓ 已恢复正常运行', 'ok');
+  } catch (err) {
+    toast(`✗ ${err.message}`, 'err');
+  }
+  pollStatus();
+});
+
+/* ---------------- 命令面板 ---------------- */
+$('btnRefresh').addEventListener('click', refreshScreen);
+
+$('btnType').addEventListener('click', () => {
+  const text = $('inputText').value;
+  if (!text) return toast('请输入要发送的文字', 'err');
+  sendAction({ action: 'type_text', text });
+});
+
+$('inputText').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btnType').click(); });
+
+$('btnKey').addEventListener('click', () => {
+  const key = $('inputKey').value.trim();
+  if (!key) return toast('请输入按键，如 enter 或 ctrl+c', 'err');
+  sendAction({ action: 'press_key', key });
+});
+
+document.querySelectorAll('.chip').forEach((chip) => {
+  chip.addEventListener('click', () => sendAction({ action: 'press_key', key: chip.dataset.key }));
+});
+
+/* ---------------- Toast ---------------- */
+function toast(msg, kind = 'ok') {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = `show ${kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+/* ---------------- 初始化 ---------------- */
+setInterval(pollStatus, 1500);
+setInterval(() => { if ($('autoRefresh').checked) refreshScreen(); }, 2500);
+// 切回标签页时立即刷新一次（后台标签页的定时器会被浏览器节流）
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && $('autoRefresh').checked) refreshScreen();
+});
+refreshScreen();
+pollStatus();
+</script>
+</body>
+</html>

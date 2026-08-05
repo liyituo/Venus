@@ -1,0 +1,561 @@
+"""
+PC Agent Daemon — 异步解耦的桌面自动化守护进程（骨架）
+
+核心设计
+--------
+1. 异步解耦：PyAutoGUI / pynput 等 GUI 操作是同步阻塞调用，全部经
+   ThreadPoolExecutor(max_workers=1) 单线程池串行执行。事件循环线程上
+   跑一个 worker 协程：从任务队列取指令 → 丢进线程池 → 结果写回对应的
+   Future。FastAPI 主事件循环永不执行阻塞调用，同时 busy / queued 计数
+   精确、止停可以精确取消"排队中"的任务。
+
+2. Kill-Switch 三重保险：
+   - FAILSAFE（物理层）：鼠标甩到屏幕四角，PyAutoGUI 自动抛出
+     FailSafeException，执行中的动作立即中断，并自动进入止停状态；
+   - stop_requested（逻辑层）：POST /api/v1/stop 后所有新指令被拒绝
+     （423 Locked），排队中尚未执行的任务被取消，直到 POST /api/v1/reset；
+   - pynput 全局热键（物理层，可选）：Ctrl+Alt+Shift+X 一键止停。
+
+3. 客户端断连安全：任务的完成由 worker 持有，HTTP 请求断开只影响"等待
+   结果"的协程，不会中断正在执行的 GUI 操作（不会留下半完成的输入状态）。
+
+运行：python app.py            # 或 uvicorn app:app --host 127.0.0.1 --port 8000
+API 文档：http://127.0.0.1:8000/docs
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import logging
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
+
+import pyautogui
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------------
+# 全局配置
+# --------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+# Kill-Switch #1：开启 FAILSAFE —— 鼠标移到屏幕任意角落即触发异常终止
+# 注：pyautogui 在 Windows 导入时已自动调用 SetProcessDPIAware()，
+#     因此 size()/screenshot() 均以物理像素为坐标基准，与前端映射一致。
+pyautogui.FAILSAFE = True
+# 每个 PyAutoGUI 动作之间的最小停顿，避免动作过快失控
+pyautogui.PAUSE = 0.05
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("agent-daemon")
+
+# --------------------------------------------------------------------------
+# 数据模型
+# --------------------------------------------------------------------------
+ActionType = Literal["click", "type_text", "press_key", "screenshot"]
+MouseButton = Literal["left", "right", "middle"]
+
+
+class ActionRequest(BaseModel):
+    """POST /api/v1/execute 请求体"""
+
+    action: ActionType
+    x: int | None = Field(default=None, ge=0, description="click 的屏幕绝对横坐标")
+    y: int | None = Field(default=None, ge=0, description="click 的屏幕绝对纵坐标")
+    text: str | None = Field(default=None, description="type_text 要输入的文字")
+    key: str | list[str] | None = Field(
+        default=None,
+        description="press_key 的按键，如 'enter'；组合键用 '+' 如 'ctrl+c'，或按键列表",
+    )
+    clicks: int = Field(default=1, ge=1, le=3, description="click 次数（1=单击 2=双击）")
+    button: MouseButton = Field(default="left", description="left / right / middle")
+
+
+class FailsafeTriggered(Exception):
+    """PyAutoGUI FAILSAFE 已触发（鼠标进入屏幕角落）。"""
+
+
+# --------------------------------------------------------------------------
+# DaemonState：任务队列 + 单线程 GUI 执行池 + Kill-Switch 状态
+# --------------------------------------------------------------------------
+class DaemonState:
+    """守护进程全局状态。
+
+    线程模型
+    --------
+    - _queue：worker 协程与 submit() 都在事件循环线程操作，但 stop 的
+      排空逻辑可能被 call_soon_threadsafe 从其它线程调度进来，故用
+      _qlock 保护（所有操作都是微秒级的短临界区）；
+    - _stop_requested：pynput 热键回调 / FAILSAFE 来自任意线程，用 _lock；
+    - _current / _last_action：只在事件循环线程读写（worker 是协程）。
+
+    任务生命周期：submit() 入队 → worker 取队头 → run_in_executor 丢进
+    单线程池执行 → 结果/异常写回 Future → 等待中的 HTTP 请求拿到结果。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._qlock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gui-worker")
+        self._queue: deque[tuple[ActionRequest, asyncio.Future]] = deque()
+        self._wakeup = asyncio.Event()
+        self._worker_task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown = False
+        self._stop_requested = False
+        self._current: str | None = None       # 正在执行的动作名
+        self._last_action: str | None = None
+        self._last_action_at: float | None = None
+        self.started_at = time.time()
+
+    # ---------- 生命周期（事件循环线程） ----------
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._worker_task = loop.create_task(self._worker_loop())
+
+    async def stop_worker(self) -> None:
+        self.cancel_queued()               # 先取消排队任务
+        with self._qlock:
+            self._shutdown = True
+        self._wakeup.set()                 # 唤醒 worker 让它退出
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        # 正在执行的 GUI 操作无法强行打断（由 FAILSAFE 兜底），
+        # cancel_futures 只清掉线程池中尚未开始的任务
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _worker_loop(self) -> None:
+        """串行消费任务队列：取一个 → 执行 → 结果写回，绝不并发。"""
+        while True:
+            item = await self._dequeue()
+            if item is None:
+                break
+            req, fut = item
+            self._current = req.action
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    self._executor, self._dispatch, req
+                )
+            except asyncio.CancelledError:
+                # 进程关闭中：让等待方感知取消；线程池里的任务自然继续
+                fut.cancel()
+                raise
+            except BaseException as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+            else:
+                if not fut.done():
+                    fut.set_result(result)
+            finally:
+                self._current = None
+
+    async def _dequeue(self) -> tuple[ActionRequest, asyncio.Future] | None:
+        """取队头任务；shutdown 且队列空时返回 None。"""
+        while True:
+            with self._qlock:
+                if self._queue:
+                    return self._queue.popleft()
+                if self._shutdown:
+                    return None
+                # 清除唤醒信号后必须在同一临界区内复查队列，
+                # 否则会与入队的 set() 形成丢失唤醒竞争
+                self._wakeup.clear()
+                if self._queue:
+                    continue
+            await self._wakeup.wait()
+
+    # ---------- 任务提交 / 止停 ----------
+    def submit(self, req: ActionRequest) -> asyncio.Future:
+        """入队一个动作指令并返回其 Future（调用方 await 它拿结果）。"""
+        fut: asyncio.Future = self._loop.create_future()
+        with self._qlock:
+            self._queue.append((req, fut))
+        self._wakeup.set()
+        return fut
+
+    def request_stop(self) -> None:
+        """设置止停标志；可从任意线程调用（热键回调 / FAILSAFE / API）。"""
+        with self._lock:
+            self._stop_requested = True
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self.cancel_queued)
+
+    def cancel_queued(self) -> int:
+        """取消排队中（尚未开始执行）的任务，返回取消个数。在事件循环线程调用。"""
+        n = 0
+        with self._qlock:
+            items = list(self._queue)
+            self._queue.clear()
+        for _, fut in items:
+            if not fut.done():
+                fut.cancel()
+                n += 1
+        return n
+
+    def request_reset(self) -> None:
+        with self._lock:
+            self._stop_requested = False
+
+    @property
+    def stop_requested(self) -> bool:
+        with self._lock:
+            return self._stop_requested
+
+    # ---------- 状态快照 ----------
+    def snapshot(self) -> dict:
+        with self._qlock:
+            queued = len(self._queue)
+        with self._lock:
+            stopped = self._stop_requested
+            last_action = self._last_action
+            last_action_at = self._last_action_at
+        return {
+            "is_busy": self._current is not None or queued > 0,
+            "queued": queued,
+            "current_action": self._current,
+            "stop_requested": stopped,
+            "last_action": last_action,
+            "last_action_at": last_action_at,
+        }
+
+    # ---------- 线程池中的阻塞执行 ----------
+    async def run_blocking(self, fn: Callable, *args):
+        """把任意阻塞调用提交到 GUI 线程池执行（供截图等非动作类操作使用）。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, fn, *args)
+
+    def _dispatch(self, req: ActionRequest) -> dict:
+        """在 GUI 工作线程内执行阻塞操作（本方法全程不碰事件循环）。"""
+        t0 = time.monotonic()
+        log.info("执行动作: %s", req.model_dump(exclude_none=True))
+        try:
+            try:
+                return HANDLERS[req.action](req)
+            except pyautogui.FailSafeException:
+                # Kill-Switch #1 触发：鼠标已进入屏幕角落
+                self.request_stop()
+                raise FailsafeTriggered() from None
+        finally:
+            with self._lock:
+                self._last_action = req.action
+                self._last_action_at = time.time()
+            log.info("动作完成: %s (%.0fms)", req.action, (time.monotonic() - t0) * 1000)
+
+
+# --------------------------------------------------------------------------
+# 动作处理器（全部在 GUI 工作线程中运行）
+# --------------------------------------------------------------------------
+def _handle_click(req: ActionRequest) -> dict:
+    if req.x is not None or req.y is not None:
+        if req.x is None or req.y is None:
+            raise HTTPException(422, "click 的 x/y 必须成对提供")
+        # 越界防护：坐标来自前端缩放换算，防御异常值
+        if SCREEN_WIDTH and SCREEN_HEIGHT and not (
+            0 <= req.x < SCREEN_WIDTH and 0 <= req.y < SCREEN_HEIGHT
+        ):
+            raise HTTPException(
+                422, f"坐标越界 ({req.x},{req.y})，屏幕范围 {SCREEN_WIDTH}x{SCREEN_HEIGHT}"
+            )
+        pyautogui.click(x=req.x, y=req.y, clicks=req.clicks, button=req.button)
+    else:
+        pyautogui.click(clicks=req.clicks, button=req.button)
+    return {"ok": True, "action": "click", "position": [req.x, req.y], "clicks": req.clicks}
+
+
+def _is_typeable(ch: str) -> bool:
+    """该字符能否被 pyautogui.write() 直接敲出（可打印 ASCII，含大小写）。"""
+    return 32 <= ord(ch) <= 126
+
+
+def _type_runs(text: str) -> list[tuple[str, str]]:
+    """把文本切分为 ('keys', ...) / ('clip', ...) 两种执行段。
+
+    pyautogui.write() 无法输入中文 / emoji 等非 ASCII 字符，
+    这些内容改走剪贴板粘贴；按段合并同类输入，减少剪贴板切换次数。
+    """
+    runs: list[tuple[str, str]] = []
+    buf: list[str] = []
+    for ch in text:
+        if _is_typeable(ch):
+            buf.append(ch)
+        else:
+            if buf:
+                runs.append(("keys", "".join(buf)))
+                buf = []
+            runs.append(("clip", ch))
+    if buf:
+        runs.append(("keys", "".join(buf)))
+    return runs
+
+
+def _paste_via_clipboard(text: str) -> None:
+    """非 ASCII 文本经剪贴板粘贴（ctrl+v），完成后还原用户原剪贴板。"""
+    try:
+        import pyperclip  # pyautogui 的固有依赖
+
+        previous = pyperclip.paste()
+        pyperclip.copy(text)
+        pyautogui.hotkey("ctrl", "v")
+        if previous:
+            pyperclip.copy(previous)
+    except Exception as exc:
+        raise HTTPException(500, f"非 ASCII 文本输入失败（剪贴板不可用）: {exc}") from exc
+
+
+def _handle_type_text(req: ActionRequest) -> dict:
+    if not req.text:
+        raise HTTPException(422, "type_text 需要提供 text 参数")
+    # write() 无法输入换行符：按行拆分，行间以 Enter 键衔接
+    for i, line in enumerate(req.text.split("\n")):
+        if i > 0:
+            pyautogui.press("enter")
+        for kind, content in _type_runs(line):
+            if kind == "keys":
+                pyautogui.write(content, interval=0.02)
+            else:
+                _paste_via_clipboard(content)
+    return {"ok": True, "action": "type_text", "chars": len(req.text)}
+
+
+def _handle_press_key(req: ActionRequest) -> dict:
+    key = req.key
+    if key is None:
+        raise HTTPException(422, "press_key 需要提供 key 参数")
+    if isinstance(key, str) and "+" in key:
+        # 组合键，如 "ctrl+c" / "alt+tab"
+        parts = [k.strip().lower() for k in key.split("+")]
+        _validate_keys(parts)
+        pyautogui.hotkey(*parts)
+    else:
+        keys = [key] if isinstance(key, str) else key
+        _validate_keys(keys)
+        pyautogui.press(*keys)
+    return {"ok": True, "action": "press_key", "key": key}
+
+
+def _validate_keys(keys: list[str]) -> None:
+    for k in keys:
+        if k.lower() not in pyautogui.KEYBOARD_KEYS:
+            raise HTTPException(
+                422,
+                f"未知按键: {k!r}（可用键列表见 pyautogui.KEYBOARD_KEYS）",
+            )
+
+
+def _handle_screenshot(req: ActionRequest) -> dict:
+    img = pyautogui.screenshot()
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    return {
+        "ok": True,
+        "action": "screenshot",
+        "format": "jpeg",
+        "size": [img.width, img.height],
+        "screenshot_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+    }
+
+
+HANDLERS: dict[str, Callable[[ActionRequest], dict]] = {
+    "click": _handle_click,
+    "type_text": _handle_type_text,
+    "press_key": _handle_press_key,
+    "screenshot": _handle_screenshot,
+}
+
+# --------------------------------------------------------------------------
+# 可选：pynput 全局热键（Ctrl+Alt+Shift+X）一键紧急止停
+# --------------------------------------------------------------------------
+def _start_hotkey_listener(state: DaemonState):
+    """注册全局止停热键；pynput 未安装或环境不支持时静默降级。"""
+    try:
+        from pynput import keyboard
+
+        listener = keyboard.GlobalHotKeys({"<ctrl>+<alt>+<shift>+x": state.request_stop})
+        listener.start()
+        log.info("已注册紧急止停热键: Ctrl+Alt+Shift+X")
+        return listener
+    except Exception as exc:  # ImportError / 无桌面会话等
+        log.warning("紧急止停热键不可用（可忽略）: %s", exc)
+        return None
+
+
+# --------------------------------------------------------------------------
+# FastAPI 应用
+# --------------------------------------------------------------------------
+state = DaemonState()
+SCREEN_WIDTH = 0
+SCREEN_HEIGHT = 0
+SCREEN_OK = False       # 启动自检：当前会话能否访问屏幕（截图）
+hotkey_listener = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_OK, hotkey_listener
+    try:
+        SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
+        pyautogui.screenshot()          # 屏幕权限自检（桌面会话可用性）
+        SCREEN_OK = True
+    except Exception as exc:
+        # 无桌面会话（SSH / 服务方式运行）时截图与输入都会失败
+        log.warning("屏幕访问不可用（需在交互式桌面会话中运行）: %s", exc)
+    state.start(asyncio.get_running_loop())
+    log.info(
+        "Daemon 启动 | 屏幕 %dx%d | screen_access=%s | FAILSAFE=%s | GUI 线程池 max_workers=1",
+        SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_OK, pyautogui.FAILSAFE,
+    )
+    hotkey_listener = _start_hotkey_listener(state)
+    yield
+    if hotkey_listener is not None:
+        hotkey_listener.stop()
+    await state.stop_worker()
+    log.info("Daemon 已退出")
+
+
+app = FastAPI(
+    title="PC Agent Daemon",
+    version="0.2.0",
+    description="异步解耦的桌面自动化守护进程：网页控制电脑（点击 / 输入 / 按键 / 截图）",
+    lifespan=lifespan,
+)
+
+# 静态前端控制台
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(BASE_DIR / "static" / "index.html")
+
+
+# --------------------------------------------------------------------------
+# API
+# --------------------------------------------------------------------------
+@app.post("/api/v1/execute", summary="执行动作指令")
+async def execute(req: ActionRequest) -> dict:
+    """执行 click / type_text / press_key / screenshot。
+
+    止停状态下直接拒绝（423）；动作经队列在后台单线程池串行执行，
+    本接口等待结果但不阻塞事件循环。
+    """
+    if state.stop_requested:
+        raise HTTPException(
+            status_code=423,
+            detail="Daemon 处于止停状态，拒绝新指令；请先调用 POST /api/v1/reset",
+        )
+    fut = state.submit(req)
+    try:
+        return await fut
+    except FailsafeTriggered:
+        raise HTTPException(
+            status_code=409,
+            detail="PyAutoGUI FAILSAFE 触发（鼠标进入屏幕角落），已自动进入止停状态",
+        ) from None
+    except asyncio.CancelledError:
+        if fut.cancelled():
+            # 止停取消了排队中的任务
+            raise HTTPException(status_code=409, detail="任务已被紧急止停取消") from None
+        raise  # 客户端断开：任务继续在后台执行，不产生半完成的输入状态
+    except HTTPException:
+        raise
+    except Exception as exc:  # 工作线程内的未知异常兜底
+        log.exception("动作执行失败")
+        raise HTTPException(status_code=500, detail=f"动作执行失败: {exc}") from exc
+
+
+@app.get("/api/v1/status", summary="Daemon 状态")
+async def get_status() -> dict:
+    snap = state.snapshot()
+    mode = "stopped" if snap["stop_requested"] else ("busy" if snap["is_busy"] else "idle")
+    return {
+        "ok": True,
+        "daemon": "running",
+        "mode": mode,
+        "is_busy": snap["is_busy"],
+        "queued": snap["queued"],                      # 排队中尚未执行的任务数
+        "current_action": snap["current_action"],      # 正在执行的动作名
+        "stop_requested": snap["stop_requested"],
+        "screen_size": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
+        "screen_access": SCREEN_OK,            # 当前会话能否访问屏幕（截图/输入）
+        "fail_safe": pyautogui.FAILSAFE,
+        "last_action": snap["last_action"],
+        "last_action_at": snap["last_action_at"],
+        "uptime": round(time.time() - state.started_at, 1),
+    }
+
+
+@app.post("/api/v1/stop", summary="紧急止停")
+async def stop_daemon() -> dict:
+    """紧急止停：设置全局止停标志 + 取消所有排队中的任务。
+
+    正在执行中的动作无法从外部打断——由 FAILSAFE（甩鼠标到角落）
+    或自然结束兜底。
+    """
+    state.request_stop()
+    n = state.cancel_queued()  # 端点就在事件循环线程，直接清队列；
+                               # request_stop 调度的那次排空会是空操作
+    log.warning("紧急止停: 已取消 %d 个排队任务", n)
+    return {
+        "ok": True,
+        "stop_requested": True,
+        "canceled_pending": n,
+        "note": "正在执行的 GUI 操作将自然结束或由 FAILSAFE 终止",
+    }
+
+
+@app.post("/api/v1/reset", summary="恢复正常运行")
+async def reset_daemon() -> dict:
+    state.request_reset()
+    log.info("已恢复正常运行状态")
+    return {"ok": True, "stop_requested": False}
+
+
+@app.get("/api/v1/screenshot", summary="获取屏幕截图（image/jpeg 字节流）")
+async def screenshot() -> Response:
+    """返回当前屏幕的 JPEG 字节流，前端 <img src> 可直接引用。
+
+    截图同样经线程池执行，不阻塞事件循环；止停状态下依然可用（被动观察）。
+    """
+    img = await state.run_blocking(pyautogui.screenshot)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Screen-Width": str(img.width),
+            "X-Screen-Height": str(img.height),
+        },
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="PC Agent Daemon")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="监听地址（保持 127.0.0.1 防止局域网内他人控制）")
+    parser.add_argument("--port", type=int, default=8000, help="监听端口")
+    parser.add_argument("--reload", action="store_true", help="开发模式热重载")
+    args = parser.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="info")
