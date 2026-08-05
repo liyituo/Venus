@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "chat_config.json"
+CONFIG_PATH = BASE_DIR.parent / "chat_config.json"
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # ===== 配色系统 =====
@@ -422,7 +422,7 @@ class ChatApp:
         port = urllib.request.urlparse(self.base_url).port or 8000
         python = self._pick_daemon_python()
         self._log(f"auto-starting Daemon with {Path(python).name} on port {port} ...", "info")
-        self._daemon_err_fh = open(BASE_DIR / "daemon.err.log", "a", encoding="utf-8")
+        self._daemon_err_fh = open(BASE_DIR.parent / "daemon.err.log", "a", encoding="utf-8")
         try:
             proc = subprocess.Popen(
                 [python, str(BASE_DIR / "app.py"), "--port", str(port)],
@@ -442,7 +442,7 @@ class ChatApp:
 
     @staticmethod
     def _pick_daemon_python() -> str:
-        candidates = [sys.executable, str(BASE_DIR / ".venv" / "Scripts" / "python.exe")]
+        candidates = [sys.executable, str(BASE_DIR.parent / ".venv" / "Scripts" / "python.exe")]
         probe_code = "import importlib.util;print(all(importlib.util.find_spec(m) for m in ('fastapi','pyautogui','uvicorn')))"
         for cand in dict.fromkeys(candidates):
             if not Path(cand).exists():

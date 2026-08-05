@@ -26,25 +26,31 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # 2. 启动 Chat 前端（自动拉起 Daemon）
-python chat.py
-#    或单独启动 Daemon：python app.py
+python src/chat.py
+#    或单独启动 Daemon：python src/app.py
 #    浏览器控制台：http://127.0.0.1:8000  |  API 文档：http://127.0.0.1:8000/docs
 ```
 
 ## 项目结构
 
 ```
-├── app.py               # FastAPI 后端：任务队列 + 单线程池 + Kill-Switch + 5 个 API
-├── llm_server.py        # LLM API 后端：转发到 OpenAI 兼容接口（读取 chat_config.json）
-├── chat.py              # Codex 风格聊天前端（Tkinter，自动拉起 Daemon + LLM 后端）
-├── gui.py               # 屏幕控制面板（测试后端：预览/点击控制/止停，由 Chat 按钮唤起）
-├── mock_llm.py          # 本地 mock OpenAI 接口（无真实 Key 时验证全链路）
-├── 一键启动控制台.bat    # 双击即用：自动初始化 venv + 无窗口启动 Chat
-├── 启动Daemon.bat        # （可选）后台常驻 Daemon，日志写 daemon.log
-├── 停止Daemon.bat        # 按 8000 端口停止 Daemon
+├── src/                 # 源代码
+│   ├── app.py           # FastAPI 屏幕控制 daemon（任务队列/单线程池/Kill-Switch）
+│   ├── llm_server.py    # LLM API 后端（OpenAI 兼容转发/工具循环/压缩/统计/配置热更新）
+│   ├── cli.py           # CLI 客户端（Linux/WSL 终端，零依赖）
+│   ├── chat.py          # Chat 聊天前端（Tkinter，Codex 风格）
+│   ├── gui.py           # 屏幕控制面板（Tkinter）
+│   └── mock_llm.py      # 本地 mock OpenAI 接口（无真实 Key 时验证全链路）
 ├── static/
 │   └── index.html       # Web 控制台（单文件 HTML + CSS + JS，无构建步骤）
-├── smoke_test.py        # 打桩冒烟测试（不产生真实鼠标/键盘动作）
+├── scripts/             # 启动脚本
+│   ├── 一键启动控制台.bat
+│   ├── 启动Daemon.bat
+│   ├── 停止Daemon.bat
+│   └── start_wsl.sh     # WSL 一键启动（隔离模式）
+├── tests/
+│   └── smoke_test.py    # 打桩冒烟测试（不产生真实鼠标/键盘动作）
+├── chat_config.json     # API 配置（含 Key，已 gitignore，不提交）
 ├── requirements.txt
 └── README.md
 ```
@@ -119,8 +125,8 @@ WSL2 默认开启 localhost 转发——**WSL 里用 `localhost` 就能访问 Wi
 
 ```bash
 # Windows 侧（两个终端）
-python llm_server.py --port 8001        # LLM 后端（本机即可，WSL 通过 localhost 访问）
-python app.py                           # 屏幕控制 daemon
+python src/llm_server.py --port 8001        # LLM 后端（本机即可，WSL 通过 localhost 访问）
+python src/app.py                           # 屏幕控制 daemon
 
 # WSL 侧（Debian 13 + Python 3.13 已验证）
 # 复制 cli.py（wsl.conf automount=false 时用 base64 管道传输）：
@@ -135,7 +141,7 @@ wsl -d Debian -- bash -c "cd ~ && python3 cli.py --host localhost --port 8001"
 
 ```
 Linux 虚拟机（只装 Python）
-   │  python cli.py --host <主机IP> --port 8001 --token xxx
+   │  python src/cli.py --host <主机IP> --port 8001 --token xxx
    ▼
 Windows 主机 llm_server.py（:8001，--host 0.0.0.0，--token）
    │  ├─ 调 DeepSeek API（推理 + 工具调用循环）
@@ -146,22 +152,22 @@ Windows 屏幕
 
 **主机端启动（Windows，远程场景）：**
 ```bash
-python llm_server.py --host 0.0.0.0 --port 8001 --token 你的随机token
-python app.py                 # 屏幕控制 daemon（另开终端）
+python src/llm_server.py --host 0.0.0.0 --port 8001 --token 你的随机token
+python src/app.py                 # 屏幕控制 daemon（另开终端）
 # Windows 防火墙放行 8001 端口（专用网络）
 ```
 
 **虚拟机端：**
 ```bash
 # 方式 1：命令行参数（把 cli.py 复制到 VM 即可，无任何依赖）
-python cli.py --host 192.168.1.10 --port 8001 --token 你的随机token
+python src/cli.py --host 192.168.1.10 --port 8001 --token 你的随机token
 
 # 方式 2：保存配置后直接运行
-python cli.py /config host=192.168.1.10 token=你的随机token
-python cli.py
+python src/cli.py /config host=192.168.1.10 token=你的随机token
+python src/cli.py
 
 # 方式 3：单次模式（脚本调用）
-python cli.py --once "打开计算器" --host 192.168.1.10 --token xxx
+python src/cli.py --once "打开计算器" --host 192.168.1.10 --token xxx
 ```
 
 **交互命令：** `/new` 新会话 · `/sessions` 列表 · `/switch N` 切换 · `/clear` 清空 · `/stats` Token 用量与缓存命中率 · `/config` 保存连接配置 · `/quit` 退出；流式输出期间 **Ctrl+C 中止**当前任务。
@@ -234,8 +240,8 @@ Codex 风格的深色交互界面，作为整个 Agent 的主入口，正在向 
 - 与后端解耦：HTTP 请求在后台线程，Tk 主线程永不阻塞
 
 ```bash
-python chat.py                 # 默认 127.0.0.1:8000
-python chat.py --port 9000     # 指定端口
+python src/chat.py                 # 默认 127.0.0.1:8000
+python src/chat.py --port 9000     # 指定端口
 ```
 
 ### API 设置（前端本地保存 + 连接测试）
@@ -309,8 +315,8 @@ base64 -w0 cli.py         | wsl -d Debian -- bash -c "base64 -d > ~/cli.py"
 base64 -w0 chat_config.json | wsl -d Debian -- bash -c "base64 -d > ~/chat_config.json"
 
 # 启动 + 使用
-wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python llm_server.py --port 8001 &"
-wsl -d Debian -- bash -c "cd ~ && .venv/bin/python cli.py --host localhost --port 8001"
+wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python src/llm_server.py --port 8001 &"
+wsl -d Debian -- bash -c "cd ~ && .venv/bin/python src/cli.py --host localhost --port 8001"
 ```
 
 已实测：Agent 对话「创建文件夹 demo/test1」→ 模型自主调 `create_folder` → `~/agent_workspace/demo/test1` 创建成功；尝试 `../escape` 越界路径被模型 + 工具双层拒绝。完整闭环「编写 fib.py → run_code 运行 → list_folder 浏览」一次成功。
@@ -341,12 +347,12 @@ wsl -d Debian -- bash -c "cd ~ && .venv/bin/python cli.py --host localhost --por
 ### 无真实 Key 时本地验证
 
 ```bash
-python mock_llm.py                     # 终端 1：mock OpenAI 接口（:8999，Key 需含 good-key）
+python src/mock_llm.py                     # 终端 1：mock OpenAI 接口（:8999，Key 需含 good-key）
 # 在 Chat 的 Settings 填入：
 #   API URL: http://127.0.0.1:8999/v1/chat/completions
 #   API Key: good-key
 #   Model:   test-model
-python chat.py                         # 终端 2：打开 Chat，直接对话
+python src/chat.py                         # 终端 2：打开 Chat，直接对话
 ```
 
 Tkinter 原生窗口，与后端完全解耦（仅通过 127.0.0.1 HTTP API 通信，后台线程执行网络请求，主线程永不阻塞）：
@@ -355,16 +361,16 @@ Tkinter 原生窗口，与后端完全解耦（仅通过 127.0.0.1 HTTP API 通�
 - **状态徽章**：Idle / Busy（含当前动作与排队数）/ Stopped / 离线；屏幕权限、分辨率、排队数、FAILSAFE 一屏可见；
 - **紧急止停**：红色 STOP 按钮（带确认框）+ 恢复 (Reset)，与热键 Ctrl+Alt+Shift+X 等效；
 - **命令面板**：输入文字（中文自动走剪贴板）、发送按键、常用快捷键；
-- **自动拉起 Daemon**：探测失败时自动启动 `python app.py`（`--no-spawn` 可禁用），日志区实时显示操作结果。
+- **自动拉起 Daemon**：探测失败时自动启动 `python src/app.py`（`--no-spawn` 可禁用），日志区实时显示操作结果。
 
 ```bash
-python gui.py                     # 默认连接/拉起 127.0.0.1:8000
-python gui.py --port 9000         # 指定端口
-python gui.py --no-spawn          # 不自动拉起 Daemon（要求已运行 python app.py）
-python gui.py --smoke             # 自检模式：连接+截图验证后自动退出（退出码 0/1）
+python src/gui.py                     # 默认连接/拉起 127.0.0.1:8000
+python src/gui.py --port 9000         # 指定端口
+python src/gui.py --no-spawn          # 不自动拉起 Daemon（要求已运行 python src/app.py）
+python src/gui.py --smoke             # 自检模式：连接+截图验证后自动退出（退出码 0/1）
 ```
 
-> 依赖装在 `.venv` 里。即使你直接用全局 `python gui.py` 运行，GUI 也会自动选用 `.venv` 的解释器来拉起 Daemon；若 Daemon 启动失败（如端口被占用、依赖缺失），真实原因会直接显示在 GUI 日志区（stderr 写入 `daemon.err.log`），不再静默超时。
+> 依赖装在 `.venv` 里。即使你直接用全局 `python src/gui.py` 运行，GUI 也会自动选用 `.venv` 的解释器来拉起 Daemon；若 Daemon 启动失败（如端口被占用、依赖缺失），真实原因会直接显示在 GUI 日志区（stderr 写入 `daemon.err.log`），不再静默超时。
 
 ## 屏幕权限（Windows）
 
@@ -387,7 +393,7 @@ python gui.py --smoke             # 自检模式：连接+截图验证后自动�
 
 ```bash
 pip install httpx2        # TestClient 依赖（仅测试用）
-python smoke_test.py      # 21 项断言，含并发提交与止停竞态
+python tests/smoke_test.py      # 21 项断言，含并发提交与止停竞态
 ```
 
 ## 安全注意

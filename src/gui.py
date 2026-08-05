@@ -279,7 +279,7 @@ class GuiApp:
         port = urllib.request.urlparse(self.base_url).port or 8000
         python = self._pick_daemon_python()
         self._ui_log(f"未检测到 Daemon，正在用 {Path(python).name} 自动启动 app.py --port {port} …", "info")
-        self._daemon_err_fh = open(BASE_DIR / "daemon.err.log", "a", encoding="utf-8")
+        self._daemon_err_fh = open(BASE_DIR.parent / "daemon.err.log", "a", encoding="utf-8")
         try:
             proc = subprocess.Popen(
                 [python, str(BASE_DIR / "app.py"), "--port", str(port)],
@@ -306,7 +306,7 @@ class GuiApp:
         """
         candidates = [
             sys.executable,
-            str(BASE_DIR / ".venv" / "Scripts" / "python.exe"),
+            str(BASE_DIR.parent / ".venv" / "Scripts" / "python.exe"),
             str(BASE_DIR / "venv" / "Scripts" / "python.exe"),
         ]
         probe_code = ("import importlib.util;"

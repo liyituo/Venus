@@ -437,12 +437,12 @@ app = FastAPI(
 )
 
 # 静态前端控制台
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+app.mount("/static", StaticFiles(directory=BASE_DIR.parent / "static"), name="static")
 
 
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    return FileResponse(BASE_DIR.parent / "static" / "index.html")
 
 
 # --------------------------------------------------------------------------
