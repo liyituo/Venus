@@ -76,11 +76,17 @@ with TestClient(daemon.app) as c:
           c.post("/api/v1/execute", json={"action": "press_key", "key": "ctrl+c"}).status_code == 200)
 
     print("== 6. 真截图（无害）==")
-    r = c.post("/api/v1/execute", json={"action": "screenshot"})
-    check("execute screenshot 200 + base64", r.status_code == 200 and r.json().get("screenshot_base64"))
-    r = c.get("/api/v1/screenshot")
-    check("GET screenshot image/jpeg",
-          r.status_code == 200 and r.headers["content-type"] == "image/jpeg" and len(r.content) > 10000)
+    status = c.get("/api/v1/status").json()
+    has_screen = bool(status.get("screen_access"))
+    if not has_screen:
+        # 无屏幕访问（CI Xvfb / 无显示环境）：跳过真截图用例
+        print("  SKIP  真截图（screen_access=False，虚拟/无显示环境）")
+    else:
+        r = c.post("/api/v1/execute", json={"action": "screenshot"})
+        check("execute screenshot 200 + base64", r.status_code == 200 and r.json().get("screenshot_base64"))
+        r = c.get("/api/v1/screenshot")
+        check("GET screenshot image/jpeg",
+              r.status_code == 200 and r.headers["content-type"] == "image/jpeg" and len(r.content) > 10000)
 
 print("== 7. 中文输入分段逻辑（纯函数）==")
 runs = daemon._type_runs("你好 world！foo bar")
