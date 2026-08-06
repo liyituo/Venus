@@ -8,7 +8,7 @@ export LC_ALL=C.UTF-8
 cd ~
 if ! ss -tln 2>/dev/null | grep -q ':8001'; then
   echo "启动 llm_server（隔离模式）..."
-  nohup .venv/bin/python llm_server.py --port 8001 --isolated > llm_wsl.log 2>&1 &
+  nohup .venv/bin/python src/llm_server.py --port 8001 --isolated > llm_wsl.log 2>&1 &
   sleep 3
 fi
-exec .venv/bin/python cli.py --host localhost --port 8001
+exec .venv/bin/python src/cli.py --host localhost --port 8001
