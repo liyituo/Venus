@@ -17,12 +17,12 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install --quiet fastapi "uvicorn[standard]" pyautogui Pillow pynput httpx python3-xlib
+          pip install --quiet -r requirements.txt httpx python-xlib
 
       - name: 冒烟测试（daemon）
         run: python tests/smoke_test.py
 
-      - name: 编程工具测试（检索/编辑/git/进程/todo/回滚）
+      - name: 编程工具测试（检索/编辑/undo/git/进程/todo/超时）
         run: python tests/llm_tools_test.py
 
       - name: agent 循环端到端（ask+diff/todo/上下文上界）
@@ -30,3 +30,9 @@ jobs:
 
       - name: 会话持久化测试
         run: python tests/session_test.py
+
+      - name: MCP 客户端测试（echo server 全链路）
+        run: python tests/mcp_test.py
+
+      - name: CLI 会话测试（摘要/懒加载/降级）
+        run: python tests/cli_session_test.py
