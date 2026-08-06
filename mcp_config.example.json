@@ -1,12 +1,13 @@
 {
   "servers": {
-    "echo": {
-      "command": "python",
-      "args": ["tests/mcp_echo_server.py"]
+    "github": {
+      "command": "/path/to/github-mcp-server",
+      "args": ["stdio"],
+      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "你的PAT", "GITHUB_PERMISSION": "read-write"}
     },
-    "filesystem": {
+    "chrome": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-fs"]
+      "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"]
     }
   }
 }
