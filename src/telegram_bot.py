@@ -47,6 +47,26 @@ def _proxy_opener(proxy: str):
     return urllib.request.build_opener()
 
 
+def _summarize_result(result: str, ok: bool) -> str:
+    """工具结果 UI 精简：成功显示 stdout 首行；失败只报简短原因，不刷原始 stderr。"""
+    try:
+        d = json.loads(result)
+    except Exception:
+        return (result or "").strip()[:100]
+    if isinstance(d, dict):
+        if ok:
+            out = (d.get("stdout") or "").strip()
+            if out:
+                lines = out.splitlines()
+                return lines[0][:100] + (" …" if len(lines) > 1 else "")
+            return "完成"
+        if d.get("error"):
+            return str(d["error"])[:100]
+        rc = d.get("exit_code")
+        return f"失败（exit {rc}）" if rc is not None else "失败"
+    return (result or "").strip()[:100]
+
+
 class Bot:
     def __init__(self, cfg_path: Path):
         self.cfg_path = cfg_path
@@ -408,7 +428,7 @@ class Bot:
                         try:
                             d = json.loads(payload)
                             mark = "✓" if d.get("ok") else "✗"
-                            state["log"].append(f"  {mark} {(d.get('result') or '')[:100]}")
+                            state["log"].append(f"  {mark} {_summarize_result(d.get('result') or '', d.get('ok'))}")
                         except Exception:
                             pass
                         continue

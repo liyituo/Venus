@@ -439,6 +439,27 @@ def _try_json(text: str) -> dict:
         return {"raw": text}
 
 
+def _summarize_result(result: str, ok: bool) -> str:
+    """工具结果 UI 精简：成功显示 stdout 首行；失败只报简短原因，不刷原始 stderr。
+    仅影响界面显示——完整结果仍由后端回传模型用于修正。"""
+    try:
+        d = json.loads(result)
+    except Exception:
+        return (result or "").strip()[:100]
+    if isinstance(d, dict):
+        if ok:
+            out = (d.get("stdout") or "").strip()
+            if out:
+                lines = out.splitlines()
+                return lines[0][:100] + (" …" if len(lines) > 1 else "")
+            return "完成"
+        if d.get("error"):
+            return str(d["error"])[:100]
+        rc = d.get("exit_code")
+        return f"失败（exit {rc}）" if rc is not None else "失败"
+    return (result or "").strip()[:100]
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -511,8 +532,9 @@ class Cli:
             print(color(f"  ⚙ [{payload.get('name')}] {arg_str} {step_str}", "blue"), flush=True)
         elif kind == "tool_result":
             ok = payload.get("ok")
-            result = (payload.get("result") or "")[:120]
-            print(color(f"    {'✓' if ok else '✗'} {result}", "green" if ok else "red"), flush=True)
+            summary = _summarize_result(payload.get("result") or "", ok)
+            print(color(f"    {'✓' if ok else '✗'} {summary}",
+                        "green" if ok else "red"), flush=True)
         elif kind == "delta":
             self._last_content += payload
             print(payload, end="", flush=True)

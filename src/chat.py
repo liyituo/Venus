@@ -82,6 +82,27 @@ def api_request(base_url: str, method: str, path: str, payload=None,
 
 
 # ===== 配置管理 =====
+def _summarize_result(result: str, ok: bool) -> str:
+    """工具结果 UI 精简：成功显示 stdout 首行；失败只报简短原因，不刷原始 stderr。
+    完整结果仍由后端回传模型，仅影响界面显示。"""
+    try:
+        d = json.loads(result)
+    except Exception:
+        return (result or "").strip()[:100]
+    if isinstance(d, dict):
+        if ok:
+            out = (d.get("stdout") or "").strip()
+            if out:
+                lines = out.splitlines()
+                return lines[0][:100] + (" …" if len(lines) > 1 else "")
+            return "完成"
+        if d.get("error"):
+            return str(d["error"])[:100]
+        rc = d.get("exit_code")
+        return f"失败（exit {rc}）" if rc is not None else "失败"
+    return (result or "").strip()[:100]
+
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
@@ -776,10 +797,11 @@ class ChatApp:
         handle, data = payload
         if handle is not self._stream_handle:
             return
-        result = (data.get("result") or "")[:150]
-        mark = "✓" if data.get("ok") else "✗"
-        self._agent_log.append(f"  {mark} {result}")
-        self._log(f"tool result: {mark} {result}", "ok" if data.get("ok") else "err")
+        ok = bool(data.get("ok"))
+        summary = _summarize_result(data.get("result") or "", ok)
+        mark = "✓" if ok else "✗"
+        self._agent_log.append(f"  {mark} {summary}")
+        self._log(f"tool result: {mark} {summary}", "ok" if ok else "err")
         self._render_agent_log(handle)
 
     def _on_stream_ask(self, payload) -> None:
