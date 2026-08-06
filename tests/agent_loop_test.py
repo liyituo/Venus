@@ -1,4 +1,6 @@
 """agent 循环端到端测试：打桩上游响应，验证 ask(diff) / todo_update / system 注入。
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 SSE 流在后台线程消费；确认请求通过直接操作 _confirm_table 自动应答（TestClient
 单事件循环，流式期间不能并发 POST respond）。

@@ -1423,10 +1423,12 @@ def _safe_float(value, default: float, lo: float, hi: float) -> float:
 
 
 def _agent_tools() -> list[dict]:
-    """按运行模式返回可用工具：隔离模式只保留文件类工具（MCP 外部工具一并排除）。"""
+    """按运行模式返回可用工具：隔离模式只保留文件类工具。
+    MCP 外部工具（如 GitHub）与屏幕无关，隔离模式同样保留。"""
     if ISOLATED:
-        return [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
-    tools = list(AGENT_TOOLS)
+        tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
+    else:
+        tools = list(AGENT_TOOLS)
     mcp = _ensure_mcp()
     if mcp is not None:
         tools.extend(mcp.all_tools())     # MCP server 工具动态并入（mcp_<server>_<tool>）
@@ -1450,8 +1452,11 @@ def _load_mcp_config() -> dict:
 
 
 def _ensure_mcp():
-    """惰性初始化 MCP 管理器（首次访问工具列表时连接各 server）。"""
+    """惰性初始化 MCP 管理器（首次访问工具列表时连接各 server）。
+    PCAGENT_DISABLE_MCP=1 时跳过（测试环境用，避免真实连接外部 server）。"""
     global _mcp_manager
+    if _mcp_manager is None and os.environ.get("PCAGENT_DISABLE_MCP"):
+        return None
     if _mcp_manager is None:
         from mcp_client import McpManager
         _mcp_manager = McpManager(_load_mcp_config())

@@ -1,4 +1,6 @@
 """临时冒烟测试：验证队列架构的 busy/queued 计数、止停取消排队任务、
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 执行中任务自然完成、坐标校验、中文输入分段等。不执行真实鼠标/键盘动作。"""
 import sys
 import threading

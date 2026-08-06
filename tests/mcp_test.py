@@ -64,11 +64,11 @@ all_tools = L._agent_tools()
 names_all = [t["function"]["name"] for t in all_tools]
 check("MCP 工具并入工具集", "mcp_echo_echo" in names_all and len(names_all) > 28, str(len(names_all)))
 
-# 3.2 隔离模式默认禁用 MCP 工具
+# 3.2 隔离模式保留 MCP 工具（外部工具与屏幕无关，GitHub 等 API 类在隔离环境可用）
 L.ISOLATED = True
 iso_names = [t["function"]["name"] for t in L._agent_tools()]
 L.ISOLATED = False
-check("隔离模式排除 MCP 工具", "mcp_echo_echo" not in iso_names, "")
+check("隔离模式保留 MCP 工具", "mcp_echo_echo" in iso_names, "")
 
 # 3.3 _execute_tool 转发
 ok, res = L._execute_tool("mcp_echo_add", json.dumps({"a": 10, "b": 32}))
