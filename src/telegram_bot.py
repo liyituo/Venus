@@ -40,6 +40,7 @@ STREAM_TICK = 1.0        # 流式回复刷新间隔（秒）
 STREAM_TIMEOUT = 600     # 单次 agent 流硬超时（秒）
 COMPRESS_THRESHOLD = 0.6 # 上下文达到窗口 60% 时压缩
 KEEP_RECENT = 8          # 压缩时保留最近 N 条原文
+MAX_LOCAL_MESSAGES = 100 # bot 本地历史上限（内存控制；发送仍受后端 20 条/12 万字符裁剪）
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -396,6 +397,9 @@ class Bot:
             self.load_history(chat_id)
         msgs = self.messages.setdefault(chat_id, [])
         msgs.append({"role": "user", "content": text})
+        # 本地历史上限：只保留最近 MAX_LOCAL_MESSAGES 条（防内存无限增长）
+        if len(msgs) > MAX_LOCAL_MESSAGES:
+            del msgs[:len(msgs) - MAX_LOCAL_MESSAGES]
         self.append_messages(chat_id, [{"role": "user", "content": text}])
 
         # 初始状态

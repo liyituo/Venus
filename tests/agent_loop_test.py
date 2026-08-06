@@ -168,6 +168,31 @@ sys_content = " ".join(m.get("content", "") for m in sys_msgs if m.get("role") =
 check("system 注入任务清单", "当前任务清单" in sys_content and "写单元测试" in sys_content,
       sys_content[-200:])
 
+# ============ 3. 上下文硬上界（防 tokens 激增）============
+print("== 3. _trim_messages 双重上限 ==")
+# 3.1 条数上限：30 条 → 裁到 20 条内
+msgs = [{"role": "system", "content": "s"}] + \
+       [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"} for i in range(30)]
+trimmed = L._trim_messages(msgs)
+check("条数裁剪到 20 条内", len(trimmed) <= 20, str(len(trimmed)))
+check("保留省略提示", any("省略" in (m.get("content") or "") for m in trimmed), "")
+check("保留最近消息", any("m29" in (m.get("content") or "") for m in trimmed), "")
+
+# 3.2 字符硬上限：巨长消息超 12 万字符 → 丢最早
+big = "x" * 150_000
+msgs2 = [{"role": "system", "content": "s"},
+         {"role": "user", "content": big},
+         {"role": "assistant", "content": "recent-ok"}]
+trimmed2 = L._trim_messages(msgs2)
+total = sum(len(m.get("content") or "") for m in trimmed2)
+check("字符硬上限生效", total <= L.MAX_HISTORY_CHARS, f"total={total}")
+check("保留最近消息", any("recent-ok" in (m.get("content") or "") for m in trimmed2), "")
+check("丢弃最早的巨长消息", not any(m.get("content") == big for m in trimmed2), "")
+
+# 3.3 小上下文不受影响
+small = [{"role": "user", "content": "hi"}]
+check("小上下文原样", L._trim_messages(small) == small, "")
+
 # ============ 汇总 ============
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

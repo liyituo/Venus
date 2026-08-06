@@ -177,6 +177,7 @@ SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
 
 # ---- Token 用量优化 ----
 MAX_HISTORY_MESSAGES = 20    # 发送给上游的消息数上限（保留 system + 最近 N 条）
+MAX_HISTORY_CHARS = 120_000  # 发送给上游的总字符硬上限（约 96K tokens，防长消息累积激增）
 MAX_TOOL_RESULT_CHARS = 1500 # 工具结果回传模型的最大长度（超出截断并提示）
 
 # ---- Token 用量统计（缓存命中率）----
@@ -193,15 +194,25 @@ _stats = {
 def _trim_messages(messages: list[dict]) -> list[dict]:
     """控制上下文规模：保留 system + 最近 N 条消息，裁剪早期对话。
 
+    双重上限，保证每轮发送给模型的总量有硬边界（防 tokens 激增）：
+    1. 条数上限 MAX_HISTORY_MESSAGES（20 条）
+    2. 总字符上限 MAX_HISTORY_CHARS（12 万字符，从最早消息开始丢）
+
     注意：仅用于入口请求；agent 工具循环内部的 messages 不能裁剪
     （tool 消息必须紧跟对应的 assistant tool_calls）。
     """
-    if len(messages) <= MAX_HISTORY_MESSAGES:
-        return messages
     system = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
-    keep = MAX_HISTORY_MESSAGES - len(system) - 1   # 预留一条"已省略"提示
-    trimmed = rest[-keep:] if keep > 0 else []
+    if len(rest) <= MAX_HISTORY_MESSAGES - 1:
+        trimmed = rest
+    else:
+        keep = MAX_HISTORY_MESSAGES - len(system) - 1   # 预留一条"已省略"提示
+        trimmed = rest[-keep:] if keep > 0 else []
+    # 字符硬上限：从最早的对话开始丢，直到总字符达标
+    total = sum(len(m.get("content") or "") for m in system + trimmed)
+    while trimmed and total > MAX_HISTORY_CHARS:
+        dropped = trimmed.pop(0)
+        total -= len(dropped.get("content") or "")
     result = system + trimmed
     if len(rest) > len(trimmed):
         result.insert(len(system),

@@ -53,6 +53,9 @@ CODE_FG = "#c9d1d9"
 # 会话首条 system 提示（本地结构发送用；后端只存 user/assistant 消息）
 SYSTEM_FIRST = ("你是一个桌面 Agent 助手，可以控制用户的电脑"
                 "（屏幕点击、输入、按键、截图）。回答尽量简洁、准确。")
+# 发送前上下文压缩（与 cli/bot 对齐：超过窗口 60% 先压缩再发送，防 tokens 激增）
+COMPRESS_THRESHOLD = 0.6
+KEEP_RECENT = 8
 
 
 def api_request(base_url: str, method: str, path: str, payload=None,
@@ -438,6 +441,7 @@ class ChatApp:
                 "llm": self._on_llm_status,
                 "llm_status": self._on_llm_status_result,
                 "sessions": self._on_sessions_loaded,
+                "stream_prep": self._on_stream_prep,
                 "stream_delta": self._on_stream_delta,
                 "stream_done": self._on_stream_done,
                 "stream_error": self._on_stream_error,
@@ -624,6 +628,28 @@ class ChatApp:
                         {"messages": msgs}, timeout=5)
         self._tasks.put(("sess_append", _do))
 
+    def _prepare_stream(self, sess: dict):
+        """后台线程：发送前压缩检查。返回 ("ready"|"compressed", 消息快照)。"""
+        cfg = load_config()
+        window = int(cfg.get("context_window") or 65536)
+        est = sum(len(m.get("content") or "") for m in sess["messages"]) * 0.8
+        if est <= window * COMPRESS_THRESHOLD:
+            return ("ready", list(sess["messages"]))
+        code, data, _ = api_request(self.llm_url, "POST", "/api/v1/compress",
+                                    {"messages": sess["messages"], "keep_recent": KEEP_RECENT},
+                                    timeout=90)
+        if code == 200 and data.get("compressed"):
+            return ("compressed", data.get("messages") or sess["messages"])
+        return ("ready", list(sess["messages"]))
+
+    def _on_stream_prep(self, payload) -> None:
+        """主线程：压缩完成 → 用压缩结果替换本地消息 → 发起流式。"""
+        kind, msgs = payload
+        if kind == "compressed":
+            self._sessions[self._current_sid]["messages"] = msgs
+            self._log("上下文已压缩（发送前，省 tokens）", "ok")
+        self._tasks.put(("stream", lambda: self._do_chat_stream(msgs, self._stream_handle)))
+
     def _tick_status(self) -> None:
         if not self.quit_flag:
             self._tasks.put(("status", lambda: api_request(self.base_url, "GET", "/api/v1/status")))
@@ -651,7 +677,6 @@ class ChatApp:
         sess = self._sessions[self._current_sid]
         sess["history"].append(("user", text))
         sess["messages"].append({"role": "user", "content": text})
-        snapshot = list(sess["messages"])   # 快照，后台线程不碰 UI 状态
         self._append_to_server([{"role": "user", "content": text}])   # 持久化 user 消息
 
         # 流式输出初始化
@@ -663,7 +688,8 @@ class ChatApp:
         # Send → Stop（流式期间可中止）
         self.send_btn.config(state="normal", text="⏹ Stop", bg=STOP,
                              command=self._stop_stream)
-        self._tasks.put(("stream", lambda: self._do_chat_stream(snapshot, self._stream_handle)))
+        # 压缩检查（后台执行，压缩完再发起流式）——每轮发送量有硬边界
+        self._tasks.put(("stream_prep", lambda: self._prepare_stream(sess)))
 
     def _stop_stream(self) -> None:
         """前端中止：关闭 SSE 连接，后端收到断开后停止循环线程。"""
