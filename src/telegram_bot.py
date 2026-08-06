@@ -404,15 +404,18 @@ class Bot:
         time.sleep(0.2)   # 让渲染线程把最后一帧刷上去
 
         if stream_result is None:
-            # 正常完成：持久化 assistant 回复
+            # 正常完成：持久化 assistant 回复（纯工具任务无文本时也留痕，保证历史成对）
             content = state["text"].strip()
-            if content:
-                msgs.append({"role": "assistant", "content": content})
-                self.append_messages(chat_id, [{"role": "assistant", "content": content}])
+            reply = content or "✓ 任务完成"
+            msgs.append({"role": "assistant", "content": reply})
+            self.append_messages(chat_id, [{"role": "assistant", "content": reply}])
             final = self._render_text(state)
             self.edit_message(chat_id, state["msg_id"], final or "✓ 任务完成")
         else:
-            # 错误/中止
+            # 失败/中断：同样留痕，后续「继续任务」时模型能看到上次任务的状态
+            note = f"（上次任务失败或中断：{stream_result[:150]}）"
+            msgs.append({"role": "assistant", "content": note})
+            self.append_messages(chat_id, [{"role": "assistant", "content": note}])
             self.edit_message(chat_id, state["msg_id"], f"⚠ {stream_result}")
 
     def _render_text(self, state: dict) -> str:
