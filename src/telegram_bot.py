@@ -214,6 +214,12 @@ class Bot:
         ids = self.cfg.get("allowed_chat_ids") or []
         return chat_id in ids
 
+    def _is_greeting(self, text: str) -> bool:
+        """纯寒暄/状态询问：直接回复，不走 agent、不调工具、不占历史。"""
+        t = text.strip().rstrip("！!？?。.～~")
+        return t in ("你还在吗", "还在吗", "在吗", "在不在", "在么", "你好", "您好",
+                     "hello", "hi", "hey", "哈喽", "嗨")
+
     def register_owner(self, chat_id: int) -> bool:
         """白名单为空时，第一个 /start 的人成为 owner。"""
         ids = self.cfg.get("allowed_chat_ids") or []
