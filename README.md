@@ -72,6 +72,24 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、撤销修改（`undo` 同样展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令（Windows 上还拦 `format C:`、`rd /s /q`、`diskpart`）；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
 
+## MCP 外部工具
+
+通过 MCP（Model Context Protocol）接入生态工具，配置 `mcp_config.json`（含第三方 token，**已 gitignore 不入库**；示例见 `mcp_config.example.json`）：
+
+```json
+{
+  "servers": {
+    "github": {"command": "/path/to/github-mcp-server", "args": ["stdio"],
+               "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "你的PAT"}},
+    "chrome": {"command": "npx", "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"]}
+  }
+}
+```
+
+- 启动时连接各 server，工具以 `mcp_<server>_<tool>` 命名动态并入（如 `mcp_github_create_issue`），health 可见
+- MCP 工具调用**默认弹确认**（trusted 模式放行 / query 模式拒绝）
+- 官方 GitHub MCP 用 release 二进制（`github-mcp-server stdio`），不要用 npm 上的同名杂牌包
+
 ## 会话与数据
 
 - 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）

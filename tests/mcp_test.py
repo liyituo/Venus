@@ -79,7 +79,6 @@ policy = L._confirm_policy("mcp_echo_add", {"a": 1, "b": 2})
 check("MCP 工具默认确认", policy == "ask", policy)
 policy = L._confirm_policy("mcp_echo_echo", {})
 check("只读 MCP 也确认（保守）", policy == "ask", policy)
-L.CONFIRM_MODES and None
 # trusted 模式放行
 _orig_mode = L._current_confirm_mode
 L._current_confirm_mode = lambda: "trusted"
