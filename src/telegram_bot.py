@@ -38,6 +38,13 @@ CHATS_FILE = BASE_DIR.parent / ".pcagent" / "telegram_chats.json"
 MAX_TEXT = 3800          # Telegram 单消息上限 4096，留余量
 STREAM_TICK = 1.0        # 流式回复刷新间隔（秒）
 STREAM_TIMEOUT = 600     # 单次 agent 流硬超时（秒）
+COMPRESS_THRESHOLD = 0.6 # 上下文达到窗口 60% 时压缩
+KEEP_RECENT = 8          # 压缩时保留最近 N 条原文
+
+
+def estimate_tokens(messages: list[dict]) -> int:
+    """粗略估算（字符 × 0.8，与 cli.py 一致），用于压缩阈值判断。"""
+    return int(sum(len(m.get("content") or "") for m in messages) * 0.8)
 
 
 def _proxy_opener(proxy: str):
@@ -77,6 +84,7 @@ class Bot:
         self.messages: dict[int, list[dict]] = {}          # chat_id -> [user/assistant]
         self.busy: set[int] = set()                        # 正在流式的 chat_id
         self.stream_state: dict[int, dict] = {}            # 流式渲染状态
+        self.context_window = 65536                        # 压缩阈值基准（run 时从 health 更新）
         self._offset = 0
 
     # ------------------------------------------------------------------ 配置
@@ -186,6 +194,21 @@ class Bot:
             return
         self.llm("POST", f"/api/v1/sessions/{sid}/messages", {"messages": msgs}, timeout=8)
 
+    def _maybe_compress(self, chat_id: int, msgs: list[dict]) -> list[dict]:
+        """上下文超过窗口 60% 时调用后端压缩，压缩结果替换本地消息并返回。
+        静默执行：用户看到「◌ 思考中…」期间完成。"""
+        est = estimate_tokens(msgs)
+        if est <= self.context_window * COMPRESS_THRESHOLD:
+            return msgs
+        status, r = self.llm("POST", "/api/v1/compress",
+                             {"messages": msgs, "keep_recent": KEEP_RECENT}, timeout=90)
+        if status == 200 and r.get("compressed"):
+            new_msgs = r.get("messages") or msgs
+            self.messages[chat_id] = new_msgs
+            print(f"[bot] 上下文已压缩（{est} → 估算 {estimate_tokens(new_msgs)} tokens）")
+            return new_msgs
+        return msgs
+
     # ------------------------------------------------------------------ 权限
     def allowed(self, chat_id: int) -> bool:
         ids = self.cfg.get("allowed_chat_ids") or []
@@ -208,6 +231,11 @@ class Bot:
             print("[bot] 提示：国内访问 api.telegram.org 需要代理，可在 telegram_config.json 配 proxy")
             sys.exit(1)
         print(f"[bot] 已连接 @{r['result'].get('username', '?')}，开始轮询…")
+        # 拉取上下文窗口（压缩阈值基准）；失败用默认
+        status, data = self.llm("GET", "/api/v1/health")
+        if status == 200 and data.get("context_window"):
+            self.context_window = int(data["context_window"])
+            print(f"[bot] 上下文窗口: {self.context_window}")
         while True:
             params = {"offset": self._offset, "timeout": 25}
             r = self.api("getUpdates", params, timeout=40)
@@ -338,6 +366,9 @@ class Bot:
         if not sid:
             self.send_message(chat_id, "无法创建会话（llm_server 未运行？）")
             return
+        # 惰性加载：bot 重启后从后端恢复本会话历史（记忆上一个任务）
+        if chat_id not in self.messages:
+            self.load_history(chat_id)
         msgs = self.messages.setdefault(chat_id, [])
         msgs.append({"role": "user", "content": text})
         self.append_messages(chat_id, [{"role": "user", "content": text}])
@@ -348,6 +379,8 @@ class Bot:
         self.stream_state[chat_id] = state
         holder = self.send_message(chat_id, "◌ 思考中…")
         state["msg_id"] = holder.get("result", {}).get("message_id")
+        # 上下文压缩：超过阈值时压缩早期历史（模型永远拿到压缩版，防 tokens 爆炸）
+        msgs = self._maybe_compress(chat_id, msgs)
 
         # 渲染刷新线程：每 1 秒把累积内容编辑进消息（ask 确认期间冻结，防止覆盖确认按钮）
         def renderer():
@@ -377,18 +410,14 @@ class Bot:
                 msgs.append({"role": "assistant", "content": content})
                 self.append_messages(chat_id, [{"role": "assistant", "content": content}])
             final = self._render_text(state)
-            self.edit_message(chat_id, state["msg_id"], final or "（模型无回复）")
+            self.edit_message(chat_id, state["msg_id"], final or "✓ 任务完成")
         else:
             # 错误/中止
             self.edit_message(chat_id, state["msg_id"], f"⚠ {stream_result}")
 
     def _render_text(self, state: dict) -> str:
-        parts = []
-        if state["log"]:
-            parts.append("\n".join(state["log"]))
-        if state["text"]:
-            parts.append(state["text"])
-        return "\n\n".join(parts)[:MAX_TEXT]
+        """只返回模型最终回复内容（不显示工具日志，保持界面简洁）。"""
+        return (state.get("text") or "")[:MAX_TEXT]
 
     def _consume_stream(self, chat_id: int, msgs: list[dict], state: dict) -> str | None:
         """POST /chat/stream 消费 SSE；返回 None=正常结束，str=错误信息。"""
