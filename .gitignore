@@ -9,3 +9,6 @@ chat_config.json.bak
 
 # ZCode 工具内部文件
 .zcode/
+
+# 本地会话数据（含聊天记录，严禁入库）
+.pcagent/

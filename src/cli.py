@@ -123,6 +123,22 @@ class AgentClient:
             h["X-Api-Token"] = self.token
         return h
 
+    def api(self, method: str, path: str, payload=None, timeout: float = 8):
+        """通用 JSON 请求，返回 (status, dict)。失败时 status=0。"""
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(self.base + path, data=body, method=method,
+                                     headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return e.code, {"detail": f"HTTP {e.code}"}
+        except Exception:
+            return 0, {}
+
     def health(self):
         """返回 (ok, 信息文本)。"""
         req = urllib.request.Request(self.base + "/api/v1/health", headers=self._headers())
@@ -314,12 +330,33 @@ class Cli:
         if ok:
             self.context_window = info.get("context_window") or 65536
             self.available_tools = info.get("tools") or []
-        self.new_session()
+        self.restore_sessions()
 
     # ---- 会话 ----
+    def restore_sessions(self) -> None:
+        """启动时从后端恢复持久化会话（权威源）；失败降级为本地新建。"""
+        status, data = self.client.api("GET", "/api/v1/sessions")
+        if status == 200 and isinstance(data, dict):
+            for s in data.get("sessions") or []:
+                sid = int(s["id"])
+                self.sessions[sid] = {"messages": [dict(m) for m in (s.get("messages") or [])],
+                                      "title": s.get("title") or ""}
+            if self.sessions:
+                self.current = max(self.sessions)
+                n = len(self.sessions[self.current]["messages"]) // 2
+                print(color(f"已恢复 {len(self.sessions)} 个持久化会话"
+                            f"（当前 会话 #{self.current}，{n} 轮）", "dim"))
+                return
+        self.new_session()
+
     def new_session(self) -> None:
-        sid = (max(self.sessions) + 1) if self.sessions else 1
-        self.sessions[sid] = {"messages": []}
+        """新建会话（后端登记持久化；失败降级本地自增）。"""
+        status, data = self.client.api("POST", "/api/v1/sessions")
+        if status == 200 and isinstance(data.get("id"), int):
+            sid = data["id"]
+        else:
+            sid = (max(self.sessions) + 1) if self.sessions else 1
+        self.sessions[sid] = {"messages": [], "title": ""}
         self.switch(sid)
 
     def switch(self, sid: int) -> None:
@@ -332,6 +369,8 @@ class Cli:
 
     def clear(self) -> None:
         self.sessions[self.current]["messages"] = []
+        # 同步清空后端持久化（失败静默，重启会恢复——属降级行为）
+        self.client.api("DELETE", f"/api/v1/sessions/{self.current}/messages", timeout=5)
         print(color("已清空当前会话历史", "cyan"))
 
     # ---- 事件渲染 ----
@@ -418,11 +457,16 @@ class Cli:
         print(color("  ◌ 思考中…", "dim"))
         err = self.client.stream_chat(snapshot, self.on_event)
         print()
+        # 持久化：user 消息必存；回复成功再存 assistant
+        persist = [{"role": "user", "content": text}]
         if err:
             print(color(f"✗ {err}", "red"))
-            return
-        # 完整回复已通过 delta 打印；回存 assistant 消息供多轮上下文
-        sess["messages"].append({"role": "assistant", "content": self._last_content})
+        else:
+            # 完整回复已通过 delta 打印；回存 assistant 消息供多轮上下文
+            sess["messages"].append({"role": "assistant", "content": self._last_content})
+            persist.append({"role": "assistant", "content": self._last_content})
+        self.client.api("POST", f"/api/v1/sessions/{self.current}/messages",
+                        {"messages": persist}, timeout=5)
 
     # ---- 交互 ----
     def repl(self) -> None:
@@ -453,8 +497,11 @@ class Cli:
         elif cmd == "/sessions":
             for sid in sorted(self.sessions):
                 n = len(self.sessions[sid]["messages"]) // 2
+                title = self.sessions[sid].get("title") or ""
                 mark = "→" if sid == self.current else " "
-                print(color(f"  {mark} 会话 #{sid}（{n} 轮）", "bold" if sid == self.current else "reset"))
+                label = f"会话 #{sid}" + (f"：{title}" if title else "")
+                print(color(f"  {mark} {label}（{n} 轮）",
+                            "bold" if sid == self.current else "reset"))
         elif cmd == "/switch":
             if len(parts) < 2 or not parts[1].isdigit():
                 print(color("用法：/switch <会话号>", "yellow"))

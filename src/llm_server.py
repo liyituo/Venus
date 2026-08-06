@@ -1097,6 +1097,53 @@ def _todos_system_note() -> str:
     return "\n".join(lines)
 
 
+# ---- 会话持久化（权威存储在项目目录 .pcagent/，跟随程序 / U 盘移动，已 gitignore）----
+SESSION_MAX = 50               # 会话数上限
+SESSION_MAX_MESSAGES = 200     # 单会话消息数上限（超出丢弃最早，防无限膨胀）
+SESSION_TITLE_CHARS = 30       # 自动标题长度（取首条用户消息）
+_session_lock = threading.Lock()
+_sessions: dict[int, dict] = {}  # id -> {"id", "title", "messages": [...], "updated"}
+_session_id_counter = itertools.count(1)
+_sessions_loaded = False
+
+
+def _session_file() -> Path:
+    """会话文件位置：项目根目录 .pcagent/sessions.json（程序数据，跟着代码/U 盘走）。"""
+    return BASE_DIR.parent / ".pcagent" / "sessions.json"
+
+
+def _load_sessions() -> None:
+    global _sessions, _session_id_counter, _sessions_loaded
+    _sessions_loaded = True
+    try:
+        p = _session_file()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            _sessions = {int(k): v for k, v in (data.get("sessions") or {}).items()}
+            if _sessions:
+                _session_id_counter = itertools.count(max(_sessions) + 1)
+    except Exception:
+        _sessions = {}
+
+
+def _save_sessions() -> None:
+    """原子写：先写临时文件再 rename，防止写一半崩溃损坏数据。"""
+    try:
+        p = _session_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"sessions": _sessions}, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(p)
+    except OSError as exc:
+        log.warning("会话持久化失败：%s", exc)
+
+
+def _ensure_sessions() -> None:
+    if not _sessions_loaded:
+        _load_sessions()
+
+
 # ---- repo 索引缓存 ----
 _repo_cache = {"key": "", "time": 0.0, "text": ""}
 
@@ -1283,6 +1330,102 @@ async def agent_respond(req: AskResponse) -> dict:
         entry["event"].set()
     log.info("confirm %s -> %s", req.request_id, req.choice)
     return {"ok": True, "choice": req.choice}
+
+
+class SessionAppend(BaseModel):
+    messages: list[dict] = Field(..., description="新增消息（增量追加，如 [user, assistant]）")
+    title: str | None = Field(default=None, description="可选：自定义标题（省略则自动取首条用户消息）")
+
+
+@app.get("/api/v1/sessions", summary="会话列表（含完整消息，供前端启动时恢复）")
+async def sessions_list() -> dict:
+    _ensure_sessions()
+    with _session_lock:
+        items = [{"id": s["id"], "title": s.get("title", ""),
+                  "messages": s.get("messages", []),
+                  "message_count": len(s.get("messages", [])),
+                  "updated": s.get("updated", "")}
+                 for s in _sessions.values()]
+    return {"ok": True, "sessions": sorted(items, key=lambda s: s["id"])}
+
+
+@app.post("/api/v1/sessions", summary="创建空会话")
+async def session_create() -> dict:
+    _ensure_sessions()
+    with _session_lock:
+        if len(_sessions) >= SESSION_MAX:
+            raise HTTPException(409, f"会话数已达上限 {SESSION_MAX}，请先删除旧会话")
+        sid = next(_session_id_counter)
+        _sessions[sid] = {"id": sid, "title": "", "messages": [],
+                          "updated": time.strftime("%m-%d %H:%M")}
+        _save_sessions()
+    log.info("session created: #%d", sid)
+    return {"ok": True, "id": sid}
+
+
+@app.get("/api/v1/sessions/{sid}", summary="读取单个会话")
+async def session_get(sid: int) -> dict:
+    _ensure_sessions()
+    with _session_lock:
+        s = _sessions.get(sid)
+        if s is None:
+            raise HTTPException(404, f"会话不存在：{sid}")
+        return {"ok": True, "session": s}
+
+
+@app.post("/api/v1/sessions/{sid}/messages", summary="向会话追加消息（增量）")
+async def session_append(sid: int, req: SessionAppend) -> dict:
+    _ensure_sessions()
+    if not req.messages:
+        raise HTTPException(422, "messages 不能为空")
+    with _session_lock:
+        s = _sessions.get(sid)
+        if s is None:
+            raise HTTPException(404, f"会话不存在：{sid}")
+        msgs = s.setdefault("messages", [])
+        for m in req.messages:
+            if m.get("role") in ("user", "assistant") and m.get("content"):
+                msgs.append({"role": m["role"], "content": m["content"]})
+        # 上限：超出丢弃最早消息
+        if len(msgs) > SESSION_MAX_MESSAGES:
+            del msgs[:len(msgs) - SESSION_MAX_MESSAGES]
+        # 自动标题：首条用户消息前 N 字
+        if not s.get("title"):
+            for m in msgs:
+                if m.get("role") == "user":
+                    s["title"] = (m.get("content") or "").strip().replace("\n", " ")[:SESSION_TITLE_CHARS]
+                    break
+        if req.title:
+            s["title"] = req.title[:60]
+        s["updated"] = time.strftime("%m-%d %H:%M")
+        _save_sessions()
+        return {"ok": True, "session": s}
+
+
+@app.delete("/api/v1/sessions/{sid}", summary="删除会话")
+async def session_delete(sid: int) -> dict:
+    _ensure_sessions()
+    with _session_lock:
+        if sid not in _sessions:
+            raise HTTPException(404, f"会话不存在：{sid}")
+        del _sessions[sid]
+        _save_sessions()
+    log.info("session deleted: #%d", sid)
+    return {"ok": True, "deleted": sid}
+
+
+@app.delete("/api/v1/sessions/{sid}/messages", summary="清空会话消息（保留会话，用于 /clear）")
+async def session_clear(sid: int) -> dict:
+    _ensure_sessions()
+    with _session_lock:
+        s = _sessions.get(sid)
+        if s is None:
+            raise HTTPException(404, f"会话不存在：{sid}")
+        s["messages"] = []
+        s["title"] = ""
+        s["updated"] = time.strftime("%m-%d %H:%M")
+        _save_sessions()
+    return {"ok": True, "cleared": sid}
 
 
 def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:

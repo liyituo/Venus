@@ -50,6 +50,10 @@ WARN = "#f59e0b"
 CODE_BG = "#0d1117"
 CODE_FG = "#c9d1d9"
 
+# 会话首条 system 提示（本地结构发送用；后端只存 user/assistant 消息）
+SYSTEM_FIRST = ("你是一个桌面 Agent 助手，可以控制用户的电脑"
+                "（屏幕点击、输入、按键、截图）。回答尽量简洁、准确。")
+
 
 def api_request(base_url: str, method: str, path: str, payload=None,
                 timeout: float = 15, raw: bool = False):
@@ -358,8 +362,10 @@ class ChatApp:
                                 wrap="word")
         self.log_text.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        # 首个会话（渲染欢迎语）
-        self._new_session()
+        # 会话初始为空，由 _start 后异步从 LLM 后端加载恢复（失败降级本地创建）
+        self._sessions: dict[int, dict] = {}
+        self._current_sid = 0
+        self._server_sessions_loaded = False
 
     def _toolbar_btn(self, parent, text: str, cmd, accent: bool = False) -> tk.Button:
         bgc = ACCENT if accent else PANEL_LIGHT
@@ -410,6 +416,7 @@ class ChatApp:
                 "status": self._on_status,
                 "llm": self._on_llm_status,
                 "llm_status": self._on_llm_status_result,
+                "sessions": self._on_sessions_loaded,
                 "stream_delta": self._on_stream_delta,
                 "stream_done": self._on_stream_done,
                 "stream_error": self._on_stream_error,
@@ -509,6 +516,11 @@ class ChatApp:
         self._log(f"LLM backend: {msg}", kind)
         if kind == "ok":
             self._tasks.put(("llm_status", self._refresh_llm_status))
+        elif not self._server_sessions_loaded:
+            # LLM 后端起不来：降级为纯内存会话
+            self._server_sessions_loaded = True
+            if not self._sessions:
+                self._new_session()
 
     def _refresh_llm_status(self):
         code, data, _ = api_request(self.llm_url, "GET", "/api/v1/health")
@@ -524,6 +536,10 @@ class ChatApp:
     def _apply_llm_status(self, data: dict) -> None:
         self._llm_ok = True
         self._llm_model = data.get("model", "")
+        if not self._server_sessions_loaded:
+            # LLM 后端就绪：拉取持久化会话（只触发一次）
+            self._server_sessions_loaded = True
+            self._tasks.put(("sessions", self._load_sessions_from_server))
         cfg = load_config()
         if data.get("configured"):
             self.llm_status.config(
@@ -545,6 +561,48 @@ class ChatApp:
         else:
             self._set_status(False)
 
+    # ------------------------------------------------------------------ 会话持久化
+    def _load_sessions_from_server(self):
+        """后台线程：从 LLM 后端拉取全部会话（含消息）用于恢复。"""
+        code, data, _ = api_request(self.llm_url, "GET", "/api/v1/sessions", timeout=8)
+        if code != 200:
+            return ("err", "无法连接 LLM 后端，本次会话仅保存在内存（重启丢失）")
+        return ("ok", data.get("sessions") or [])
+
+    def _on_sessions_loaded(self, payload) -> None:
+        """主线程：用后端会话重建本地状态（后端为权威源）。"""
+        kind, msg = payload
+        if kind == "err":
+            self._log(msg, "err")
+            if not self._sessions:
+                self._new_session()
+            return
+        sessions = msg
+        if not sessions:
+            if not self._sessions:
+                self._new_session()
+            return
+        self._sessions.clear()
+        for s in sessions:
+            sid = int(s["id"])
+            msgs = [dict(m) for m in (s.get("messages") or [])]
+            self._sessions[sid] = {
+                "messages": [{"role": "system", "content": SYSTEM_FIRST}] + msgs,
+                "history": [(m["role"], m["content"]) for m in msgs],
+                "title": s.get("title") or "",
+            }
+        self._current_sid = 0
+        self._switch_session(max(self._sessions))
+        self._log(f"已恢复 {len(self._sessions)} 个持久化会话", "ok")
+
+    def _append_to_server(self, msgs: list[dict]) -> None:
+        """后台线程：把新增消息追加到后端会话（幂等失败，不阻塞 UI）。"""
+        sid = self._current_sid
+        def _do():
+            api_request(self.llm_url, "POST", f"/api/v1/sessions/{sid}/messages",
+                        {"messages": msgs}, timeout=5)
+        self._tasks.put(("sess_append", _do))
+
     def _tick_status(self) -> None:
         if not self.quit_flag:
             self._tasks.put(("status", lambda: api_request(self.base_url, "GET", "/api/v1/status")))
@@ -563,6 +621,9 @@ class ChatApp:
         text = self.input_box.get("1.0", "end-1c").strip()
         if not text:
             return
+        # 防御：会话尚未初始化（后端未就绪）时先建一个
+        if not self._sessions:
+            self._new_session()
         self._add_message("user", text)
         self.input_box.delete("1.0", "end")
 
@@ -570,6 +631,7 @@ class ChatApp:
         sess["history"].append(("user", text))
         sess["messages"].append({"role": "user", "content": text})
         snapshot = list(sess["messages"])   # 快照，后台线程不碰 UI 状态
+        self._append_to_server([{"role": "user", "content": text}])   # 持久化 user 消息
 
         # 流式输出初始化
         self._streaming = True
@@ -854,6 +916,7 @@ class ChatApp:
             sess = self._sessions[self._current_sid]
             sess["history"].append(("agent", full_text))          # 展示用（含工具日志）
             sess["messages"].append({"role": "assistant", "content": content})  # 模型上下文（纯回复，省 token）
+            self._append_to_server([{"role": "assistant", "content": content}])  # 持久化回复
             self._log("agent reply complete", "ok")
         else:
             self._update_message(handle, "⚠ 模型未返回内容，请重试。")
@@ -1005,15 +1068,20 @@ class ChatApp:
 
     # ------------------------------------------------------------------ 会话
     def _new_session(self) -> None:
-        """创建新会话并切换过去。"""
-        sid = (max(self._sessions) + 1) if self._sessions else 1
+        """创建新会话并切换过去（后端登记持久化；失败降级本地自增）。"""
+        sid = self._create_server_session()
         self._sessions[sid] = {
-            "messages": [{"role": "system",
-                          "content": "你是一个桌面 Agent 助手，可以控制用户的电脑"
-                                     "（屏幕点击、输入、按键、截图）。回答尽量简洁、准确。"}],
+            "messages": [{"role": "system", "content": SYSTEM_FIRST}],
             "history": [],   # [(role, text), ...] 已展示的对话
+            "title": "",
         }
         self._switch_session(sid)
+
+    def _create_server_session(self) -> int:
+        code, data, _ = api_request(self.llm_url, "POST", "/api/v1/sessions", timeout=5)
+        if code == 200 and isinstance(data.get("id"), int):
+            return data["id"]
+        return (max(self._sessions) + 1) if self._sessions else 1
 
     def _switch_session(self, sid: int) -> None:
         if self._streaming or sid not in self._sessions:
@@ -1041,7 +1109,8 @@ class ChatApp:
             bgc = ACCENT if is_current else PANEL_LIGHT
             row = tk.Frame(self.session_list, bg=bgc)
             row.pack(fill="x", pady=2)
-            btn = tk.Button(row, text=f"会话 #{sid}", bg=bgc,
+            title = self._sessions[sid].get("title") or f"会话 #{sid}"
+            btn = tk.Button(row, text=title[:14], bg=bgc,
                             fg="white" if is_current else TEXT, relief="flat", bd=0,
                             anchor="w", padx=10, pady=4, cursor="hand2",
                             font=("Segoe UI", 9),
@@ -1064,8 +1133,12 @@ class ChatApp:
         """删除会话；删除当前会话时自动切换到剩余会话，删空则自动新建。"""
         if self._streaming or sid not in self._sessions:
             return
-        if not messagebox.askyesno("删除会话", f"确定删除 会话 #{sid}？此操作不可恢复。"):
+        if not messagebox.askyesno("删除会话", f"确定删除该会话？此操作不可恢复。"):
             return
+        # 同步删除后端持久化（后台执行，失败静默——本地删除照常进行）
+        def _do():
+            api_request(self.llm_url, "DELETE", f"/api/v1/sessions/{sid}", timeout=5)
+        self._tasks.put(("sess_delete", _do))
         del self._sessions[sid]
         self._log(f"deleted session #{sid}", "info")
         if self._current_sid == sid:
