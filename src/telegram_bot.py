@@ -285,6 +285,8 @@ class Bot:
             self.cmd_switch(chat_id, text)
         elif text == "/status":
             self.cmd_status(chat_id)
+        elif text == "/stats":
+            self.cmd_stats(chat_id)
         elif text.startswith("/"):
             self.send_message(chat_id, f"未知命令：{text}（/help 查看）")
         else:
@@ -295,7 +297,7 @@ class Bot:
             "PC Agent（Telegram 前端）\n"
             "直接发消息即可，Agent 自主调用工具。\n\n"
             "/new 新建会话\n/sessions 会话列表\n/switch N 切换会话\n"
-            "/status 状态\n/help 帮助\n\n"
+            "/status 状态\n/stats Token 用量\n/help 帮助\n\n"
             "敏感操作（改文件/提交 git/执行命令）会弹确认按钮。"))
 
     def cmd_sessions(self, chat_id: int) -> None:
@@ -336,6 +338,23 @@ class Bot:
                           f"后端: {'已配置 ' + data.get('model', '') if data.get('configured') else '未配置 API'}\n"
                           f"隔离模式: {'是' if data.get('isolated') else '否'}\n"
                           f"当前会话: #{sid}\n工具: {len(data.get('tools') or [])} 个")
+
+    def cmd_stats(self, chat_id: int) -> None:
+        """Token 用量统计（llm_server 进程内聚合，重启清零）。"""
+        status, d = self.llm("GET", "/api/v1/stats")
+        if status != 200:
+            self.send_message(chat_id, f"获取统计失败：{d.get('detail', '')}")
+            return
+        prompt = d.get("prompt_tokens") or 0
+        cached = d.get("cached_tokens") or 0
+        pct = d.get("cache_hit_rate_pct") or 0
+        lines = [
+            "Token 用量统计",
+            f"调用次数: {d.get('calls', 0)}",
+            f"Prompt: {prompt:,}（缓存命中 {cached:,}，{pct}%）",
+            f"Completion: {d.get('completion_tokens', 0):,}（推理 {d.get('reasoning_tokens', 0):,}）",
+        ]
+        self.send_message(chat_id, "\n".join(lines))
 
     # ------------------------------------------------------------------ 确认回调
     def handle_callback(self, cq: dict) -> None:
