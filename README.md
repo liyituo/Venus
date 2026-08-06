@@ -62,7 +62,7 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 - **屏幕**：看分辨率、点击、输入文字、按按键
 - **文件**：建文件夹、浏览目录、读写文件、`search_text` 代码检索、`list_symbols` 看函数结构
-- **编辑**：`replace_text` 精确替换，改前弹 diff 给你确认
+- **编辑**：`replace_text` 精确替换，改前弹 diff 给你确认；改错用 `undo` 一键回滚（自动备份，可逆）
 - **Git**：`git_status` / `git_diff` / `git_log` / `git_commit`（提交需确认）
 - **执行**：跑 Python（`run_code`）、shell 命令（`run_shell`）、后台进程（`start_process`）
 - **规划**：`create_todo` 列任务清单，侧边栏实时显示，重启后保留
@@ -70,33 +70,40 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 ## 安全
 
-敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
+敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、撤销修改（`undo` 同样展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令（Windows 上还拦 `format C:`、`rd /s /q`、`diskpart`）；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
 
 ## 会话与数据
 
 - 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）
-- 重启程序自动恢复全部会话；chat / cli / 网页共享同一份历史（后端权威存储）
+- 重启程序自动恢复全部会话；chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
+- 文件修改自动备份到 `.pcagent/backups/`（`undo` 回滚用，50 条上限）
+- 运行日志写入 `.pcagent/server.log` 与 `.pcagent/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
 - 任务清单存在工作区 `~/agent_workspace/.pcagent/todos.json`（跟随机器）
 - 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
 
 ## 目录结构
 
 ```
-src/                源代码（app / llm_server / 三个前端 / mock_llm 测试 API）
-scripts/            一键启动 .bat、start_wsl.sh
+src/                源代码（app / llm_server / 五前端 / mock_llm 测试 API）
+scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh
 static/index.html   网页控制台
-tests/              smoke_test / llm_tools_test / agent_loop_test / session_test
+tests/              四套测试（daemon / 编程工具 / agent 循环 / 会话）
+.github/workflows/  CI（push 自动跑四套测试）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
-.pcagent/           本地会话历史（gitignore，不入库）
+telegram_config.json  bot 配置（含 token，已 gitignore，别提交）
+.pcagent/           会话历史 / 修改备份 / 运行日志（gitignore，不入库）
 ```
 
 ## 开发
 
 ```
 .venv\Scripts\python tests\smoke_test.py       # daemon 冒烟测试（21 断言，不碰真实屏幕）
-.venv\Scripts\python tests\llm_tools_test.py   # 编程工具测试（45 断言：检索/编辑/git/进程/todo/repo）
-.venv\Scripts\python tests\agent_loop_test.py  # agent 循环端到端（12 断言：ask+diff/todo 事件/system 注入）
+.venv\Scripts\python tests\llm_tools_test.py   # 编程工具测试（69 断言：检索/编辑/undo/git/进程/todo/repo/超时）
+.venv\Scripts\python tests\agent_loop_test.py  # agent 循环端到端（19 断言：ask+diff/todo/上下文硬上界）
+.venv\Scripts\python tests\session_test.py     # 会话持久化（28 断言：CRUD/重启恢复/上限）
 .venv\Scripts\python src\mock_llm.py           # 无 Key 时本地假 API 验证全链路
 ```
+
+推送后 GitHub Actions 自动跑四套测试（共 137 断言），回归在 Actions 页面一眼可见。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。
