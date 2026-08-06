@@ -29,6 +29,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -77,7 +78,7 @@ READONLY_SHELL_WIN = re.compile(
 )
 
 # 确认请求需要发 ask 事件的敏感工具
-CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process"}
+CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process", "undo"}
 
 # ---- 问询模式（四种）----
 CONFIRM_MODES = ("auto", "strict", "trusted", "query")
@@ -125,7 +126,7 @@ class ConfirmModeRequest(BaseModel):
 _SCREEN_TOOLS = {"get_screen_size", "click", "type_text", "press_key"}
 _FILE_TOOLS = {
     "create_folder", "list_folder", "create_file", "read_file", "run_code", "run_shell",
-    "search_text", "glob_files", "list_symbols", "replace_text",
+    "search_text", "glob_files", "list_symbols", "replace_text", "undo",
     "git_status", "git_diff", "git_log", "git_commit",
     "start_process", "process_output", "stop_process", "list_processes",
     "create_todo", "update_todo", "list_todos", "repo_map",
@@ -260,6 +261,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger("llm-backend")
 
 
+def _setup_file_logging() -> None:
+    """统一运行日志：写入项目根 .pcagent/server.log（1MB 轮转，保留 3 份）。"""
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_dir = BASE_DIR.parent / ".pcagent"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(log_dir / "server.log", maxBytes=1_000_000,
+                                 backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+        log.info("运行日志已写入 %s", log_dir / "server.log")
+    except Exception as exc:
+        log.warning("日志文件初始化失败：%s", exc)
+
+
+_setup_file_logging()
+
+
 def load_config() -> dict:
     default = {
         "api_url": "https://api.deepseek.com/v1/chat/completions",
@@ -352,6 +371,16 @@ async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
 
 # 可选 token 鉴权：--token 启动时启用，所有请求须带 X-Api-Token 头
 AUTH_TOKEN = ""
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """请求日志：method/path/状态/耗时，写入统一运行日志。"""
+    start = time.monotonic()
+    response = await call_next(request)
+    log.info("%s %s -> %d (%.2fs)", request.method, request.url.path,
+             response.status_code, time.monotonic() - start)
+    return response
 
 
 @app.middleware("http")
@@ -697,7 +726,8 @@ AGENT_TOOLS = [
         "name": "replace_text",
         "description": "精确修改工作区内的文件：把 old 文本替换为 new 文本（小步修改，不要重写整个文件）。"
                        "执行前会生成 diff 并经用户确认。old 必须是文件中的唯一片段（注意缩进/换行），"
-                       "若不唯一可用 occurrence 指定第几次出现，或把 old 写长一些。",
+                       "若不唯一可用 occurrence 指定第几次出现，或把 old 写长一些。"
+                       "修改前会自动备份，改错了可用 undo 恢复。",
         "parameters": {"type": "object",
                        "properties": {
                            "file": {"type": "string", "description": "相对工作区的文件路径"},
@@ -705,6 +735,16 @@ AGENT_TOOLS = [
                            "new": {"type": "string", "description": "替换成的新文本"},
                            "occurrence": {"type": "integer", "default": 1, "description": "old 出现多次时指定第几次"}},
                        "required": ["file", "old", "new"]},
+    }},
+    {"type": "function", "function": {
+        "name": "undo",
+        "description": "撤销最近一次文件修改（replace_text / create_file 覆盖前会自动备份）。"
+                       "file 参数可指定只撤销某个文件；省略则撤销全局最近一次修改。"
+                       "执行前会展示前后 diff 并经用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {"file": {"type": "string",
+                                               "description": "可选：要撤销的文件（相对工作区）"}},
+                       "required": []},
     }},
     # ---- 编程工具：Git ----
     {"type": "function", "function": {
@@ -1210,6 +1250,71 @@ def _ensure_sessions() -> None:
         _load_sessions()
 
 
+# ---- 修改回滚（undo）：replace_text / create_file 覆盖前自动备份 ----
+BACKUP_MAX = 50            # 备份条目上限（超出丢最老）
+_backup_lock = threading.Lock()
+
+
+def _backup_dir() -> Path:
+    return BASE_DIR.parent / ".pcagent" / "backups"
+
+
+def _backup_index() -> list[dict]:
+    """[{id, file, time, backup}] 按时间旧→新。"""
+    try:
+        p = _backup_dir() / "index.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def _save_backup_index(idx: list) -> None:
+    try:
+        p = _backup_dir()
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "index.json").write_text(json.dumps(idx, ensure_ascii=False, indent=1),
+                                      encoding="utf-8")
+    except OSError as exc:
+        log.warning("备份清单写入失败：%s", exc)
+
+
+def _take_backup(workspace: Path, target: Path) -> bool:
+    """修改文件前备份原内容（供 undo 恢复）。失败不阻塞修改。"""
+    try:
+        rel = target.relative_to(workspace).as_posix()
+        content = target.read_text(encoding="utf-8", errors="replace")
+        with _backup_lock:
+            idx = _backup_index()
+            bid = (idx[-1]["id"] + 1) if idx else 1
+            bdir = _backup_dir() / str(bid)
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / "content").write_text(content, encoding="utf-8")
+            idx.append({"id": bid, "file": rel,
+                        "time": time.strftime("%m-%d %H:%M:%S"), "backup": str(bid)})
+            if len(idx) > BACKUP_MAX:          # 上限：丢最老
+                old = idx.pop(0)
+                shutil.rmtree(_backup_dir() / str(old["backup"]), ignore_errors=True)
+            _save_backup_index(idx)
+        return True
+    except Exception:
+        return False
+
+
+def _find_undo_entry(target_file: str = "") -> dict | None:
+    """找要撤销的备份条目：指定文件取该文件最近一次，否则全局最近一次。"""
+    idx = _backup_index()
+    if not idx:
+        return None
+    if target_file:
+        for e in reversed(idx):
+            if e["file"] == target_file:
+                return e
+        return None
+    return idx[-1]
+
+
 # ---- repo 索引缓存 ----
 _repo_cache = {"key": "", "time": 0.0, "text": ""}
 
@@ -1339,8 +1444,8 @@ def _needs_confirm(name: str, args: dict) -> bool:
         workspace = _get_workspace()
         target = _safe_join(workspace, args.get("path", ""))
         return target is not None and target.exists()
-    if name in ("replace_text", "git_commit", "start_process"):
-        # 修改文件 / 提交 git / 启动后台进程：一律确认
+    if name in ("replace_text", "git_commit", "start_process", "undo"):
+        # 修改文件 / 提交 git / 启动后台进程 / 撤销修改：一律确认
         return True
     if name == "run_shell":
         command = (args.get("command") or "").strip()
@@ -1358,6 +1463,26 @@ def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
         diff = _make_replace_diff(args)
         file = args.get("file")
         return f"要修改文件 `{file}`（把指定内容替换为新的内容）吗？", diff
+    if name == "undo":
+        entry = _find_undo_entry((args.get("file") or "").strip())
+        if entry is None:
+            return "没有可撤销的修改记录", None
+        # diff：备份内容 vs 当前内容
+        workspace = _get_workspace()
+        cur = _safe_join(workspace, entry["file"])
+        diff = None
+        if cur is not None and cur.is_file():
+            try:
+                old_text = (_backup_dir() / str(entry["backup"]) / "content").read_text(
+                    encoding="utf-8", errors="replace")
+                new_text = cur.read_text(encoding="utf-8", errors="replace")
+                diff = "".join(difflib.unified_diff(
+                    new_text.splitlines(keepends=True), old_text.splitlines(keepends=True),
+                    fromfile=f"a/{entry['file']}", tofile=f"b/{entry['file']}（{entry['time']} 备份）",
+                    n=2))[:REPLACE_DIFF_CHARS]
+            except OSError:
+                pass
+        return (f"要撤销对 `{entry['file']}` 的修改（恢复到 {entry['time']} 的备份）吗？", diff)
     if name == "git_commit":
         workspace = _get_workspace()
         root = _find_git_root(workspace, args.get("path", ""))
@@ -1582,6 +1707,8 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if len(content) > MAX_WRITE_CHARS:
                 return False, f"内容过长（{len(content)} 字符 > 上限 {MAX_WRITE_CHARS}）"
             target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                _take_backup(workspace, target)      # 覆盖前自动备份（供 undo 恢复）
             target.write_text(content, encoding="utf-8")
             return True, json.dumps(
                 {"created": target.relative_to(workspace).as_posix(), "chars": len(content)},
@@ -1782,10 +1909,36 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                 fromfile=f"a/{args['file']}", tofile=f"b/{args['file']}", n=1))
             if len(diff) > REPLACE_DIFF_CHARS:
                 diff = diff[:REPLACE_DIFF_CHARS] + "\n...(diff 过长已截断)"
+            _take_backup(workspace, target)          # 修改前自动备份（供 undo 恢复）
             target.write_text(new_text, encoding="utf-8")
             return True, json.dumps({"file": args.get("file"), "occurrence": occ,
-                                     "replacements": count, "diff": diff},
-                                    ensure_ascii=False)
+                                     "replacements": count, "diff": diff,
+                                     "backup": True}, ensure_ascii=False)
+        if name == "undo":
+            workspace = _get_workspace()
+            entry = _find_undo_entry((args.get("file") or "").strip())
+            if entry is None:
+                return False, "没有可撤销的修改（replace_text / create_file 覆盖前会自动备份）"
+            bdir = _backup_dir() / str(entry["backup"])
+            content_path = bdir / "content"
+            if not content_path.exists():
+                return False, "备份文件缺失，无法撤销"
+            target = _safe_join(workspace, entry["file"])
+            if target is None:
+                return False, "非法路径：备份记录中的路径超出工作区"
+            content = content_path.read_text(encoding="utf-8", errors="replace")
+            _take_backup(workspace, target)          # 恢复前备份当前状态（撤销可逆）
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            # 移除该备份条目
+            with _backup_lock:
+                idx = _backup_index()
+                if entry in idx:
+                    idx.remove(entry)
+                    _save_backup_index(idx)
+            shutil.rmtree(bdir, ignore_errors=True)
+            return True, json.dumps({"restored": entry["file"], "time": entry["time"],
+                                     "chars": len(content)}, ensure_ascii=False)
         # ================= 编程工具：Git =================
         if name in ("git_status", "git_diff", "git_log", "git_commit"):
             workspace = _get_workspace()

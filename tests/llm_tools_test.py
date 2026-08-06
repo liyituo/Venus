@@ -107,6 +107,45 @@ check("replace_text occurrence 越界", not ok, res)
 ok, res = run("replace_text", json.dumps({"file": "demo/../nope.py", "old": "a", "new": "b"}))
 check("replace_text 越界路径拒绝", not ok, res)
 
+# ============ 2.5 修改回滚（undo）============
+print("== 2.5 undo（自动备份 + 恢复）==")
+L._backup_lock = L._backup_lock  # 已有
+# 清空备份区
+import shutil as _sh
+_sh.rmtree(L._backup_dir(), ignore_errors=True)
+L._backup_index()
+
+(WS / "demo" / "fib.py").write_text("line1\nline2\nline3\n", encoding="utf-8")
+ok, res = run("replace_text", json.dumps({
+    "file": "demo/fib.py", "old": "line2", "new": "CHANGED"}))
+check("replace_text 后自动备份", ok and "backup" in ok_json(res), res)
+
+ok, res = run("undo", json.dumps({"file": "demo/fib.py"}))
+data = ok_json(res)
+check("undo 恢复文件", ok and data.get("restored") == "demo/fib.py", res)
+check("undo 内容还原", (WS / "demo" / "fib.py").read_text(encoding="utf-8") == "line1\nline2\nline3\n", "")
+
+# create_file 覆盖也备份 + 全局 undo
+(WS / "demo" / "fib.py").write_text("v1\n", encoding="utf-8")
+ok, res = run("create_file", json.dumps({"path": "demo/fib.py", "content": "v2-overwrite\n"}))
+check("create_file 覆盖备份", ok, res)
+ok, res = run("undo", "{}")
+data = ok_json(res)
+check("全局 undo 恢复最近一次", ok and data.get("restored") == "demo/fib.py", res)
+check("全局 undo 内容", (WS / "demo" / "fib.py").read_text(encoding="utf-8") == "v1\n", "")
+
+# undo 可逆：恢复前的当前状态也被备份
+ok, res = run("undo", "{}")
+data = ok_json(res)
+check("undo 后仍可再 undo（可逆）", ok and (WS / "demo" / "fib.py").read_text(encoding="utf-8") == "v2-overwrite\n", res)
+
+# 确认问题生成（diff 展示）
+q, diff = L._confirm_question("undo", {"file": "demo/fib.py"})
+check("undo 确认问题", "demo/fib.py" in q, q)
+check("undo 确认带 diff", diff is not None and "v2-overwrite" in diff, (diff or "")[:80])
+q, diff = L._confirm_question("undo", {"file": "不存在的文件.py"})
+check("undo 无记录提示", "没有可撤销" in q, q)
+
 # ============ 3. Git 闭环 ============
 print("== 3. git_status / git_diff / git_commit / git_log ==")
 repo = WS / "repo1"

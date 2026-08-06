@@ -1,0 +1,32 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        run: |
+          pip install --quiet fastapi "uvicorn[standard]" pyautogui Pillow pynput httpx python3-xlib
+
+      - name: 冒烟测试（daemon）
+        run: python tests/smoke_test.py
+
+      - name: 编程工具测试（检索/编辑/git/进程/todo/回滚）
+        run: python tests/llm_tools_test.py
+
+      - name: agent 循环端到端（ask+diff/todo/上下文上界）
+        run: python tests/agent_loop_test.py
+
+      - name: 会话持久化测试
+        run: python tests/session_test.py

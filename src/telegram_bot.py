@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import queue
 import sys
 import threading
@@ -35,6 +36,28 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "telegram_config.json"
 CHATS_FILE = BASE_DIR.parent / ".pcagent" / "telegram_chats.json"
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("telegram-bot")
+
+
+def _setup_file_logging() -> None:
+    """统一运行日志：写入项目根 .pcagent/bot.log（1MB 轮转，保留 3 份）。"""
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_dir = BASE_DIR.parent / ".pcagent"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(log_dir / "bot.log", maxBytes=1_000_000,
+                                 backupCount=3, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+        log.info("运行日志已写入 %s", log_dir / "bot.log")
+    except Exception as exc:
+        log.warning("日志文件初始化失败：%s", exc)
+
+
+_setup_file_logging()
 MAX_TEXT = 3800          # Telegram 单消息上限 4096，留余量
 STREAM_TICK = 1.0        # 流式回复刷新间隔（秒）
 STREAM_TIMEOUT = 600     # 单次 agent 流硬超时（秒）
@@ -208,6 +231,7 @@ class Bot:
         if status == 200 and r.get("compressed"):
             new_msgs = r.get("messages") or msgs
             self.messages[chat_id] = new_msgs
+            log.info("上下文已压缩（%s → 估算 %s tokens）", est, estimate_tokens(new_msgs))
             print(f"[bot] 上下文已压缩（{est} → 估算 {estimate_tokens(new_msgs)} tokens）")
             return new_msgs
         return msgs
@@ -236,9 +260,11 @@ class Bot:
     def run(self) -> None:
         r = self.api("getMe")
         if not r.get("ok"):
+            log.error("无法连接 Telegram（token 无效或网络不通）：%s", r.get('description', ''))
             print(f"[bot] 无法连接 Telegram（token 无效或网络不通）：{r.get('description', '')}")
             print("[bot] 提示：国内访问 api.telegram.org 需要代理，可在 telegram_config.json 配 proxy")
             sys.exit(1)
+        log.info("已连接 @%s，开始轮询", r['result'].get('username', '?'))
         print(f"[bot] 已连接 @{r['result'].get('username', '?')}，开始轮询…")
         # 拉取上下文窗口（压缩阈值基准）；失败用默认
         status, data = self.llm("GET", "/api/v1/health")
@@ -249,6 +275,7 @@ class Bot:
             params = {"offset": self._offset, "timeout": 25}
             r = self.api("getUpdates", params, timeout=40)
             if not r.get("ok"):
+                log.warning("getUpdates 失败：%s（2 秒后重试）", r.get('description', ''))
                 print(f"[bot] getUpdates 失败：{r.get('description', '')}（2 秒后重试）")
                 time.sleep(2)
                 continue
@@ -330,6 +357,7 @@ class Bot:
             up_dir.mkdir(parents=True, exist_ok=True)
             target = up_dir / safe_name
             target.write_bytes(data)
+            log.info("收到文件 %s（%d KB）→ %s", safe_name, len(data) // 1024, target)
             self.send_message(
                 chat_id,
                 f"已收到 `{safe_name}`（{len(data) // 1024} KB）\n"
