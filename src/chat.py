@@ -126,6 +126,7 @@ def load_config() -> dict:
         "api_url": "https://api.deepseek.com/v1/chat/completions",
         "api_key": "",
         "model": "deepseek-v4-flash",
+        "reasoning_mode": "max",   # 推理强度：max（最高）/ high（高）/ off（关闭）
     }
 
 
@@ -141,7 +142,7 @@ class SettingsWindow:
         self.on_changed = on_changed   # 保存或连接成功后回调（主界面刷新 LLM 状态）
         self.win = tk.Toplevel(parent)
         self.win.title("Settings - API")
-        self.win.geometry("560x430")
+        self.win.geometry("560x470")
         self.win.configure(bg=BG)
         self.win.transient(parent)
         self.win.grab_set()
@@ -166,17 +167,34 @@ class SettingsWindow:
         # Model
         self._row(body, 2, "Model", "model")
 
+        # 推理强度（DeepSeek v4 系列）
+        _R_LABELS = {"max": "最高", "high": "高", "off": "关闭"}
+        current_rm = self.config.get("reasoning_mode") or "max"
+        tk.Label(body, text="推理强度", bg=BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="nw", pady=(14, 4))
+        self.reasoning_var = tk.StringVar(value=_R_LABELS.get(current_rm, "最高"))
+        opt = tk.OptionMenu(body, self.reasoning_var, *_R_LABELS.values())
+        opt.config(bg=PANEL_LIGHT, fg=TEXT, relief="flat", highlightthickness=0,
+                   font=("Segoe UI", 10), width=22, cursor="hand2")
+        opt["menu"].config(bg=PANEL_LIGHT, fg=TEXT, font=("Segoe UI", 10))
+        opt.grid(row=3, column=1, sticky="w", pady=(14, 4), padx=(12, 0))
+        self._r_by_label = {v: k for k, v in _R_LABELS.items()}
+        tk.Label(body, text="最高=reasoning_effort max · 高=high（默认平衡）\n"
+                            "关闭=禁用思考（最快最省）",
+                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 8), justify="left").grid(
+            row=3, column=1, sticky="w", padx=(12, 0), pady=(40, 0))
+
         # 提示文本（支持各种 OpenAI 兼容 API）
         tk.Label(body, text="支持任意 OpenAI 兼容接口：可直接填域名或 base_url，\n"
                             "例如 https://api.deepseek.com / https://api.openai.com/v1 /\n"
                             "http://localhost:11434/v1 ，路径会自动补全为 /chat/completions。",
                  bg=BG, fg=TEXT_DIM, justify="left", font=("Segoe UI", 9)).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(14, 0))
+            row=4, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
         # 测试连接结果
         self.test_result = tk.Label(body, text="", bg=BG, fg=TEXT_DIM, justify="left",
                                     wraplength=480, font=("Segoe UI", 9))
-        self.test_result.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.test_result.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # 按钮区
         btns = tk.Frame(self.win, bg=BG)
@@ -209,6 +227,7 @@ class SettingsWindow:
         self.config["api_url"] = self.entry_api_url.get().strip()
         self.config["api_key"] = self.entry_api_key.get().strip()
         self.config["model"] = self.entry_model.get().strip()
+        self.config["reasoning_mode"] = self._r_by_label.get(self.reasoning_var.get(), "max")
         save_config(self.config)
         if self.on_changed:
             self.on_changed()
@@ -220,6 +239,7 @@ class SettingsWindow:
         self.config["api_url"] = self.entry_api_url.get().strip()
         self.config["api_key"] = self.entry_api_key.get().strip()
         self.config["model"] = self.entry_model.get().strip()
+        self.config["reasoning_mode"] = self._r_by_label.get(self.reasoning_var.get(), "max")
         save_config(self.config)
         self.test_btn.config(state="disabled", text="Testing...")
         self.test_result.config(text="正在测试连接…", fg=TEXT_DIM)

@@ -699,6 +699,8 @@ class Cli:
             self.handle_model(parts[1:])
         elif cmd == "/confirm-mode":
             self.handle_confirm_mode(parts[1:])
+        elif cmd == "/reasoning":
+            self.handle_reasoning(parts[1:])
         elif cmd == "/config":
             self.handle_config(parts[1:])
         else:
@@ -754,6 +756,8 @@ class Cli:
         print(color(f"  API Key:  {c.get('api_key') or '（未设置）'}", "reset"))
         print(color(f"  Model:    {c.get('model') or '（未设置）'}", "reset"))
         print(color(f"  上下文窗口: {c.get('context_window', '?')} tokens", "reset"))
+        rm = c.get("reasoning_mode") or "max"
+        print(color(f"  推理强度: {rm}（{dict(self._REASONING_OPTIONS).get(rm, '?')}）", "reset"))
 
     def handle_apiconfig(self, args: List[str]) -> None:
         """设置 API：/apiconfig url=... key=... model=...（无参数时查看当前配置）"""
@@ -772,8 +776,8 @@ class Cli:
                 return
             k, v = a.split("=", 1)
             k = self._FIELD_ALIAS.get(k.strip().lower(), k.strip().lower())
-            if k not in ("api_url", "api_key", "model", "context_window"):
-                print(color(f"✗ 未知字段：{k}（支持 api_url/url、api_key/key、model、context_window）", "red"))
+            if k not in ("api_url", "api_key", "model", "context_window", "reasoning_mode"):
+                print(color(f"✗ 未知字段：{k}（支持 api_url/url、api_key/key、model、context_window、reasoning_mode）", "red"))
                 return
             fields[k] = v.strip()
         if "context_window" in fields:
@@ -837,6 +841,48 @@ class Cli:
         else:
             print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
 
+    # ---- 推理强度（DeepSeek v4 系列：max/high/off）----
+    _REASONING_OPTIONS = [
+        ("max", "最高强度（reasoning_effort=max，思考最深，较慢）"),
+        ("high", "高强度（reasoning_effort=high，默认平衡）"),
+        ("off", "关闭思考（thinking disabled，最快最省）"),
+    ]
+
+    def handle_reasoning(self, args: List[str]) -> None:
+        """推理强度：/reasoning 进入方向键菜单；或 /reasoning <max|high|off> 直接切换。"""
+        cfg = self.client.get_config()
+        if not cfg.get("ok"):
+            print(color(f"✗ 获取配置失败：{cfg.get('detail', '?')}", "red"))
+            return
+        current = cfg["config"].get("reasoning_mode") or "max"
+        if args:
+            mode = args[0].lower()
+            if mode not in dict(self._REASONING_OPTIONS):
+                print(color("✗ 无效档位，可选：max（最高）/ high（高）/ off（关闭）", "yellow"))
+                return
+            self._set_reasoning(mode)
+            return
+        # 交互选择：方向键 ↑/↓ 移动，Enter 确认
+        options = [f"{m:<4} {d}" for m, d in self._REASONING_OPTIONS]
+        idx = next((i for i, (m, _) in enumerate(self._REASONING_OPTIONS) if m == current), 0)
+        sel = select_menu(f"推理强度选择（当前: {current}）", options, idx)
+        if sel is None:
+            print(color("已取消", "dim"))
+            return
+        target = self._REASONING_OPTIONS[sel][0]
+        if target == current:
+            print(color(f"✓ 已是当前档位：{current}", "dim"))
+            return
+        self._set_reasoning(target)
+
+    def _set_reasoning(self, mode: str) -> None:
+        label = dict(self._REASONING_OPTIONS).get(mode, mode)
+        r = self.client.update_config({"reasoning_mode": mode})
+        if r.get("ok"):
+            print(color(f"✓ 推理强度已切换为 {mode}（{label}），实时生效", "green"))
+        else:
+            print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
+
     def handle_config(self, args: List[str]) -> None:
         cfg = load_config()
         for a in args:
@@ -865,6 +911,7 @@ class Cli:
         print(color("  /apiconfig        查看/设置 API（url=/key=/model=）", "reset"))
         print(color("  /model            查看/切换模型（/model 模型名）", "reset"))
         print(color("  /confirm-mode     问询模式：↑/↓ 方向键选择，回车确认", "reset"))
+        print(color("  /reasoning        推理强度：↑/↓ 选择 最高(max)/高(high)/关闭(off)", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))

@@ -56,7 +56,14 @@ wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python telegram_bot.py &"
 .venv\Scripts\python src\cli.py --token sk-xxx --api-url https://api.deepseek.com
 ```
 
-CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认模式，`/stats` 看 token 用量。
+CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认模式，`/reasoning` 切推理强度，`/stats` 看 token 用量。
+
+**推理强度**（DeepSeek v4 系列）：三档可选，默认最高。
+- 最高（`max`）→ `reasoning_effort: max`，思考最深，复杂任务效果最好
+- 高（`high`）→ `reasoning_effort: high`，速度与质量平衡
+- 关闭（`off`）→ 禁用思考（`thinking: disabled`），最快最省，适合简单问答
+
+CLI 里 `/reasoning`（或 `/reasoning max|high|off`）切换；Chat 界面在 Settings 里选；配置存 `chat_config.json` 实时生效。上下文压缩和连接测试固定用「关闭」，不吃你的思考配额。
 
 ## Agent 能干的事
 

@@ -408,8 +408,11 @@ class Bot:
             self.send_message(chat_id, f"LLM 后端未连接：{data.get('detail', '')}")
             return
         sid = self.chats.get(chat_id, {}).get("session_id", 0)
+        rm = data.get("reasoning_mode") or "max"
+        rm_label = {"max": "最高", "high": "高", "off": "关闭"}.get(rm, rm)
         self.send_message(chat_id,
                           f"后端: v{data.get('version', '?')} · {'已配置 ' + data.get('model', '') if data.get('configured') else '未配置 API'}\n"
+                          f"推理强度: {rm}（{rm_label}）\n"
                           f"隔离模式: {'是' if data.get('isolated') else '否'}\n"
                           f"当前会话: #{sid}\n工具: {len(data.get('tools') or [])} 个")
 

@@ -36,3 +36,6 @@ jobs:
 
       - name: CLI 会话测试（摘要/懒加载/降级）
         run: python tests/cli_session_test.py
+
+      - name: 推理强度测试（max/high/off 映射与持久化）
+        run: python tests/reasoning_test.py

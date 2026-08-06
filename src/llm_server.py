@@ -283,6 +283,12 @@ def _setup_file_logging() -> None:
 _setup_file_logging()
 
 
+# 推理强度三档：max=最高（reasoning_effort: max）/ high=高（reasoning_effort: high）/
+# off=关闭思考（thinking: {"type": "disabled"}，不发 reasoning_effort）
+REASONING_MODES = ("max", "high", "off")
+REASONING_MODE_LABEL = {"max": "最高", "high": "高", "off": "关闭"}
+
+
 def load_config() -> dict:
     default = {
         "api_url": "https://api.deepseek.com/v1/chat/completions",
@@ -290,6 +296,7 @@ def load_config() -> dict:
         "model": "deepseek-v4-flash",
         "context_window": 65536,   # 模型上下文窗口（token），用于容量显示与压缩阈值
         "confirm_mode": "auto",    # 问询模式：auto/strict/trusted/query
+        "reasoning_mode": "max",   # 推理强度：max/high/off（DeepSeek v4 系列）
     }
     if CONFIG_PATH.exists():
         try:
@@ -297,6 +304,22 @@ def load_config() -> dict:
         except Exception:
             log.warning("chat_config.json 解析失败，使用默认配置")
     return default
+
+
+def _apply_reasoning(payload: dict, mode: str | None = None) -> None:
+    """按推理强度档位向请求 payload 注入 DeepSeek v4 推理参数。
+
+    max → reasoning_effort: "max"；high → reasoning_effort: "high"；
+    off → thinking: {"type": "disabled"}（同时不携带 reasoning_effort）。
+    仅 DeepSeek v4 系列支持；其他 OpenAI 兼容服务如报参数错误可改为 off。
+    """
+    mode = mode or str(load_config().get("reasoning_mode") or "max")
+    if mode not in REASONING_MODES:
+        mode = "max"
+    if mode == "off":
+        payload["thinking"] = {"type": "disabled"}
+    else:
+        payload["reasoning_effort"] = mode
 
 
 def normalize_url(raw: str) -> str:
@@ -339,6 +362,7 @@ class ConfigUpdate(BaseModel):
     api_key: str | None = None
     model: str | None = None
     context_window: int | None = None
+    reasoning_mode: str | None = None
 
 
 class LlmError(Exception):
@@ -428,7 +452,7 @@ async def compress(req: CompressRequest) -> dict:
     early = others[:-req.keep_recent]
     early_json = json.dumps(early, ensure_ascii=False)
 
-    # 用模型生成早期对话摘要（非流式，少量 token）
+    # 用模型生成早期对话摘要（非流式，少量 token）；摘要任务关闭思考，更快更省
     payload = {
         "model": model,
         "messages": [
@@ -438,6 +462,7 @@ async def compress(req: CompressRequest) -> dict:
         "temperature": 0.3,
         "max_tokens": 500,
     }
+    _apply_reasoning(payload, "off")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     loop = asyncio.get_running_loop()
     try:
@@ -477,6 +502,7 @@ async def get_config() -> dict:
         "api_key": "***" if cfg.get("api_key") else "",
         "model": cfg.get("model", ""),
         "context_window": cfg.get("context_window", 65536),
+        "reasoning_mode": cfg.get("reasoning_mode", "max"),
     }}
 
 
@@ -498,8 +524,14 @@ async def update_config(req: ConfigUpdate) -> dict:
             raise HTTPException(422, "context_window 必须是正整数")
         cfg["context_window"] = req.context_window
         updates["context_window"] = True
+    if req.reasoning_mode is not None:
+        if req.reasoning_mode not in REASONING_MODES:
+            raise HTTPException(422, f"无效推理强度，可选：{' / '.join(REASONING_MODES)}")
+        cfg["reasoning_mode"] = req.reasoning_mode
+        updates["reasoning_mode"] = True
     if not updates:
-        raise HTTPException(422, "没有可更新的字段（支持 api_url/api_key/model/context_window）")
+        raise HTTPException(
+            422, "没有可更新的字段（支持 api_url/api_key/model/context_window/reasoning_mode）")
     try:
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     except OSError as exc:
@@ -510,6 +542,7 @@ async def update_config(req: ConfigUpdate) -> dict:
         "api_key": "***" if cfg.get("api_key") else "",
         "model": cfg.get("model", ""),
         "context_window": cfg.get("context_window", 65536),
+        "reasoning_mode": cfg.get("reasoning_mode", "max"),
     }}
 
 
@@ -537,6 +570,7 @@ async def health() -> dict:
         "api_url": normalize_url(cfg.get("api_url")),
         "model": cfg.get("model") or "",
         "context_window": cfg.get("context_window") or 65536,
+        "reasoning_mode": cfg.get("reasoning_mode", "max"),
         "isolated": ISOLATED,
         "tools": sorted(t["function"]["name"] for t in _agent_tools()),
     }
@@ -556,6 +590,7 @@ async def test_connection() -> dict:
         "temperature": 0,
         "max_tokens": 200,  # 足够大：v4-flash 等模型先输出推理再输出正式回答
     }
+    _apply_reasoning(payload, "off")  # 连通性测试关闭思考，快速返回
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     loop = asyncio.get_running_loop()
     try:
@@ -574,6 +609,7 @@ async def chat(req: ChatRequest) -> dict:
     _validate_config(api_url, api_key, req.messages)
 
     payload = {"model": model, "messages": req.messages, "temperature": req.temperature}
+    _apply_reasoning(payload)
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     loop = asyncio.get_running_loop()
@@ -2194,6 +2230,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
 
         payload = {"model": model, "messages": messages, "temperature": temperature,
                    "tools": _agent_tools()}
+        _apply_reasoning(payload)
         try:
             data = _call_upstream_raw(api_url, payload, headers)
         except LlmError as exc:
@@ -2393,6 +2430,7 @@ async def chat_stream(req: ChatRequest):
 
     payload = {"model": model, "messages": _trim_messages(req.messages),
                "temperature": req.temperature, "stream": True}
+    _apply_reasoning(payload)
     return StreamingResponse(
         _stream_events(api_url, payload, headers),
         media_type="text/event-stream",
