@@ -170,6 +170,24 @@ check("list_processes 可用", ok and "processes" in ok_json(res), res)
 ok, res = run("start_process", json.dumps({"command": "rm -rf /etc"}))
 check("start_process 黑名单拦截", not ok and "拦截" in res, res)
 
+# ============ 4.5 超时 debug ============
+print("== 4.5 run_shell / run_code 超时 debug ==")
+L.RUN_SHELL_TIMEOUT = 2
+cmd = f'{py} -c "import time; print(\'progress-x\', flush=True); time.sleep(10)"'
+ok, res = run("run_shell", json.dumps({"command": cmd}))
+data = ok_json(res)
+check("run_shell 超时返回现场", not ok and "超时" in data.get("error", ""), res[:150])
+check("run_shell 带回部分输出", "progress-x" in data.get("partial_stdout", ""), str(data)[:200])
+check("run_shell 超时 hint 建议", "start_process" in data.get("hint", ""), "")
+
+L.RUN_CODE_TIMEOUT = 2
+ok, res = run("run_code", json.dumps({"code": "import time; print('code-progress', flush=True); time.sleep(10)"}))
+data = ok_json(res)
+check("run_code 超时返回现场", not ok and "超时" in data.get("error", ""), res[:150])
+check("run_code 带回部分输出", "code-progress" in data.get("partial_stdout", ""), str(data)[:200])
+L.RUN_SHELL_TIMEOUT = 30
+L.RUN_CODE_TIMEOUT = 30
+
 # ============ 5. 任务规划 ============
 print("== 5. create_todo / update_todo / list_todos ==")
 L._todos = []

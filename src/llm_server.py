@@ -1003,6 +1003,52 @@ def _start_process_impl(command: str, cwd: Path) -> tuple[bool, str]:
                              "started": _processes[proc.pid]["started"]}, ensure_ascii=False)
 
 
+def _kill_process_tree(proc) -> None:
+    """杀整个进程组/控制台组（shell 启动的子进程一并结束），防止残留。"""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, text=True)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _run_subprocess(cmd, cwd, timeout: float, shell: bool = True) -> tuple[int, str, str, bool]:
+    """统一子进程执行（run_shell / run_code 共用）。
+
+    超时处理：杀整个进程组（防子进程残留），并带回超时前的完整部分输出——
+    让模型能判断命令是「真慢（有进度）」还是「卡死（无输出）」。
+
+    返回 (returncode, stdout, stderr, timed_out)；输出统一 bytes 解码容错。
+    """
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  cwd=str(cwd), shell=shell)
+    if sys.platform != "win32":
+        kwargs["executable"] = "/bin/bash" if shell else None
+        kwargs["start_new_session"] = True          # 独立进程组，超时可整组击杀
+    else:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        out, err = proc.communicate()               # 杀完后再取剩余输出
+        return proc.returncode, out, err, True
+
+
+def _decode_out(data) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return data or ""
+
+
 def _stop_process_impl(pid: int) -> tuple[bool, str]:
     with _process_lock:
         entry = _processes.get(pid)
@@ -1010,14 +1056,7 @@ def _stop_process_impl(pid: int) -> tuple[bool, str]:
             return False, f"进程不存在：{pid}（可用 list_processes 查看）"
         proc = entry["proc"]
     if proc.poll() is None:
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, text=True)
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        _kill_process_tree(proc)
     return True, json.dumps({"pid": pid, "stopped": True}, ensure_ascii=False)
 
 
@@ -1544,20 +1583,24 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if not code.strip():
                 return False, "没有可执行的代码（请提供 file 或 code 参数）"
             try:
-                proc = subprocess.run(
-                    [sys.executable, "-c", code],
-                    cwd=str(workspace), capture_output=True, text=True,
-                    timeout=RUN_CODE_TIMEOUT, shell=False,
-                )
-            except subprocess.TimeoutExpired:
-                return False, f"执行超时（>{RUN_CODE_TIMEOUT}s），已强制终止"
+                rc, out, err, timed_out = _run_subprocess(
+                    [sys.executable, "-c", code], workspace, RUN_CODE_TIMEOUT, shell=False)
+            except FileNotFoundError:
+                return False, "Python 解释器不存在"
             except Exception as exc:
                 return False, f"执行失败：{exc}"
-            stdout = (proc.stdout or "")[:RUN_CODE_OUTPUT_LIMIT]
-            stderr = (proc.stderr or "")[:RUN_CODE_OUTPUT_LIMIT]
-            if proc.returncode != 0:
-                return False, json.dumps({"exit_code": proc.returncode, "stderr": stderr},
-                                         ensure_ascii=False)
+            stdout = _decode_out(out)[:RUN_CODE_OUTPUT_LIMIT]
+            stderr = _decode_out(err)[:RUN_CODE_OUTPUT_LIMIT]
+            if timed_out:
+                # 超时即 debug：带回超时前的部分输出，让模型判断是慢还是卡死
+                return False, json.dumps({
+                    "error": f"执行超时（>{RUN_CODE_TIMEOUT}s），进程组已强制终止",
+                    "exit_code": rc, "partial_stdout": stdout, "partial_stderr": stderr,
+                    "hint": "以上是超时前产生的输出。有持续输出=代码还在跑（如循环/下载），"
+                            "可缩短任务或改用 start_process 后台执行；无输出=可能卡死（如阻塞等待输入）。",
+                }, ensure_ascii=False)
+            if rc != 0:
+                return False, json.dumps({"exit_code": rc, "stderr": stderr}, ensure_ascii=False)
             return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
         if name == "run_shell":
             command = (args.get("command") or "").strip()
@@ -1571,21 +1614,25 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                     return False, f"危险命令已被拦截：{command[:80]}（破坏性操作禁止执行）"
             cwd = (args.get("cwd") or "").strip() or str(_get_workspace())
             try:
-                proc = subprocess.run(
-                    command, shell=True, cwd=cwd, capture_output=True, text=True,
-                    timeout=RUN_SHELL_TIMEOUT,
-                    executable="/bin/bash" if sys.platform != "win32" else None,
-                )
-            except subprocess.TimeoutExpired:
-                return False, f"执行超时（>{RUN_SHELL_TIMEOUT}s），已强制终止"
+                rc, out, err, timed_out = _run_subprocess(
+                    command, cwd, RUN_SHELL_TIMEOUT, shell=True)
             except FileNotFoundError:
                 return False, f"目录不存在：{cwd}"
             except Exception as exc:
                 return False, f"执行失败：{exc}"
-            stdout = (proc.stdout or "")[:RUN_SHELL_OUTPUT_LIMIT]
-            stderr = (proc.stderr or "")[:RUN_SHELL_OUTPUT_LIMIT]
-            if proc.returncode != 0:
-                return False, json.dumps({"exit_code": proc.returncode,
+            stdout = _decode_out(out)[:RUN_SHELL_OUTPUT_LIMIT]
+            stderr = _decode_out(err)[:RUN_SHELL_OUTPUT_LIMIT]
+            if timed_out:
+                # 超时即 debug：部分输出 + 处置建议
+                return False, json.dumps({
+                    "error": f"执行超时（>{RUN_SHELL_TIMEOUT}s），进程组已强制终止",
+                    "exit_code": rc, "partial_stdout": stdout, "partial_stderr": stderr,
+                    "hint": "以上是超时前产生的输出。有持续输出=命令在正常推进（编译/下载/安装），"
+                            "可拆分步骤执行或改用 start_process 后台运行（process_output 分次查看）；"
+                            "无输出且无进度=命令卡死（如等待交互输入），请检查命令是否挂起。",
+                }, ensure_ascii=False)
+            if rc != 0:
+                return False, json.dumps({"exit_code": rc,
                                           "stderr": stderr or stdout}, ensure_ascii=False)
             return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
         # ================= 编程工具：检索 =================
