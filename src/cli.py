@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -61,6 +62,103 @@ def color(text: str, code: str = "reset") -> str:
     if not sys.stdout.isatty():
         return text
     return f"{_ANSI[code]}{text}{_ANSI['reset']}"
+
+
+# ======================================================================
+# 方向键选择菜单（跨平台：Windows msvcrt / Linux termios，零依赖）
+# ======================================================================
+def _read_key() -> Optional[str]:
+    """读取单个按键。返回 'up'/'down'/'enter'/'esc'/普通字符；非交互环境返回 None。"""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            if not msvcrt.kbhit():
+                return None
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):            # 功能键前缀（方向键等）
+                ch2 = msvcrt.getwch()
+                return {"H": "up", "P": "down"}.get(ch2, "enter")
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x1b":
+                return "esc"
+            return ch.lower()
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    seq = sys.stdin.read(2)
+                    if seq == "[A":
+                        return "up"
+                    if seq == "[B":
+                        return "down"
+                    return "esc"
+                if ch in ("\r", "\n"):
+                    return "enter"
+                return ch.lower()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        return None
+
+
+def select_menu(title: str, options: List[str], current: int = 0) -> Optional[int]:
+    """方向键选择菜单：↑/↓ 移动，Enter 确认，q/Esc 取消。
+    非交互环境（管道/重定向）直接打印列表并返回 None。"""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(color(title, "bold"))
+        for i, opt in enumerate(options):
+            print(color(f"  {'▶' if i == current else ' '} {opt}",
+                        "bold" if i == current else "reset"))
+        return None
+    if sys.platform == "win32":
+        os.system("")   # 启用 Windows 控制台 ANSI 转义序列（Win10+）
+    n = len(options)
+    sel = max(0, min(current, n - 1))
+    print()
+    print(color(title, "bold"))
+    for i, opt in enumerate(options):
+        print(color(f"  {'▶' if i == sel else ' '} {opt}", "bold" if i == sel else "reset"))
+    hint = color("  ↑/↓ 选择 · Enter 确认 · q/Esc 取消", "dim")
+    print(hint)
+
+    def draw() -> None:
+        # 光标在 hint 行后，上移 n+1 行到第一个选项行，重写全部选项 + hint
+        sys.stdout.write(f"\033[{n + 1}A")
+        for i in range(n):
+            sys.stdout.write("\033[2K" + color(f"  {'▶' if i == sel else ' '} {options[i]}",
+                                               "bold" if i == sel else "reset") + "\n")
+        sys.stdout.write("\033[2K" + hint + "\n")
+        sys.stdout.flush()
+
+    def cleanup() -> None:
+        # 上移 n+2 行（标题+选项+hint），逐行清空，光标复位
+        sys.stdout.write(f"\033[{n + 2}A")
+        for _ in range(n + 2):
+            sys.stdout.write("\033[2K\033[1B")
+        sys.stdout.write("\033[2K\r")
+        sys.stdout.flush()
+
+    while True:
+        key = _read_key()
+        if key == "up":
+            sel = (sel - 1) % n
+            draw()
+        elif key == "down":
+            sel = (sel + 1) % n
+            draw()
+        elif key == "enter":
+            cleanup()
+            return sel
+        elif key in ("esc", "q"):
+            cleanup()
+            return None
+        # 其他按键忽略（保持菜单等待）
 
 
 def _setup_utf8_stdio() -> None:
@@ -628,19 +726,30 @@ class Cli:
             print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
 
     def handle_confirm_mode(self, args: List[str]) -> None:
-        """问询模式：/confirm-mode [auto|strict|trusted|query]"""
-        if not args:
-            r = self.client.get_confirm_mode()
-            if not r.get("ok"):
-                print(color(f"✗ 获取模式失败：{r.get('detail', '?')}", "red"))
-                return
-            print(color(f"当前问询模式: {r.get('mode')}", "bold"))
-            for m, desc in (r.get("descriptions") or {}).items():
-                mark = "→" if m == r.get("mode") else " "
-                print(color(f"  {mark} {m:<8} {desc}", "dim" if m != r.get("mode") else "reset"))
-            print(color("  切换: /confirm-mode auto|strict|trusted|query", "dim"))
+        """问询模式：/confirm-mode 进入方向键选择菜单；或 /confirm-mode <模式名> 直接切换。"""
+        r = self.client.get_confirm_mode()
+        if not r.get("ok"):
+            print(color(f"✗ 获取模式失败：{r.get('detail', '?')}", "red"))
             return
-        r = self.client.set_confirm_mode(args[0])
+        modes = r.get("modes") or list((r.get("descriptions") or {}).keys())
+        if args:
+            self._set_confirm_mode(args[0])
+            return
+        # 交互选择：方向键 ↑/↓ 移动，Enter 确认
+        current = modes.index(r.get("mode")) if r.get("mode") in modes else 0
+        options = [f"{m:<9} {(r.get('descriptions') or {}).get(m, '')}" for m in modes]
+        sel = select_menu(f"问询模式选择（当前: {r.get('mode')}）", options, current)
+        if sel is None:
+            print(color("已取消", "dim"))
+            return
+        target = modes[sel]
+        if target == r.get("mode"):
+            print(color(f"✓ 已是当前模式：{target}", "dim"))
+            return
+        self._set_confirm_mode(target)
+
+    def _set_confirm_mode(self, mode: str) -> None:
+        r = self.client.set_confirm_mode(mode)
         if r.get("ok"):
             print(color(f"✓ 问询模式已切换为 {r.get('mode')}：{r.get('description', '')}", "green"))
         else:
