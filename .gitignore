@@ -6,3 +6,6 @@ venv/
 chat_config.json
 *.bak
 chat_config.json.bak
+
+# ZCode 工具内部文件
+.zcode/
