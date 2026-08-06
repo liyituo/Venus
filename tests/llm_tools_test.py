@@ -5,6 +5,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,24 @@ check("run_code 超时返回现场", not ok and "超时" in data.get("error", ""
 check("run_code 带回部分输出", "code-progress" in data.get("partial_stdout", ""), str(data)[:200])
 L.RUN_SHELL_TIMEOUT = 30
 L.RUN_CODE_TIMEOUT = 30
+
+# ============ 4.6 Windows shell 适配（平台相关）============
+print("== 4.6 shell 平台适配 ==")
+check("只读判定 Linux 命令", L._is_readonly_shell("ls -la"), "")
+check("重定向视为写", not L._is_readonly_shell("echo hi > f.txt"), "")
+if sys.platform == "win32":
+    check("Windows 只读命令免确认", L._is_readonly_shell("dir /b"), "")
+    check("Windows 只读命令2", L._is_readonly_shell("tasklist"), "")
+else:
+    check("Linux 环境 dir 不算只读（cmd 专有）", not L._is_readonly_shell("dir"), "")
+check("黑名单: format C:", bool([p for p in L.DANGEROUS_PATTERNS if re.search(p, "format C:")]), "")
+check("黑名单: rd /s /q C:\\", bool([p for p in L.DANGEROUS_PATTERNS
+                                     if re.search(p, "rd /s /q C:\\")]), "")
+check("黑名单: diskpart", bool([p for p in L.DANGEROUS_PATTERNS
+                                if re.search(p, "diskpart")]), "")
+check("黑名单: reg add", bool([p for p in L.DANGEROUS_PATTERNS
+                               if re.search(p, "reg add HKLM")]), "")
+check("正常命令不受影响", not any(re.search(p, "dir /b") for p in L.DANGEROUS_PATTERNS), "")
 
 # ============ 5. 任务规划 ============
 print("== 5. create_todo / update_todo / list_todos ==")

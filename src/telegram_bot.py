@@ -41,6 +41,8 @@ STREAM_TIMEOUT = 600     # 单次 agent 流硬超时（秒）
 COMPRESS_THRESHOLD = 0.6 # 上下文达到窗口 60% 时压缩
 KEEP_RECENT = 8          # 压缩时保留最近 N 条原文
 MAX_LOCAL_MESSAGES = 100 # bot 本地历史上限（内存控制；发送仍受后端 20 条/12 万字符裁剪）
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024   # 手机上传文件大小上限（20MB）
+UPLOAD_DIR = "telegram_uploads"       # 上传文件存放目录（工作区内）
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -267,31 +269,74 @@ class Bot:
     def handle_message(self, msg: dict) -> None:
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
-        if not text:
-            return
         if not self.allowed(chat_id):
             if text == "/start" and self.register_owner(chat_id):
                 self.send_message(chat_id, "已登记你为管理员（白名单为空时的首个 /start）。")
             else:
                 return   # 非白名单：静默忽略
-        if text == "/start" or text == "/help":
-            self.cmd_help(chat_id)
-        elif text == "/new":
-            sid = self.get_or_create_session(chat_id)
-            self.messages.pop(chat_id, None)
-            self.send_message(chat_id, f"已创建 会话 #{sid}，开始新任务。")
-        elif text == "/sessions":
-            self.cmd_sessions(chat_id)
-        elif text.startswith("/switch"):
-            self.cmd_switch(chat_id, text)
-        elif text == "/status":
-            self.cmd_status(chat_id)
-        elif text == "/stats":
-            self.cmd_stats(chat_id)
-        elif text.startswith("/"):
-            self.send_message(chat_id, f"未知命令：{text}（/help 查看）")
-        else:
-            threading.Thread(target=self.agent_flow, args=(chat_id, text), daemon=True).start()
+        if text:
+            if text == "/start" or text == "/help":
+                self.cmd_help(chat_id)
+            elif text == "/new":
+                sid = self.get_or_create_session(chat_id)
+                self.messages.pop(chat_id, None)
+                self.send_message(chat_id, f"已创建 会话 #{sid}，开始新任务。")
+            elif text == "/sessions":
+                self.cmd_sessions(chat_id)
+            elif text.startswith("/switch"):
+                self.cmd_switch(chat_id, text)
+            elif text == "/status":
+                self.cmd_status(chat_id)
+            elif text == "/stats":
+                self.cmd_stats(chat_id)
+            elif text.startswith("/"):
+                self.send_message(chat_id, f"未知命令：{text}（/help 查看）")
+            else:
+                threading.Thread(target=self.agent_flow, args=(chat_id, text), daemon=True).start()
+        elif msg.get("document") or msg.get("photo"):
+            # 文件消息：下载到工作区 telegram_uploads/，供 agent 处理
+            threading.Thread(target=self.handle_file, args=(chat_id, msg), daemon=True).start()
+
+    def handle_file(self, chat_id: int, msg: dict) -> None:
+        """接收手机上传的文件/图片，保存到工作区 telegram_uploads/ 并告知位置。"""
+        try:
+            if "document" in msg:
+                doc = msg["document"]
+                file_id = doc["file_id"]
+                fname = doc.get("file_name") or f"file_{file_id[:8]}"
+                size = doc.get("file_size") or 0
+            else:
+                photo = msg["photo"][-1]   # 取最大尺寸
+                file_id = photo["file_id"]
+                fname = f"photo_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                size = photo.get("file_size") or 0
+            if size > MAX_UPLOAD_BYTES:
+                self.send_message(chat_id, f"文件过大（{size // 1024} KB > 20MB 上限）")
+                return
+            # 获取文件路径并下载（走代理）
+            r = self.api("getFile", {"file_id": file_id})
+            if not r.get("ok"):
+                self.send_message(chat_id, f"获取文件失败：{r.get('description', '')}")
+                return
+            file_path = r["result"].get("file_path", "")
+            if not file_path:
+                self.send_message(chat_id, "文件下载失败（无 file_path）")
+                return
+            url = f"https://api.telegram.org/file/bot{self.cfg.get('bot_token', '')}/{file_path}"
+            data = self.opener.open(url, timeout=60).read()
+            # 安全落盘：文件名清洗（防路径穿越），统一放 telegram_uploads/
+            safe_name = Path(fname).name.strip()[:120] or f"file_{int(time.time())}"
+            up_dir = Path.home() / "agent_workspace" / UPLOAD_DIR
+            up_dir.mkdir(parents=True, exist_ok=True)
+            target = up_dir / safe_name
+            target.write_bytes(data)
+            self.send_message(
+                chat_id,
+                f"已收到 `{safe_name}`（{len(data) // 1024} KB）\n"
+                f"存放在工作区 `{UPLOAD_DIR}/{safe_name}`\n"
+                f"想让我怎么处理？（如「读取并解释」「检查 bug」）")
+        except Exception as exc:
+            self.send_message(chat_id, f"文件接收失败：{exc}")
 
     def cmd_help(self, chat_id: int) -> None:
         self.send_message(chat_id, (

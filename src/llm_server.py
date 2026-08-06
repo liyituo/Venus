@@ -68,6 +68,13 @@ READONLY_SHELL = re.compile(
     r"which|type|file|stat|wc|sort|cut|awk|sed -n|history|printenv|id|hostname|"
     r"uptime|free|getconf|locale)\b"
 )
+# Windows（cmd）只读命令白名单：Linux 白名单 + cmd 原生只读命令
+READONLY_SHELL_WIN = re.compile(
+    r"^\s*(ls|cat|head|tail|grep|find|echo|pwd|whoami|date|df|du|uname|ps|env|"
+    r"which|type|file|stat|wc|sort|cut|awk|sed -n|history|printenv|id|hostname|"
+    r"uptime|free|getconf|locale|dir|more|findstr|where|tasklist|systeminfo|"
+    r"ver|set|path|cd|cls|help|netstat|ipconfig|reg query)\b"
+)
 
 # 确认请求需要发 ask 事件的敏感工具
 CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process"}
@@ -151,6 +158,13 @@ DANGEROUS_PATTERNS = [
     r">+\s*/dev/sd",                         # 写块设备
     r"\bsudo\s+rm\b",
     r"\bgit\s+push\s+(-f|--force)",          # 强制推送（防误覆盖远程）
+    # ---- Windows 破坏性命令 ----
+    r"\bformat\s+[a-zA-Z]:",                 # format C:（格式化盘符）
+    r"\bdiskpart\b",                         # 磁盘分区工具
+    r"\b(rd|rmdir|deltree)\s+(/\w+\s+)*[a-zA-Z]:",  # rd /s /q C:\（递归删盘）
+    r"\bdel\s+/\w*\s*[a-zA-Z]:\\",           # del /f /s /q C:\*
+    r"\breg\s+(add|delete)\b",               # 注册表写操作
+    r"\bcipher\s+/\w*[w]",                   # cipher /w（擦除磁盘）
 ]
 
 # ---- 编程工具安全限制（检索 / 编辑 / git / 进程 / todo / repo 索引）----
@@ -1307,9 +1321,12 @@ def _agent_tools() -> list[dict]:
 
 
 def _is_readonly_shell(command: str) -> bool:
-    """判断 shell 命令是否只读（免确认）。重定向到真实文件视为写操作。"""
+    """判断 shell 命令是否只读（免确认）。重定向到真实文件视为写操作。
+    平台相关：Windows(cmd) 用 Windows 白名单（dir/more/findstr 等）。"""
     if re.search(r">\s*(?!/?dev/null\b)\S", command):   # > file 或 >> file（排除 >/dev/null、2>/dev/null）
         return False
+    if sys.platform == "win32":
+        return bool(READONLY_SHELL_WIN.match(command))
     return bool(READONLY_SHELL.match(command))
 
 
