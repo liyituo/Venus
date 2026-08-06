@@ -12,3 +12,6 @@ chat_config.json.bak
 
 # 本地会话数据（含聊天记录，严禁入库）
 .pcagent/
+
+# Telegram bot 配置（含 bot token，严禁入库）
+telegram_config.json

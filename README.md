@@ -6,7 +6,7 @@
 
 - `src/app.py` — 屏幕控制 daemon，所有鼠标键盘操作在单线程队列里排队执行
 - `src/llm_server.py` — LLM 中转，接任意 OpenAI 兼容接口，把模型的工具调用转成实际动作
-- 前端 — `src/chat.py`（聊天窗）、`src/cli.py`（终端）、`src/gui.py`（屏幕面板）
+- 前端 — `src/chat.py`（聊天窗）、`src/cli.py`（终端）、`src/gui.py`（屏幕面板）、`src/telegram_bot.py`（手机遥控）
 
 ## 快速开始（Windows）
 
@@ -29,6 +29,22 @@ bash scripts/start_wsl.sh
 ```
 
 脚本用 `--isolated` 模式启动：删掉全部屏幕工具，只留文件类，保证不碰 Windows 桌面（前提是 WSL 配了 `automount=false`、`interop=false`）。
+
+**WSL 里跑 Telegram 前端（手机遥控，纯标准库）：**
+
+```
+# 1. Windows 侧传代码（base64 管道，不依赖 /mnt）
+base64 -w0 src/telegram_bot.py | wsl -d Debian -- bash -c "base64 -d > ~/telegram_bot.py"
+
+# 2. WSL 里建配置 telegram_config.json（含 bot token，不入库）：
+#    { "bot_token": "BotFather 获取", "proxy": "http://<宿主机IP>:7890",
+#      "llm_url": "http://127.0.0.1:8001", "allowed_chat_ids": [] }
+
+# 3. WSL 里后台运行
+wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python telegram_bot.py &"
+```
+
+白名单 `allowed_chat_ids` 留空时，第一个发 `/start` 的人自动成为管理员；敏感操作在手机上弹允许/拒绝按钮。
 
 ## 命令行
 
