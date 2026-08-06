@@ -45,6 +45,11 @@ r = client.get("/api/v1/sessions")
 data = r.json()
 check("列表含 2 个会话", r.status_code == 200 and len(data["sessions"]) == 2, str(data))
 check("新会话消息为空", data["sessions"][0]["message_count"] == 0, str(data))
+check("默认列表不含 messages（摘要模式）",
+      all("messages" not in s for s in data["sessions"]), str(data)[:200])
+r = client.get("/api/v1/sessions?full=1")
+data = r.json()
+check("full=1 含完整消息", all("messages" in s for s in data["sessions"]), str(data)[:200])
 
 # ============ 2. 追加与自动标题 ============
 print("== 2. 追加消息 / 自动标题 ==")

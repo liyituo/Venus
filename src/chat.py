@@ -599,7 +599,7 @@ class ChatApp:
     # ------------------------------------------------------------------ 会话持久化
     def _load_sessions_from_server(self):
         """后台线程：从 LLM 后端拉取全部会话（含消息）用于恢复。"""
-        code, data, _ = api_request(self.llm_url, "GET", "/api/v1/sessions", timeout=8)
+        code, data, _ = api_request(self.llm_url, "GET", "/api/v1/sessions?full=1", timeout=8)
         if code != 200:
             return ("err", "无法连接 LLM 后端，本次会话仅保存在内存（重启丢失）")
         return ("ok", data.get("sessions") or [])

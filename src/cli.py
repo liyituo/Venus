@@ -489,17 +489,28 @@ class Cli:
         self.restore_sessions()
 
     # ---- 会话 ----
+    def _ensure_loaded(self, sid: int) -> None:
+        """按需加载会话消息：只在需要时拉取单个会话（不启动全量拉取，省网络/内存）。"""
+        sess = self.sessions.get(sid)
+        if sess is None or sess.get("messages") or not sess.get("count"):
+            return   # 已加载 / 不存在 / 空会话
+        status, data = self.client.api("GET", f"/api/v1/sessions/{sid}")
+        if status == 200:
+            sess["messages"] = [dict(m) for m in
+                                (data.get("session") or {}).get("messages", [])]
+            sess["count"] = len(sess["messages"])
+
     def restore_sessions(self) -> None:
-        """启动时从后端恢复持久化会话（权威源）；失败降级为本地新建。"""
+        """启动时从后端恢复会话列表（仅摘要，不拉消息）；失败降级为本地新建。"""
         status, data = self.client.api("GET", "/api/v1/sessions")
         if status == 200 and isinstance(data, dict):
             for s in data.get("sessions") or []:
                 sid = int(s["id"])
-                self.sessions[sid] = {"messages": [dict(m) for m in (s.get("messages") or [])],
-                                      "title": s.get("title") or ""}
+                self.sessions[sid] = {"messages": [], "title": s.get("title") or "",
+                                      "count": s.get("message_count") or 0}
             if self.sessions:
                 self.current = max(self.sessions)
-                n = len(self.sessions[self.current]["messages"]) // 2
+                n = self.sessions[self.current]["count"] // 2
                 print(color(f"已恢复 {len(self.sessions)} 个持久化会话"
                             f"（当前 会话 #{self.current}，{n} 轮）", "dim"))
                 return
@@ -512,7 +523,7 @@ class Cli:
             sid = data["id"]
         else:
             sid = (max(self.sessions) + 1) if self.sessions else 1
-        self.sessions[sid] = {"messages": [], "title": ""}
+        self.sessions[sid] = {"messages": [], "title": "", "count": 0}
         self.switch(sid)
 
     def switch(self, sid: int) -> None:
@@ -520,11 +531,13 @@ class Cli:
             print(color(f"✗ 会话 #{sid} 不存在", "red"))
             return
         self.current = sid
+        self._ensure_loaded(sid)
         n = len(self.sessions[sid]["messages"]) // 2
         print(color(f"已切换到 会话 #{sid}（{n} 轮对话）", "cyan"))
 
     def clear(self) -> None:
         self.sessions[self.current]["messages"] = []
+        self.sessions[self.current]["count"] = 0
         # 同步清空后端持久化（失败静默，重启会恢复——属降级行为）
         self.client.api("DELETE", f"/api/v1/sessions/{self.current}/messages", timeout=5)
         print(color("已清空当前会话历史", "cyan"))
@@ -590,6 +603,7 @@ class Cli:
 
     # ---- 发送 ----
     def send(self, text: str) -> None:
+        self._ensure_loaded(self.current)          # 按需加载当前会话历史
         sess = self.sessions[self.current]
         sess["messages"].append({"role": "user", "content": text})
         snapshot = list(sess["messages"])
@@ -601,6 +615,7 @@ class Cli:
             r = self.client.compress(snapshot, keep_recent=KEEP_RECENT)
             if r.get("compressed"):
                 sess["messages"] = r["messages"]
+                sess["count"] = len(sess["messages"])
                 snapshot = list(sess["messages"])
                 st = r.get("stats", {})
                 print(color(f"  ◇ 压缩完成：{st.get('before_messages')} 条 → {st.get('after_messages')} 条"
@@ -650,7 +665,8 @@ class Cli:
             self.new_session()
         elif cmd == "/sessions":
             for sid in sorted(self.sessions):
-                n = len(self.sessions[sid]["messages"]) // 2
+                n = (self.sessions[sid].get("count") or
+                     len(self.sessions[sid]["messages"])) // 2
                 title = self.sessions[sid].get("title") or ""
                 mark = "→" if sid == self.current else " "
                 label = f"会话 #{sid}" + (f"：{title}" if title else "")

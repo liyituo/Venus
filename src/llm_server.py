@@ -1570,15 +1570,20 @@ class SessionAppend(BaseModel):
     title: str | None = Field(default=None, description="可选：自定义标题（省略则自动取首条用户消息）")
 
 
-@app.get("/api/v1/sessions", summary="会话列表（含完整消息，供前端启动时恢复）")
-async def sessions_list() -> dict:
+@app.get("/api/v1/sessions", summary="会话列表（默认仅摘要；full=1 时含完整消息）")
+async def sessions_list(full: int = 0) -> dict:
+    """默认只返回摘要（id/标题/消息数），避免大量会话时全量传输。
+    需要完整消息用 full=1 或逐个 GET /sessions/{id}（按需加载）。"""
     _ensure_sessions()
     with _session_lock:
-        items = [{"id": s["id"], "title": s.get("title", ""),
-                  "messages": s.get("messages", []),
-                  "message_count": len(s.get("messages", [])),
-                  "updated": s.get("updated", "")}
-                 for s in _sessions.values()]
+        items = []
+        for s in _sessions.values():
+            item = {"id": s["id"], "title": s.get("title", ""),
+                    "message_count": len(s.get("messages", [])),
+                    "updated": s.get("updated", "")}
+            if full:
+                item["messages"] = s.get("messages", [])
+            items.append(item)
     return {"ok": True, "sessions": sorted(items, key=lambda s: s["id"])}
 
 
