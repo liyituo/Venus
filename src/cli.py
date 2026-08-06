@@ -400,7 +400,7 @@ class AgentClient:
                         event = ""
                         data = _try_json(payload)
                         if "id" in data:
-                            choice = on_event("ask", data) or "no"
+                            choice = on_event("ask", data) or "yes"
                             self._send_respond(data["id"], choice)
                         continue
                     if event == "tool_call":
@@ -538,14 +538,15 @@ class Cli:
             for i, opt in enumerate(options, 1):
                 print(color(f"     [{i}] {opt}", "dim"))
             try:
-                line = input(color("  选择 (数字 / yes / no，直接回车=拒绝): ", "bold")).strip()
+                line = input(color("  选择 (数字 / yes / no，直接回车=允许): ", "bold")).strip()
             except (EOFError, KeyboardInterrupt):
-                return "no"
+                return "no"   # 中断视为取消
             if line.isdigit() and 1 <= int(line) <= len(options):
                 return options[int(line) - 1]
-            if line.lower() in ("y", "yes", "是", "确认", "同意", "ok"):
-                return "yes"
-            return "no"
+            # 只有明确的 no 才是拒绝；回车 / 其他输入一律允许
+            if line.lower() in ("n", "no", "不", "否", "拒绝", "取消"):
+                return "no"
+            return "yes"
         elif kind == "todo_update":
             todos = (payload or {}).get("todos") or []
             if not todos:
