@@ -54,7 +54,7 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 ## 安全
 
-敏感操作（覆盖文件、非只读 shell）会弹确认，超时默认拒绝；`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
+敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
 
 ## 目录结构
 
@@ -69,8 +69,10 @@ chat_config.json    API 配置（含 Key，已 gitignore，别提交）
 ## 开发
 
 ```
-.venv\Scripts\python tests\smoke_test.py   # 21 个断言
-.venv\Scripts\python src\mock_llm.py       # 无 Key 时本地假 API 验证全链路
+.venv\Scripts\python tests\smoke_test.py       # daemon 冒烟测试（21 断言，不碰真实屏幕）
+.venv\Scripts\python tests\llm_tools_test.py   # 编程工具测试（45 断言：检索/编辑/git/进程/todo/repo）
+.venv\Scripts\python tests\agent_loop_test.py  # agent 循环端到端（12 断言：ask+diff/todo 事件/system 注入）
+.venv\Scripts\python src\mock_llm.py           # 无 Key 时本地假 API 验证全链路
 ```
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。
