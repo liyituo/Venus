@@ -331,15 +331,26 @@ class ChatApp:
         self.llm_status.pack(anchor="w", padx=14, pady=(0, 14))
 
         self._side_section(side, "Tools")
-        for name, desc in [("screen", "capture / click / type / key"),
-                           ("stop", "emergency kill-switch"),
-                           ("status", "real-time daemon state")]:
+        for name, desc in [("repo_map", "project structure index"),
+                           ("search_text", "code search / locate"),
+                           ("replace_text", "precise edit + diff"),
+                           ("git", "status / diff / commit"),
+                           ("process", "background processes"),
+                           ("todo", "task planning"),
+                           ("screen", "capture / click / type"),
+                           ("stop", "emergency kill-switch")]:
             row = tk.Frame(side, bg=PANEL)
             row.pack(fill="x", padx=14, pady=2)
             tk.Label(row, text=f"• {name}", bg=PANEL, fg=ACCENT,
-                     font=("Consolas", 9, "bold"), width=8, anchor="w").pack(side="left")
+                     font=("Consolas", 9, "bold"), width=12, anchor="w").pack(side="left")
             tk.Label(row, text=desc, bg=PANEL, fg=TEXT_DIM,
-                     font=("Segoe UI", 8), wraplength=150, justify="left").pack(side="left")
+                     font=("Segoe UI", 8), wraplength=130, justify="left").pack(side="left")
+
+        self._side_section(side, "Task")
+        self.todo_frame = tk.Frame(side, bg=PANEL)
+        self.todo_frame.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(self.todo_frame, text="(暂无任务)", bg=PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 9)).pack(anchor="w")
 
         self._side_section(side, "Log")
         self.log_text = tk.Text(side, bg=BG, fg=TEXT_DIM, relief="flat",
@@ -404,6 +415,8 @@ class ChatApp:
                 "stream_error": self._on_stream_error,
                 "stream_tool_call": self._on_stream_tool_call,
                 "stream_tool_result": self._on_stream_tool_result,
+                "stream_ask": self._on_stream_ask,
+                "stream_todo": self._on_stream_todo,
             }.get(kind)
             if handler:
                 handler(payload)
@@ -608,6 +621,10 @@ class ChatApp:
                         self._results.put(("stream_tool_call", (handle, payload)))
                     elif kind == "tool_result":
                         self._results.put(("stream_tool_result", (handle, payload)))
+                    elif kind == "ask":
+                        self._results.put(("stream_ask", (handle, payload)))
+                    elif kind == "todo_update":
+                        self._results.put(("stream_todo", payload))
                     elif kind == "error":
                         self._results.put(("stream_error", (handle, payload)))
                         return
@@ -650,6 +667,18 @@ class ChatApp:
                 return "tool_result", json.loads(payload)
             except Exception:
                 return "tool_result", payload
+        if self._sse_event == "ask":
+            self._sse_event = ""
+            try:
+                return "ask", json.loads(payload)
+            except Exception:
+                return "ask", payload
+        if self._sse_event == "todo_update":
+            self._sse_event = ""
+            try:
+                return "todo_update", json.loads(payload)
+            except Exception:
+                return "todo_update", payload
         if payload == "[DONE]":
             return "done", None
         try:
@@ -690,6 +719,115 @@ class ChatApp:
         self._agent_log.append(f"  {mark} {result}")
         self._log(f"tool result: {mark} {result}", "ok" if data.get("ok") else "err")
         self._render_agent_log(handle)
+
+    def _on_stream_ask(self, payload) -> None:
+        """模型请求确认：弹确认窗（含 diff 展示），用户选择后回传服务端。"""
+        handle, data = payload
+        if handle is not self._stream_handle:
+            return
+        # ask 串行发出，防御性关闭残留窗口
+        if getattr(self, "_confirm_win", None) is not None:
+            try:
+                self._confirm_win.destroy()
+            except Exception:
+                pass
+        self._show_confirm_window(data)
+
+    def _show_confirm_window(self, data: dict) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("需要确认")
+        win.geometry("660x460")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.grab_set()
+        self._confirm_win = win
+
+        header = tk.Frame(win, bg=PANEL, height=44)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="⚠ 操作确认", bg=PANEL, fg=WARN,
+                 font=("Segoe UI", 13, "bold")).pack(side="left", padx=14, pady=8)
+        tool_name = data.get("name") or ""
+        tk.Label(header, text=f"工具: {tool_name}", bg=PANEL, fg=TEXT_DIM,
+                 font=("Consolas", 9)).pack(side="right", padx=14, pady=8)
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=16, pady=12)
+
+        tk.Label(body, text=data.get("question") or "确认执行该操作吗？",
+                 bg=BG, fg=TEXT, justify="left", wraplength=600,
+                 font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 8))
+
+        diff = data.get("diff")
+        if diff:
+            tk.Label(body, text="改动预览（diff）:", bg=BG, fg=TEXT_DIM,
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 2))
+            diff_frame = tk.Frame(body, bg=CODE_BG)
+            diff_frame.pack(fill="both", expand=True)
+            box = tk.Text(diff_frame, bg=CODE_BG, fg=CODE_FG, relief="flat",
+                          font=("Consolas", 9), height=12, wrap="none")
+            vbar = ttk.Scrollbar(diff_frame, orient="vertical", command=box.yview)
+            hbar = ttk.Scrollbar(diff_frame, orient="horizontal", command=box.xview)
+            box.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+            box.grid(row=0, column=0, sticky="nsew")
+            vbar.grid(row=0, column=1, sticky="ns")
+            hbar.grid(row=1, column=0, sticky="ew")
+            diff_frame.rowconfigure(0, weight=1)
+            diff_frame.columnconfigure(0, weight=1)
+            box.insert("1.0", diff)
+            box.config(state="disabled")
+
+        btns = tk.Frame(win, bg=BG)
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        request_id = data.get("id", "")
+
+        def choose(choice: str) -> None:
+            self._send_respond(request_id, choice)
+            win.destroy()
+
+        tk.Button(btns, text="✓ 允许", command=lambda: choose("yes"),
+                  bg=OK, fg="white", activebackground="#16a34a",
+                  activeforeground="white", relief="flat", bd=0,
+                  padx=24, pady=8, cursor="hand2",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Button(btns, text="✗ 拒绝", command=lambda: choose("no"),
+                  bg=STOP, fg="white", activebackground="#b91c1c",
+                  activeforeground="white", relief="flat", bd=0,
+                  padx=24, pady=8, cursor="hand2",
+                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=10)
+        tk.Button(btns, text="关闭（按拒绝处理）", command=lambda: choose("no"),
+                  bg=PANEL_LIGHT, fg=TEXT_DIM, activebackground="#262c36",
+                  activeforeground=TEXT_DIM, relief="flat", bd=0,
+                  padx=14, pady=8, cursor="hand2",
+                  font=("Segoe UI", 9)).pack(side="right")
+        win.focus_force()
+
+    def _send_respond(self, request_id: str, choice: str) -> None:
+        """把确认选择回传 llm_server（后台线程执行，不阻塞 UI）。"""
+        def _do():
+            api_request(self.llm_url, "POST", "/api/v1/agent/respond",
+                        {"request_id": request_id, "choice": choice}, timeout=10)
+        self._tasks.put(("respond", _do))
+
+    def _on_stream_todo(self, payload) -> None:
+        """刷新侧边栏任务面板（todo_update 事件）。"""
+        todos = (payload or {}).get("todos") or []
+        for w in self.todo_frame.winfo_children():
+            w.destroy()
+        if not todos:
+            tk.Label(self.todo_frame, text="(暂无任务)", bg=PANEL, fg=TEXT_DIM,
+                     font=("Segoe UI", 9)).pack(anchor="w")
+            return
+        colors = {"pending": WARN, "in_progress": ACCENT, "completed": OK,
+                  "failed": STOP, "cancelled": TEXT_DIM}
+        for t in todos[-15:]:
+            row = tk.Frame(self.todo_frame, bg=PANEL)
+            row.pack(fill="x", pady=1)
+            st = t.get("status", "pending")
+            tk.Label(row, text=f"[{st}]", bg=PANEL, fg=colors.get(st, WARN),
+                     font=("Consolas", 8, "bold")).pack(side="left")
+            tk.Label(row, text=t.get("title", ""), bg=PANEL, fg=TEXT,
+                     font=("Segoe UI", 9), wraplength=185, justify="left").pack(side="left", padx=4)
 
     def _on_stream_delta(self, payload) -> None:
         handle, (content, reasoning) = payload

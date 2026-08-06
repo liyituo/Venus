@@ -42,7 +42,15 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 ## Agent 能干的事
 
-模型在对话里按需调工具，不用配置：看屏幕分辨率、点击、输入文字、按按键；建文件夹、浏览目录、读写文件；跑 Python（`run_code`）和 shell 命令（`run_shell`）。
+模型在对话里按需调工具，不用配置：
+
+- **屏幕**：看分辨率、点击、输入文字、按按键
+- **文件**：建文件夹、浏览目录、读写文件、`search_text` 代码检索、`list_symbols` 看函数结构
+- **编辑**：`replace_text` 精确替换，改前弹 diff 给你确认
+- **Git**：`git_status` / `git_diff` / `git_log` / `git_commit`（提交需确认）
+- **执行**：跑 Python（`run_code`）、shell 命令（`run_shell`）、后台进程（`start_process`）
+- **规划**：`create_todo` 列任务清单，侧边栏实时显示，重启后保留
+- **索引**：`repo_map` 生成项目结构摘要（目录树 + 符号表）
 
 ## 安全
 

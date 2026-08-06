@@ -21,17 +21,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
+import fnmatch
 import itertools
 import json
 import logging
+import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -65,7 +70,7 @@ READONLY_SHELL = re.compile(
 )
 
 # 确认请求需要发 ask 事件的敏感工具
-CONFIRM_TOOLS = {"create_file", "run_shell"}
+CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process"}
 
 # ---- 问询模式（四种）----
 CONFIRM_MODES = ("auto", "strict", "trusted", "query")
@@ -75,7 +80,12 @@ CONFIRM_MODE_DESC = {
     "trusted": "信任：全部自动执行（危险命令黑名单仍拦截）",
     "query":   "只读：仅允许查询操作，一切修改直接拒绝",
 }
-QUERY_TOOLS = {"list_folder", "read_file", "get_screen_size"}  # 查询类工具（任何模式都放行）
+QUERY_TOOLS = {  # 查询类工具（任何模式都放行）
+    "list_folder", "read_file", "get_screen_size",
+    "search_text", "glob_files", "list_symbols",
+    "git_status", "git_diff", "git_log",
+    "process_output", "list_processes", "list_todos", "repo_map",
+}
 
 
 def _current_confirm_mode() -> str:
@@ -106,7 +116,13 @@ class ConfirmModeRequest(BaseModel):
 # 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件/系统类工具。
 # WSL 隔离测试环境使用，代码层面保证 agent 无法操作任何屏幕。
 _SCREEN_TOOLS = {"get_screen_size", "click", "type_text", "press_key"}
-_FILE_TOOLS = {"create_folder", "list_folder", "create_file", "read_file", "run_code", "run_shell"}
+_FILE_TOOLS = {
+    "create_folder", "list_folder", "create_file", "read_file", "run_code", "run_shell",
+    "search_text", "glob_files", "list_symbols", "replace_text",
+    "git_status", "git_diff", "git_log", "git_commit",
+    "start_process", "process_output", "stop_process", "list_processes",
+    "create_todo", "update_todo", "list_todos", "repo_map",
+}
 ISOLATED = False
 
 # ---- 文件/系统工具安全限制 ----
@@ -136,6 +152,28 @@ DANGEROUS_PATTERNS = [
     r"\bsudo\s+rm\b",
     r"\bgit\s+push\s+(-f|--force)",          # 强制推送（防误覆盖远程）
 ]
+
+# ---- 编程工具安全限制（检索 / 编辑 / git / 进程 / todo / repo 索引）----
+SEARCH_MAX_RESULTS = 30          # search_text 单次最多匹配数
+SEARCH_CONTEXT_LINES = 2         # 匹配行上下文行数（默认）
+SEARCH_MAX_FILE_SIZE = 1_000_000 # 搜索跳过 >1MB 文件
+SEARCH_MAX_LINE_LEN = 300        # 匹配行内容截断长度
+SEARCH_OUTPUT_LIMIT = 6000       # 搜索结果回传模型的总字符上限
+MAX_SYMBOLS_PER_FILE = 50        # list_symbols / repo_map 单文件符号上限
+MAX_SYMBOLS_FILE_SIZE = 1_000_000
+REPLACE_OLD_MAX = 8000           # replace_text old 串长度上限
+REPLACE_DIFF_CHARS = 2000        # replace_text 确认 diff 回传上限
+MAX_PROCESSES = 8                # start_process 并发上限
+PROCESS_OUTPUT_LINES = 2000      # 进程输出环形缓冲行数
+PROCESS_OUTPUT_LIMIT = 4000      # process_output 单次返回字符上限
+PROCESS_WAIT_MAX = 60            # process_output wait_seconds 上限
+MAX_TODOS = 30                   # 任务清单上限
+TODO_STATUSES = ("pending", "in_progress", "completed", "failed", "cancelled")
+REPO_MAP_TTL = 30                # repo_map 缓存秒数
+REPO_MAP_MAX_ENTRIES = 300
+REPO_MAP_MAX_DEPTH = 5
+SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
+             ".pcagent", ".idea", ".vscode", ".mypy_cache", ".pytest_cache"}
 
 # ---- Token 用量优化 ----
 MAX_HISTORY_MESSAGES = 20    # 发送给上游的消息数上限（保留 system + 最近 N 条）
@@ -598,18 +636,180 @@ AGENT_TOOLS = [
         "description": "紧急止停：立即停止所有后续操作并拒绝新指令。当用户要求停止或发现操作可能造成损害时调用。",
         "parameters": {"type": "object", "properties": {}},
     }},
+    # ---- 编程工具：检索 ----
+    {"type": "function", "function": {
+        "name": "search_text",
+        "description": "在项目中搜索文本/正则，返回 文件:行号:内容（可带上下文行）。"
+                       "自动跳过 .venv/.git/node_modules 等目录。定位代码优先用它，不要逐个 read_file 翻。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "pattern": {"type": "string", "description": "正则表达式或关键字，如 r'def \\w+' 或 'fib'"},
+                           "path": {"type": "string", "description": "可选：限定搜索目录（相对工作区，省略搜整个工作区）"},
+                           "file_pattern": {"type": "string", "description": "可选：按文件名过滤，如 *.py、*.md"},
+                           "max_results": {"type": "integer", "default": 20, "description": "最多返回匹配数（1-30）"},
+                           "context_lines": {"type": "integer", "default": 2, "description": "匹配行前后各带几行上下文（0-5）"}},
+                       "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "glob_files",
+        "description": "按文件名模式列出工作区文件，如 *.py、test_*.py。返回相对路径 + 大小 + 行数。"
+                       "想找「哪些文件」时用它，想找「内容关键字」用 search_text。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "pattern": {"type": "string", "description": "文件名模式（支持 * 通配），如 *.py、test_*.py"},
+                           "max_results": {"type": "integer", "default": 50, "description": "最多返回条数"}},
+                       "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_symbols",
+        "description": "列出单个文件的函数/类定义符号表（行号 + 签名），快速了解文件结构，无需读全文。",
+        "parameters": {"type": "object",
+                       "properties": {"file": {"type": "string", "description": "相对工作区的文件路径"}},
+                       "required": ["file"]},
+    }},
+    # ---- 编程工具：精确编辑 ----
+    {"type": "function", "function": {
+        "name": "replace_text",
+        "description": "精确修改工作区内的文件：把 old 文本替换为 new 文本（小步修改，不要重写整个文件）。"
+                       "执行前会生成 diff 并经用户确认。old 必须是文件中的唯一片段（注意缩进/换行），"
+                       "若不唯一可用 occurrence 指定第几次出现，或把 old 写长一些。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "file": {"type": "string", "description": "相对工作区的文件路径"},
+                           "old": {"type": "string", "description": "要被替换的原文（需与文件内容逐字一致）"},
+                           "new": {"type": "string", "description": "替换成的新文本"},
+                           "occurrence": {"type": "integer", "default": 1, "description": "old 出现多次时指定第几次"}},
+                       "required": ["file", "old", "new"]},
+    }},
+    # ---- 编程工具：Git ----
+    {"type": "function", "function": {
+        "name": "git_status",
+        "description": "查看工作区内 Git 仓库的状态：当前分支 + 变更文件列表（相当于 git status --short）。"
+                       "如果还没有仓库，先用 run_shell 执行 git init。",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"}},
+                       "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "git_diff",
+        "description": "查看工作区 Git 仓库的改动内容（unified diff）或统计摘要。改完代码用它自查改动。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"},
+                           "staged": {"type": "boolean", "default": False, "description": "查看已暂存（git add 后）的改动"},
+                           "stat": {"type": "boolean", "default": False, "description": "只看统计摘要（改动文件/行数）"}},
+                       "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "git_log",
+        "description": "查看工作区 Git 仓库的最近提交历史（git log --oneline）。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"},
+                           "n": {"type": "integer", "default": 10, "description": "显示最近几条（1-30）"}},
+                       "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "git_commit",
+        "description": "提交工作区 Git 仓库的所有改动（内部执行 git add -A + git commit）。"
+                       "提交前会展示改动统计并经用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "message": {"type": "string", "description": "提交信息（说明改了什么、为什么）"},
+                           "path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"}},
+                       "required": ["message"]},
+    }},
+    # ---- 编程工具：后台进程 ----
+    {"type": "function", "function": {
+        "name": "start_process",
+        "description": "在后台启动一个长时间运行的进程（如 dev server、监听脚本），不阻塞当前任务。"
+                       "启动后立即返回 pid，用 process_output 查看输出、stop_process 停止。"
+                       "适合跑服务/守护类命令；一次性命令用 run_shell 即可。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "command": {"type": "string", "description": "要启动的命令（支持 shell 语法）"},
+                           "cwd": {"type": "string", "description": "可选：工作目录（相对工作区）"}},
+                       "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "process_output",
+        "description": "查看后台进程的输出（最近 N 行）与运行状态。wait_seconds 可等待一段时间再取输出。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "pid": {"type": "integer", "description": "start_process 返回的进程号"},
+                           "tail": {"type": "integer", "default": 2000, "description": "返回最近多少行"},
+                           "wait_seconds": {"type": "number", "default": 0, "description": "可选：先等待几秒再取输出（如服务启动日志）"}},
+                       "required": ["pid"]},
+    }},
+    {"type": "function", "function": {
+        "name": "stop_process",
+        "description": "停止后台进程（连同其子进程一并结束）。",
+        "parameters": {"type": "object",
+                       "properties": {"pid": {"type": "integer", "description": "start_process 返回的进程号"}},
+                       "required": ["pid"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_processes",
+        "description": "列出所有正在运行/已结束的后台进程（pid、命令、状态）。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    # ---- 编程工具：任务规划 ----
+    {"type": "function", "function": {
+        "name": "create_todo",
+        "description": "为当前任务添加一个待办项（任务清单会展示给用户并在重启后保留）。"
+                       "多步骤任务先建 todo 列表再逐步执行。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "title": {"type": "string", "description": "待办标题（一句话）"},
+                           "description": {"type": "string", "description": "可选：补充说明"}},
+                       "required": ["title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "update_todo",
+        "description": "更新待办项状态：pending / in_progress / completed / failed / cancelled。"
+                       "任务每完成一个步骤就更新一次。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "id": {"type": "integer", "description": "待办项编号（create_todo 返回的 id）"},
+                           "status": {"type": "string",
+                                      "enum": ["pending", "in_progress", "completed", "failed", "cancelled"]}},
+                       "required": ["id", "status"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_todos",
+        "description": "查看当前任务清单。",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    # ---- 编程工具：项目索引 ----
+    {"type": "function", "function": {
+        "name": "repo_map",
+        "description": "生成项目结构摘要：目录树 + 每个文件的行数 + 顶层函数/类符号。"
+                       "接触新项目时第一步调用它了解整体结构，再配合 search_text / list_symbols 深入。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string", "description": "可选：子目录（相对工作区，省略为整个工作区）"},
+                           "depth": {"type": "integer", "default": 3, "description": "目录深度（1-5）"},
+                           "max_entries": {"type": "integer", "default": 200, "description": "最多返回条目数"}},
+                       "required": []},
+    }},
 ]
 
 AGENT_SYSTEM_SUFFIX = (
-    "\n\n你是 PC Agent，一个可以控制用户电脑的智能体。你可以通过工具操作电脑。\n"
+    "\n\n你是 PC Agent，一个可以控制用户电脑的智能体。你可以通过工具操作电脑、编写和修改代码。\n"
+    "编程工作流：\n"
+    "1. 先 repo_map 了解项目结构，search_text / glob_files 定位相关代码，list_symbols 查看文件内部结构。\n"
+    "2. 修改用 replace_text 小步替换（系统会展示 diff 请用户确认）；新文件用 create_file。\n"
+    "3. 用 git_status / git_diff 自查改动，完成一个阶段后用 git_commit 提交（需用户确认）。\n"
+    "4. 多步骤长任务用 create_todo 先列计划，每完成一步用 update_todo 更新状态。\n"
+    "5. 后台服务（dev server 等）用 start_process 启动，process_output 看输出。\n"
+    "6. 运行测试/一次性命令用 run_code 或 run_shell；修改代码后主动运行相关测试验证。\n"
     "使用规则：\n"
-    "1. 执行点击前，先调用 get_screen_size 获取屏幕分辨率，坐标必须在该范围内。\n"
-    "2. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
-    "3. 覆盖文件、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
-    "4. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
+    "1. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
+    "2. 覆盖文件、修改代码、提交 git、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
+    "3. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
     "先用文字列出选项让用户选择，等待用户答复后再行动。\n"
-    "5. 完成任务后，用简短的中文总结你做了什么。\n"
-    "6. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
+    "4. 完成任务后，用简短的中文总结你做了什么。\n"
+    "5. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
 )
 
 
@@ -679,6 +879,292 @@ def _safe_join(workspace: Path, rel: str) -> Path | None:
     return target
 
 
+def _iter_workspace_files(workspace: Path, root: Path | None = None, max_files: int = 5000):
+    """深度优先遍历工作区文件：跳过 SKIP_DIRS 与隐藏目录。
+    yield (绝对路径, 相对工作区的 posix 路径)。"""
+    root = root or workspace
+    ws_res = workspace.resolve()
+    count = 0
+    for abs_p in sorted(root.rglob("*")):
+        if abs_p.is_dir():
+            continue
+        parts = abs_p.relative_to(ws_res).parts
+        # 只检查目录段：隐藏目录 / 已知构建目录跳过；隐藏文件（如 .env）保留
+        if any(part in SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
+            continue
+        yield abs_p, abs_p.relative_to(ws_res).as_posix()
+        count += 1
+        if count >= max_files:
+            return
+
+
+_SYMBOL_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)(.*)$")
+
+
+def _extract_symbols(text: str, limit: int = MAX_SYMBOLS_PER_FILE) -> list[str]:
+    """提取文本中的 def/class 定义，返回 ["行号: 名字 签名", ...]（只扫前 2000 行）。"""
+    syms = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if lineno > 2000:
+            break
+        m = _SYMBOL_RE.match(line)
+        if m:
+            tail = (m.group(2) or "").strip()
+            sig = tail.split("#")[0].strip()[:80] if tail else ""
+            syms.append(f"{lineno}: {m.group(1)}{' ' + sig if sig else ''}")
+        if len(syms) >= limit:
+            break
+    return syms
+
+
+def _extract_symbols_file(abs_p: Path) -> list[str]:
+    """提取单文件的符号表；二进制 / 超限 / 不可读文件返回空。"""
+    try:
+        if abs_p.stat().st_size > MAX_SYMBOLS_FILE_SIZE:
+            return []
+        text = abs_p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if "\x00" in text[:4096]:
+        return []
+    return _extract_symbols(text)
+
+
+def _find_git_root(workspace: Path, rel: str = "") -> Path | None:
+    """从工作区（或 rel 子目录）向上找 Git 仓库根；仓库根必须仍位于工作区内。"""
+    start = workspace if not rel else _safe_join(workspace, rel)
+    if start is None:
+        return None
+    ws_res = workspace.resolve()
+    cur = start if start.is_dir() else start.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            try:
+                p.resolve().relative_to(ws_res)
+                return p
+            except ValueError:
+                return None    # 仓库根在工作区外：拒绝操作
+    return None
+
+
+def _run_git(root: Path, *args: str, timeout: int = 20) -> tuple[bool, str]:
+    """执行 git 命令（参数数组形式，无 shell 注入）。返回 (ok, 输出/错误)。"""
+    try:
+        proc = subprocess.run(["git", "-C", str(root), *args],
+                              capture_output=True, text=True, timeout=timeout, shell=False)
+    except FileNotFoundError:
+        return False, "未找到 git 命令（请先安装 git）"
+    except subprocess.TimeoutExpired:
+        return False, f"git 执行超时（>{timeout}s）"
+    except Exception as exc:
+        return False, f"git 执行失败：{exc}"
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        return False, (proc.stderr or out).strip()[:500] or f"git 退出码 {proc.returncode}"
+    return True, out
+
+
+# ---- 后台进程管理 ----
+_process_lock = threading.Lock()
+_processes: dict[int, dict] = {}   # pid -> {"proc", "cmd", "started", "lines"}
+
+
+def _process_reader(proc, lines: deque) -> None:
+    """后台线程：逐行缓冲进程输出（环形，防内存膨胀）。bytes 解码容错，兼容任意编码输出。"""
+    for raw in proc.stdout:
+        lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+
+
+def _cleanup_dead_processes() -> None:
+    """移除已退出的进程条目。调用方须持有 _process_lock。"""
+    dead = [pid for pid, e in _processes.items() if e["proc"].poll() is not None]
+    for pid in dead:
+        _processes.pop(pid, None)
+
+
+def _start_process_impl(command: str, cwd: Path) -> tuple[bool, str]:
+    """后台启动进程。POSIX 独立进程组 / Windows 独立控制台组，停止时整组击杀。"""
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+                  shell=True, cwd=str(cwd))
+    if sys.platform != "win32":
+        kwargs["executable"] = "/bin/bash"
+        kwargs["start_new_session"] = True
+    else:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(command, **kwargs)
+    lines: deque = deque(maxlen=PROCESS_OUTPUT_LINES)
+    threading.Thread(target=_process_reader, args=(proc, lines), daemon=True).start()
+    with _process_lock:
+        _cleanup_dead_processes()
+        if len(_processes) >= MAX_PROCESSES:
+            proc.kill()
+            return False, f"后台进程数已达上限 {MAX_PROCESSES}，请先 stop_process 清理"
+        _processes[proc.pid] = {"proc": proc, "cmd": command[:200],
+                                "started": time.strftime("%H:%M:%S"), "lines": lines}
+    return True, json.dumps({"pid": proc.pid, "command": command[:200],
+                             "started": _processes[proc.pid]["started"]}, ensure_ascii=False)
+
+
+def _stop_process_impl(pid: int) -> tuple[bool, str]:
+    with _process_lock:
+        entry = _processes.get(pid)
+        if entry is None:
+            return False, f"进程不存在：{pid}（可用 list_processes 查看）"
+        proc = entry["proc"]
+    if proc.poll() is None:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, text=True)
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    return True, json.dumps({"pid": pid, "stopped": True}, ensure_ascii=False)
+
+
+def _process_output_impl(pid: int, tail: int, wait_seconds: float) -> tuple[bool, str]:
+    with _process_lock:
+        entry = _processes.get(pid)
+        if entry is None:
+            return False, f"进程不存在：{pid}（可用 list_processes 查看）"
+        proc = entry["proc"]
+        lines = list(entry["lines"])
+    if wait_seconds > 0 and proc.poll() is None:
+        time.sleep(wait_seconds)
+        with _process_lock:
+            entry = _processes.get(pid)
+            if entry is not None:
+                lines = list(entry["lines"])
+    running = proc.poll() is None
+    out = "\n".join(lines[-tail:])
+    if len(out) > PROCESS_OUTPUT_LIMIT:
+        out = out[-PROCESS_OUTPUT_LIMIT:]
+    return True, json.dumps({"pid": pid, "running": running,
+                             "exit_code": None if running else proc.returncode,
+                             "output": out}, ensure_ascii=False)
+
+
+# ---- 任务清单（todo）----
+_todo_lock = threading.Lock()
+_todos: list[dict] = []
+_todo_counter = itertools.count(1)
+_todos_loaded = False
+
+
+def _todo_file() -> Path:
+    return _get_workspace() / ".pcagent" / "todos.json"
+
+
+def _load_todos() -> None:
+    global _todos, _todo_counter, _todos_loaded
+    _todos_loaded = True
+    try:
+        p = _todo_file()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            _todos = [dict(t) for t in data.get("todos", [])]
+            if _todos:
+                _todo_counter = itertools.count(max(int(t.get("id", 0)) for t in _todos) + 1)
+    except Exception:
+        _todos = []
+
+
+def _save_todos() -> None:
+    try:
+        p = _todo_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"todos": _todos}, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+    except OSError as exc:
+        log.warning("todo 持久化失败：%s", exc)
+
+
+def _todos_snapshot() -> dict:
+    if not _todos_loaded:
+        _load_todos()
+    with _todo_lock:
+        return {"todos": [dict(t) for t in _todos]}
+
+
+def _todos_system_note() -> str:
+    """把当前任务清单追加进 system 提示，实现中断后任务的半恢复。"""
+    todos = _todos_snapshot().get("todos", [])
+    if not todos:
+        return ""
+    lines = ["\n\n当前任务清单（用 update_todo 更新状态，新任务用 create_todo 添加）："]
+    for t in todos[-MAX_TODOS:]:
+        desc = f" — {t.get('description')}" if t.get("description") else ""
+        lines.append(f"- [#{t['id']}] {t['status']}: {t['title']}{desc}")
+    return "\n".join(lines)
+
+
+# ---- repo 索引缓存 ----
+_repo_cache = {"key": "", "time": 0.0, "text": ""}
+
+
+def _count_lines(abs_p: Path) -> int:
+    try:
+        with abs_p.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def _repo_map_text(workspace: Path, rel: str, depth: int, max_entries: int) -> str:
+    """生成项目结构摘要（目录树 + 文件行数 + 顶层符号），30 秒 TTL 缓存。"""
+    key = f"{rel}|{depth}|{max_entries}"
+    now = time.monotonic()
+    if _repo_cache["key"] == key and now - _repo_cache["time"] < REPO_MAP_TTL:
+        return _repo_cache["text"]
+    root = workspace if not rel else _safe_join(workspace, rel)
+    if root is None or not root.is_dir():
+        return f"目录不存在：{rel or '.'}"
+    out = []
+    count = 0
+    for abs_p, rel_p in _iter_workspace_files(workspace, root=root):
+        level = len(rel_p.split("/"))
+        if level > depth:
+            continue
+        indent = "  " * (level - 1)
+        syms = _extract_symbols_file(abs_p)
+        suffix = f"  [{', '.join(syms[:6])}]" if syms else ""
+        out.append(f"{indent}{abs_p.name}  {_count_lines(abs_p)}行{suffix}")
+        count += 1
+        if count >= max_entries:
+            out.append("...(条目过多已截断，可缩小范围)")
+            break
+    text = "\n".join(out) if out else f"（空目录：{rel or '.'}）"
+    _repo_cache.update(key=key, time=now, text=text)
+    return text
+
+
+def _make_replace_diff(args: dict) -> str | None:
+    """为 replace_text 生成确认用的 unified diff；文件缺失/无匹配时返回 None。"""
+    workspace = _get_workspace()
+    target = _safe_join(workspace, args.get("file", ""))
+    old = args.get("old") or ""
+    if target is None or not target.is_file() or not old:
+        return None
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    count = text.count(old)
+    if count == 0:
+        return None
+    occ = max(1, int(args.get("occurrence") or 1))
+    new = args.get("new") or ""
+    parts = text.split(old)
+    if occ > len(parts) - 1:
+        return None
+    new_text = old.join(parts[:occ]) + new + old.join(parts[occ:])
+    diff = "".join(difflib.unified_diff(
+        text.splitlines(keepends=True), new_text.splitlines(keepends=True),
+        fromfile=f"a/{args['file']}", tofile=f"b/{args['file']}", n=2))
+    return diff[:REPLACE_DIFF_CHARS] or None
+
+
 def _agent_tools() -> list[dict]:
     """按运行模式返回可用工具：隔离模式只保留文件类工具。"""
     if ISOLATED:
@@ -702,19 +1188,38 @@ def _needs_confirm(name: str, args: dict) -> bool:
         workspace = _get_workspace()
         target = _safe_join(workspace, args.get("path", ""))
         return target is not None and target.exists()
+    if name in ("replace_text", "git_commit", "start_process"):
+        # 修改文件 / 提交 git / 启动后台进程：一律确认
+        return True
     if name == "run_shell":
         command = (args.get("command") or "").strip()
         return bool(command) and not _is_readonly_shell(command)
     return False
 
 
-def _confirm_question(name: str, args: dict) -> str:
-    """生成人类可读的确认问题。"""
+def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
+    """生成 (确认问题, diff 文本)。diff 为空时前端不展示 diff 区域。"""
     if name == "create_file":
-        return f"要覆盖已存在的文件 `{args.get('path')}` 吗？"
+        return f"要覆盖已存在的文件 `{args.get('path')}` 吗？", None
     if name == "run_shell":
-        return f"要执行系统命令 `{(args.get('command') or '')[:80]}` 吗？"
-    return "确认执行该操作吗？"
+        return f"要执行系统命令 `{(args.get('command') or '')[:80]}` 吗？", None
+    if name == "replace_text":
+        diff = _make_replace_diff(args)
+        file = args.get("file")
+        return f"要修改文件 `{file}`（把指定内容替换为新的内容）吗？", diff
+    if name == "git_commit":
+        workspace = _get_workspace()
+        root = _find_git_root(workspace, args.get("path", ""))
+        diff = None
+        if root is not None:
+            ok, out = _run_git(root, "diff", "--stat")
+            if ok and out:
+                diff = out[:REPLACE_DIFF_CHARS]
+        msg = (args.get("message") or "")[:60]
+        return f"要提交 Git 变更吗？提交信息：`{msg}`", diff
+    if name == "start_process":
+        return f"要在后台启动进程 `{(args.get('command') or '')[:80]}` 吗？", None
+    return "确认执行该操作吗？", None
 
 
 def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT) -> str | None:
@@ -905,6 +1410,270 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                 return False, json.dumps({"exit_code": proc.returncode,
                                           "stderr": stderr or stdout}, ensure_ascii=False)
             return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
+        # ================= 编程工具：检索 =================
+        if name == "search_text":
+            workspace = _get_workspace()
+            pattern = args.get("pattern") or ""
+            if not pattern:
+                return False, "没有提供搜索 pattern"
+            try:
+                rx = re.compile(pattern)
+            except re.error:
+                rx = re.compile(re.escape(pattern))
+            rel = (args.get("path") or "").strip()
+            root = workspace if not rel else _safe_join(workspace, rel)
+            if root is None:
+                return False, "非法路径：必须是工作区内的相对路径"
+            if not root.exists():
+                return False, f"路径不存在：{rel or '.'}"
+            file_pat = (args.get("file_pattern") or "").strip()
+            max_results = min(max(1, int(args.get("max_results") or 20)), SEARCH_MAX_RESULTS)
+            ctx = min(max(0, int(args.get("context_lines") or SEARCH_CONTEXT_LINES)), 5)
+            hits = []   # (rel, lineno, text, before, after)
+            for abs_p, rel_p in _iter_workspace_files(workspace, root=root):
+                if file_pat and not fnmatch.fnmatch(abs_p.name, file_pat):
+                    continue
+                try:
+                    if abs_p.stat().st_size > SEARCH_MAX_FILE_SIZE:
+                        continue
+                    with abs_p.open("r", encoding="utf-8", errors="replace") as f:
+                        lines = f.readlines()
+                except OSError:
+                    continue
+                if "\x00" in "".join(lines[:100]):
+                    continue
+                for i, line in enumerate(lines):
+                    if rx.search(line):
+                        before = [l.rstrip("\r\n") for l in lines[max(0, i - ctx):i]]
+                        after = [l.rstrip("\r\n") for l in lines[i + 1:i + 1 + ctx]]
+                        hits.append((rel_p, i + 1, line.rstrip("\r\n")[:SEARCH_MAX_LINE_LEN],
+                                     before, after))
+                        if len(hits) >= max_results:
+                            break
+                if len(hits) >= max_results:
+                    break
+            if not hits:
+                return True, json.dumps({"matches": 0, "pattern": pattern[:100]},
+                                        ensure_ascii=False)
+            out = []
+            for rel_p, lineno, text, before, after in hits:
+                out.append(f"{rel_p}:{lineno}: {text}")
+                out.extend(f"  {b}" for b in before)
+                out.extend(f"  {a}" for a in after)
+            text_out = "\n".join(out)
+            if len(text_out) > SEARCH_OUTPUT_LIMIT:
+                text_out = text_out[:SEARCH_OUTPUT_LIMIT] + "\n...(结果过多已截断)"
+            return True, json.dumps({"matches": len(hits), "pattern": pattern[:100],
+                                     "results": text_out}, ensure_ascii=False)
+        if name == "glob_files":
+            workspace = _get_workspace()
+            pattern = (args.get("pattern") or "").strip()
+            if not pattern:
+                return False, "没有提供文件名模式（如 *.py）"
+            max_results = min(max(1, int(args.get("max_results") or 50)), 200)
+            files = []
+            for abs_p, rel_p in _iter_workspace_files(workspace):
+                if not (fnmatch.fnmatch(abs_p.name, pattern) or fnmatch.fnmatch(rel_p, pattern)):
+                    continue
+                try:
+                    size = abs_p.stat().st_size
+                    lines = _count_lines(abs_p)
+                except OSError:
+                    size, lines = 0, 0
+                files.append({"path": rel_p, "size": size, "lines": lines})
+                if len(files) >= max_results:
+                    break
+            return True, json.dumps({"matches": len(files), "files": files},
+                                    ensure_ascii=False)
+        if name == "list_symbols":
+            workspace = _get_workspace()
+            target = _safe_join(workspace, args.get("file", ""))
+            if target is None:
+                return False, "非法路径：必须是工作区内的相对路径"
+            if not target.is_file():
+                return False, f"文件不存在：{args.get('file')}"
+            syms = _extract_symbols_file(target)
+            return True, json.dumps({"file": args.get("file"), "symbols": syms},
+                                    ensure_ascii=False)
+        # ================= 编程工具：精确编辑 =================
+        if name == "replace_text":
+            workspace = _get_workspace()
+            target = _safe_join(workspace, args.get("file", ""))
+            if target is None:
+                return False, "非法路径：必须是工作区内的相对路径"
+            if not target.is_file():
+                return False, f"文件不存在：{args.get('file')}"
+            if target.stat().st_size > MAX_FILE_SIZE:
+                return False, f"文件过大（>{MAX_FILE_SIZE} 字节）"
+            old = args.get("old") or ""
+            if not old:
+                return False, "old 不能为空"
+            if len(old) > REPLACE_OLD_MAX:
+                return False, f"old 过长（{len(old)} 字符 > 上限 {REPLACE_OLD_MAX}）"
+            text = target.read_text(encoding="utf-8", errors="replace")
+            count = text.count(old)
+            if count == 0:
+                return False, ("未找到要替换的内容：old 与文件内容不一致（注意空格/缩进/换行，"
+                               "或先用 read_file 查看实际内容）")
+            occ = int(args.get("occurrence") or 1)
+            if occ > count:
+                return False, (f"occurrence={occ} 超出出现次数 {count}；"
+                               f"可省略 occurrence 或把 old 写长一点保证唯一")
+            new = args.get("new") or ""
+            parts = text.split(old)
+            new_text = old.join(parts[:occ]) + new + old.join(parts[occ:])
+            diff = "".join(difflib.unified_diff(
+                text.splitlines(keepends=True), new_text.splitlines(keepends=True),
+                fromfile=f"a/{args['file']}", tofile=f"b/{args['file']}", n=1))
+            if len(diff) > REPLACE_DIFF_CHARS:
+                diff = diff[:REPLACE_DIFF_CHARS] + "\n...(diff 过长已截断)"
+            target.write_text(new_text, encoding="utf-8")
+            return True, json.dumps({"file": args.get("file"), "occurrence": occ,
+                                     "replacements": count, "diff": diff},
+                                    ensure_ascii=False)
+        # ================= 编程工具：Git =================
+        if name in ("git_status", "git_diff", "git_log", "git_commit"):
+            workspace = _get_workspace()
+            root = _find_git_root(workspace, args.get("path", ""))
+            if root is None:
+                return False, ("工作区内未找到 Git 仓库（仓库根必须位于工作区内）。"
+                               "可先用 run_shell 执行 git init 创建")
+            rel_root = root.relative_to(workspace).as_posix()
+            if name == "git_status":
+                ok, out = _run_git(root, "status", "--short", "--branch")
+                if not ok:
+                    return False, f"git status 失败：{out}"
+                return True, json.dumps({"repo": rel_root, "status": out},
+                                        ensure_ascii=False)
+            if name == "git_diff":
+                cmd = ["diff"]
+                if args.get("staged"):
+                    cmd.append("--cached")
+                if args.get("stat"):
+                    cmd.append("--stat")
+                ok, out = _run_git(root, *cmd)
+                if not ok:
+                    return False, f"git diff 失败：{out}"
+                if not out:
+                    return True, json.dumps({"repo": rel_root, "diff": "（无改动）"},
+                                            ensure_ascii=False)
+                if len(out) > REPLACE_DIFF_CHARS * 2:
+                    out = out[:REPLACE_DIFF_CHARS * 2] + "\n...(diff 过长已截断)"
+                return True, json.dumps({"repo": rel_root, "diff": out}, ensure_ascii=False)
+            if name == "git_log":
+                n = min(max(1, int(args.get("n") or 10)), 30)
+                ok, out = _run_git(root, "log", "--oneline", f"-{n}")
+                if not ok:
+                    return False, f"git log 失败：{out}"
+                return True, json.dumps({"repo": rel_root, "log": out or "（暂无提交）"},
+                                        ensure_ascii=False)
+            # git_commit（确认后由 _agent_loop 调用到此处）
+            message = (args.get("message") or "").strip()
+            if not message:
+                return False, "提交信息不能为空"
+            if len(message) > 200:
+                return False, "提交信息过长（≤200 字符）"
+            ok1, err1 = _run_git(root, "add", "-A")
+            if not ok1:
+                return False, f"git add 失败：{err1}"
+            ok2, out2 = _run_git(root, "commit", "-m", message)
+            if not ok2:
+                return False, f"git commit 失败：{out2}"
+            return True, json.dumps({"repo": rel_root, "committed": True,
+                                     "message": message, "result": out2},
+                                    ensure_ascii=False)
+        # ================= 编程工具：后台进程 =================
+        if name == "start_process":
+            command = (args.get("command") or "").strip()
+            if not command:
+                return False, "没有提供命令"
+            if len(command) > RUN_SHELL_MAX_CMD:
+                return False, f"命令过长（>{RUN_SHELL_MAX_CMD} 字符）"
+            for pat in DANGEROUS_PATTERNS:
+                if re.search(pat, command):
+                    return False, f"危险命令已被拦截：{command[:80]}"
+            workspace = _get_workspace()
+            cwd = workspace
+            rel = (args.get("cwd") or "").strip()
+            if rel and rel != ".":
+                cwd = _safe_join(workspace, rel)
+                if cwd is None:
+                    return False, "非法路径：必须是工作区内的相对路径"
+                if not cwd.is_dir():
+                    return False, f"目录不存在：{rel}"
+            return _start_process_impl(command, cwd)
+        if name == "process_output":
+            try:
+                pid = int(args.get("pid") or 0)
+            except (TypeError, ValueError):
+                return False, "pid 必须是整数"
+            if pid <= 0:
+                return False, "无效 pid"
+            tail = min(max(int(args.get("tail") or 2000), 1), 5000)
+            wait = min(max(float(args.get("wait_seconds") or 0), 0), PROCESS_WAIT_MAX)
+            return _process_output_impl(pid, tail, wait)
+        if name == "stop_process":
+            try:
+                pid = int(args.get("pid") or 0)
+            except (TypeError, ValueError):
+                return False, "pid 必须是整数"
+            return _stop_process_impl(pid)
+        if name == "list_processes":
+            with _process_lock:
+                _cleanup_dead_processes()
+                procs = [{"pid": pid, "command": e["cmd"], "started": e["started"],
+                          "running": e["proc"].poll() is None,
+                          "exit_code": None if e["proc"].poll() is None else e["proc"].returncode}
+                         for pid, e in _processes.items()]
+            return True, json.dumps({"processes": procs}, ensure_ascii=False)
+        # ================= 编程工具：任务规划 =================
+        if name == "create_todo":
+            title = (args.get("title") or "").strip()
+            if not title:
+                return False, "title 不能为空"
+            if len(title) > 200:
+                return False, "title 过长（≤200 字符）"
+            _todos_snapshot()   # 确保已从磁盘加载
+            with _todo_lock:
+                if len(_todos) >= MAX_TODOS:
+                    return False, (f"任务清单已满（{MAX_TODOS} 条），"
+                                   f"先 update_todo 把旧任务标记 completed/failed")
+                item = {"id": next(_todo_counter), "title": title,
+                        "description": (args.get("description") or "")[:500],
+                        "status": "pending", "created": time.strftime("%H:%M:%S")}
+                _todos.append(item)
+                _save_todos()
+                snapshot = [dict(t) for t in _todos]
+            return True, json.dumps({"created": item, "todos": snapshot},
+                                    ensure_ascii=False)
+        if name == "update_todo":
+            try:
+                tid = int(args.get("id") or -1)
+            except (TypeError, ValueError):
+                return False, "id 必须是整数"
+            status = (args.get("status") or "").strip()
+            if status not in TODO_STATUSES:
+                return False, f"无效状态：{status}（可选：{' / '.join(TODO_STATUSES)}）"
+            _todos_snapshot()
+            with _todo_lock:
+                for it in _todos:
+                    if it["id"] == tid:
+                        it["status"] = status
+                        _save_todos()
+                        snapshot = [dict(t) for t in _todos]
+                        return True, json.dumps({"updated": it, "todos": snapshot},
+                                                ensure_ascii=False)
+            return False, f"todo 不存在：{tid}"
+        if name == "list_todos":
+            return True, json.dumps(_todos_snapshot(), ensure_ascii=False)
+        # ================= 编程工具：项目索引 =================
+        if name == "repo_map":
+            workspace = _get_workspace()
+            rel = (args.get("path") or "").strip()
+            depth = min(max(int(args.get("depth") or 3), 1), REPO_MAP_MAX_DEPTH)
+            max_entries = min(max(int(args.get("max_entries") or 200), 10),
+                              REPO_MAP_MAX_ENTRIES)
+            return True, _repo_map_text(workspace, rel, depth, max_entries)
         if name in ("click", "type_text", "press_key"):
             code, data = _call_daemon("POST", "/api/v1/execute", {"action": name, **args})
             if code == 200:
@@ -987,10 +1756,11 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                           f"如需执行请先切换到其他问询模式")
             elif policy == "ask":
                 ask_id = f"ask-{next(_confirm_counter)}"
+                question, diff = _confirm_question(fn["name"], args)
                 q.put(("ask", {"id": ask_id, "name": fn["name"],
                                "arguments": fn["arguments"],
-                               "question": _confirm_question(fn["name"], args),
-                               "options": ["yes", "no"]}))
+                               "question": question,
+                               "options": ["yes", "no"], "diff": diff}))
                 choice = _wait_confirm(ask_id)
                 if choice != "yes":
                     log.info("tool %s rejected by user (%s)", fn["name"], choice)
@@ -1005,6 +1775,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
             q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result}))
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            # 任务清单变化：推送 todo_update 事件（前端刷新任务面板）
+            if fn["name"] in ("create_todo", "update_todo"):
+                q.put(("todo_update", _todos_snapshot()))
             # 连续失败熔断
             consecutive_failures = 0 if ok else consecutive_failures + 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -1040,6 +1813,8 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
                 yield f"event: tool_result\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             elif kind == "ask":
                 yield f"event: ask\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            elif kind == "todo_update":
+                yield f"event: todo_update\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             elif kind == "delta":
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': data}}]}, ensure_ascii=False)}\n\n"
     except asyncio.CancelledError:
@@ -1069,9 +1844,14 @@ async def chat_stream(req: ChatRequest):
         for m in messages:
             if m.get("role") == "system":
                 m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
+                # 注入当前任务清单：中断后模型能感知进度（半恢复）
+                todo_note = _todos_system_note()
+                if todo_note:
+                    m["content"] += todo_note
                 break
         else:
-            messages.insert(0, {"role": "system", "content": AGENT_SYSTEM_SUFFIX.lstrip()})
+            messages.insert(0, {"role": "system",
+                                "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()})
         return StreamingResponse(
             _agent_stream_events(api_url, headers, messages, model, req.temperature),
             media_type="text/event-stream",

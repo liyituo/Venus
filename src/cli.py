@@ -270,6 +270,10 @@ class AgentClient:
                         event = ""
                         on_event("tool_result", _try_json(payload))
                         continue
+                    if event == "todo_update":
+                        event = ""
+                        on_event("todo_update", _try_json(payload))
+                        continue
                     if payload == "[DONE]":
                         return None
                     try:
@@ -349,7 +353,7 @@ class Cli:
             self._last_content += payload
             print(payload, end="", flush=True)
         elif kind == "ask":
-            # 敏感操作确认：显示问题与选项，等待用户输入，返回选择
+            # 敏感操作确认：显示问题、diff（如有）与选项，等待用户输入，返回选择
             try:
                 args = json.loads(payload.get("arguments") or "{}")
                 arg_str = ", ".join(f"{k}={v}" for k, v in args.items()) or ""
@@ -359,6 +363,13 @@ class Cli:
             print(color(f"  ❓ {payload.get('question', '需要确认')}", "yellow"))
             if arg_str:
                 print(color(f"     {arg_str}", "dim"))
+            diff = payload.get("diff")
+            if diff:
+                print(color("  ── diff ────────────────────────────", "dim"))
+                for dl in diff.splitlines()[:60]:
+                    c = "green" if dl.startswith("+") else ("red" if dl.startswith("-") else "dim")
+                    print(color(f"  {dl[:200]}", c))
+                print(color("  ────────────────────────────────────", "dim"))
             options = payload.get("options") or ["yes", "no"]
             for i, opt in enumerate(options, 1):
                 print(color(f"     [{i}] {opt}", "dim"))
@@ -371,6 +382,18 @@ class Cli:
             if line.lower() in ("y", "yes", "是", "确认", "同意", "ok"):
                 return "yes"
             return "no"
+        elif kind == "todo_update":
+            todos = (payload or {}).get("todos") or []
+            if not todos:
+                return None
+            print()
+            print(color("  ☑ 任务清单", "cyan"))
+            for t in todos[-10:]:
+                st = t.get("status", "pending")
+                c = {"pending": "yellow", "in_progress": "cyan",
+                     "completed": "green", "failed": "red", "cancelled": "dim"}.get(st, "yellow")
+                print(color(f"    [{st}] #{t.get('id')} {t.get('title')}", c))
+            return None
 
     # ---- 发送 ----
     def send(self, text: str) -> None:
