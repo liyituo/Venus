@@ -201,6 +201,75 @@ check("丢弃最早的巨长消息", not any(m.get("content") == big for m in tr
 small = [{"role": "user", "content": "hi"}]
 check("小上下文原样", L._trim_messages(small) == small, "")
 
+# ============ 4. 计划审批模式（plan）============
+print("== 4. 计划审批模式 ==")
+L._todos = []
+L._todos_loaded = True
+_orig_confirm_mode = L._current_confirm_mode
+L._current_confirm_mode = lambda: "plan"
+
+# 4.1 全链路：create_plan → ask 带计划 → 批准 → 计划内 run_shell 免确认执行 → 最终回复
+plan_seen = {"called": 0, "plan": None}
+
+def fake_plan_upstream(api_url, payload, headers):
+    n = plan_seen.get("called", 0) + 1
+    plan_seen["called"] = n
+    if n == 1:
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p1", "type": "function",
+             "function": {"name": "create_plan", "arguments": json.dumps({
+                 "steps": [
+                     {"step": "查看工作区", "tools": ["list_folder"], "reason": "了解现状"},
+                     {"step": "执行命令", "tools": ["run_shell"], "reason": "需要运行命令"},
+                 ]})}}]}}], "usage": {}}
+    if n == 2:
+        # 计划批准后：调计划内声明的 run_shell（应免确认直接执行）
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p2", "type": "function",
+             "function": {"name": "run_shell",
+                          "arguments": json.dumps({"command": "echo planned-ok"})}}]}}], "usage": {}}
+    return {"choices": [{"message": {"role": "assistant", "content": "任务完成"}}], "usage": {}}
+
+L._call_upstream_raw = fake_plan_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "做个计划并执行"}]})
+
+kinds = [e[0] for e in events]
+ask = next((p for k, p in events if k == "ask"), None)
+check("plan ask 事件", ask is not None, str(kinds))
+check("ask 带计划字段", ask is not None and isinstance(ask.get("plan"), list)
+      and len(ask["plan"]) == 2, str(ask)[:200])
+check("计划含工具声明", ask is not None and any("run_shell" in s.get("tools", [])
+      for s in ask["plan"]), str(ask)[:200])
+tr_plan = next((p for k, p in events if k == "tool_result" and "计划已批准" in p.get("result", "")), None)
+check("计划批准回传", tr_plan is not None, str(events)[:300])
+# 批准后 run_shell 直接执行（无第二次 ask）
+ask_count = sum(1 for k, _ in events if k == "ask")
+check("计划内工具免确认（无第二次 ask）", ask_count == 1, str(ask_count))
+tr_shell = next((p for k, p in events if k == "tool_result" and "planned-ok" in p.get("result", "")), None)
+check("计划内 run_shell 已执行", tr_shell is not None and tr_shell.get("ok"), str(tr_shell)[:150])
+check("最终回复", any(k == "delta" and "任务完成" in p for k, p in events), str(kinds))
+
+# 4.2 未规划直接调工具 → 拒绝
+plan_seen2 = {"called": 0}
+
+def fake_noplan_upstream(api_url, payload, headers):
+    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "p3", "type": "function",
+         "function": {"name": "run_shell", "arguments": json.dumps({"command": "echo x"})}}]}}],
+        "usage": {}}
+
+L._call_upstream_raw = fake_noplan_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "直接执行"}]})
+tr = next((p for k, p in events if k == "tool_result"), None)
+check("未规划工具被拒绝", tr is not None and "create_plan" in tr.get("result", ""), str(tr)[:150])
+check("未规划不弹确认（直接拒绝）", not any(k == "ask" for k, _ in events), str([k for k, _ in events]))
+
+L._current_confirm_mode = _orig_confirm_mode
+
 # ============ 汇总 ============
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

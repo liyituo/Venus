@@ -81,13 +81,14 @@ READONLY_SHELL_WIN = re.compile(
 # 确认请求需要发 ask 事件的敏感工具
 CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process", "undo"}
 
-# ---- 问询模式（四种）----
-CONFIRM_MODES = ("auto", "strict", "trusted", "query")
+# ---- 问询模式（五种）----
+CONFIRM_MODES = ("auto", "strict", "trusted", "query", "plan")
 CONFIRM_MODE_DESC = {
     "auto":    "智能：敏感写操作确认，只读命令免确认（默认）",
     "strict":  "严格：所有修改/执行类操作都需确认",
     "trusted": "信任：全部自动执行（危险命令黑名单仍拦截）",
     "query":   "只读：仅允许查询操作，一切修改直接拒绝",
+    "plan":    "计划：任务先列计划表格（步骤+所需工具），统一批准后按计划执行，计划内免确认",
 }
 QUERY_TOOLS = {  # 查询类工具（任何模式都放行）
     "list_folder", "read_file", "get_screen_size",
@@ -739,6 +740,24 @@ AGENT_TOOLS = [
                            "new": {"type": "string", "description": "替换成的新文本"},
                            "occurrence": {"type": "integer", "default": 1, "description": "old 出现多次时指定第几次"}},
                        "required": ["file", "old", "new"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_plan",
+        "description": "（计划审批模式）任务开始前提交执行计划：列出每个步骤、每步需要的工具和原因。"
+                       "用户批准后按计划执行，计划内声明的工具不再逐个确认；计划外的操作仍需确认。"
+                       "只声明计划，不执行任何实际动作。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "steps": {"type": "array",
+                                     "items": {"type": "object",
+                                               "properties": {
+                                                   "step": {"type": "string", "description": "步骤描述"},
+                                                   "tools": {"type": "array", "items": {"type": "string"},
+                                                             "description": "本步骤需要的工具名（如 create_file、run_shell）"},
+                                                   "reason": {"type": "string", "description": "为什么需要这个权限"}},
+                                               "required": ["step", "tools"]},
+                                     "description": "计划步骤列表"}},
+                       "required": ["steps"]},
     }},
     {"type": "function", "function": {
         "name": "undo",
@@ -2136,6 +2155,8 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if mcp is None or not mcp.conns:
                 return False, "MCP 未配置（mcp_config.json 为空）"
             return mcp.call(name, arguments)
+        if name == "create_plan":
+            return False, "create_plan 仅在计划审批模式（/confirm-mode plan）下使用，由 agent 循环处理"
         return False, f"未知工具：{name}"
     except Exception as exc:
         return False, f"工具执行异常：{exc}"
@@ -2153,6 +2174,10 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     start = time.monotonic()
     tool_calls_total = 0
     consecutive_failures = 0
+    # ---- 计划审批模式状态（plan）：任务先列计划，统一批准后按计划执行 ----
+    plan_mode = _current_confirm_mode() == "plan"
+    plan_submitted = not plan_mode
+    approved_tools: set[str] = set()
 
     for step in range(1, MAX_TOOL_STEPS + 1):
         # 安全锁检查
@@ -2205,28 +2230,64 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
                                  "arguments": fn["arguments"],
                                  "step": step, "max_steps": MAX_TOOL_STEPS}))
-            # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
-            policy = _confirm_policy(fn["name"], args)
-            if policy == "deny":
-                ok = False
-                result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
-                          f"如需执行请先切换到其他问询模式")
-            elif policy == "ask":
-                ask_id = f"ask-{next(_confirm_counter)}"
-                question, diff = _confirm_question(fn["name"], args)
-                q.put(("ask", {"id": ask_id, "name": fn["name"],
-                               "arguments": fn["arguments"],
-                               "question": question,
-                               "options": ["yes", "no"], "diff": diff}))
-                choice = _wait_confirm(ask_id)
-                if choice != "yes":
-                    log.info("tool %s rejected by user (%s)", fn["name"], choice)
-                    result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+            # ---- 计划审批模式：先规划，批准后按计划执行 ----
+            if plan_mode and not plan_submitted:
+                if fn["name"] == "create_plan":
+                    plan_steps = args.get("steps") or []
+                    if not isinstance(plan_steps, list) or not plan_steps:
+                        result = "计划无效：steps 必须是非空数组（每个步骤含 step/tools）"
+                        ok = False
+                    else:
+                        ask_id = f"ask-{next(_confirm_counter)}"
+                        q.put(("ask", {"id": ask_id, "name": "create_plan",
+                                       "arguments": fn["arguments"],
+                                       "question": "任务计划需要你的批准：批准后按计划执行，"
+                                                   "计划内声明的操作不再逐个确认；计划外操作仍会确认。",
+                                       "options": ["yes", "no"],
+                                       "plan": plan_steps}))
+                        choice = _wait_confirm(ask_id)
+                        if choice == "yes":
+                            approved_tools = {t for s in plan_steps
+                                              for t in (s.get("tools") or [])}
+                            plan_submitted = True
+                            result = (f"计划已批准（{len(plan_steps)} 步，"
+                                      f"授权工具：{', '.join(sorted(approved_tools)) or '无'}），"
+                                      f"开始按计划执行")
+                            ok = True
+                        else:
+                            result = "计划被用户拒绝，请停止执行并询问用户如何调整"
+                            ok = False
+                else:
+                    result = ("计划审批模式下，执行任何工具前必须先用 create_plan 提交计划"
+                              "（列出步骤与所需工具，用户批准后才可执行）")
                     ok = False
+            # ---- 常规执行（或计划已批准）----
+            elif plan_mode and fn["name"] in approved_tools:
+                # 计划内声明的工具：免确认直接执行
+                ok, result = _execute_tool(fn["name"], fn["arguments"])
+            else:
+                # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
+                policy = _confirm_policy(fn["name"], args)
+                if policy == "deny":
+                    ok = False
+                    result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
+                              f"如需执行请先切换到其他问询模式")
+                elif policy == "ask":
+                    ask_id = f"ask-{next(_confirm_counter)}"
+                    question, diff = _confirm_question(fn["name"], args)
+                    q.put(("ask", {"id": ask_id, "name": fn["name"],
+                                   "arguments": fn["arguments"],
+                                   "question": question,
+                                   "options": ["yes", "no"], "diff": diff}))
+                    choice = _wait_confirm(ask_id)
+                    if choice != "yes":
+                        log.info("tool %s rejected by user (%s)", fn["name"], choice)
+                        result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+                        ok = False
+                    else:
+                        ok, result = _execute_tool(fn["name"], fn["arguments"])
                 else:
                     ok, result = _execute_tool(fn["name"], fn["arguments"])
-            else:
-                ok, result = _execute_tool(fn["name"], fn["arguments"])
             # 工具结果截断：避免大结果（read_file 等）撑爆上下文
             if len(result) > MAX_TOOL_RESULT_CHARS:
                 result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
@@ -2305,6 +2366,11 @@ async def chat_stream(req: ChatRequest):
                 todo_note = _todos_system_note()
                 if todo_note:
                     m["content"] += todo_note
+                # 计划审批模式：提示先规划
+                if _current_confirm_mode() == "plan":
+                    m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
+                                     "列出步骤与所需工具；用户批准前不要执行任何工具。"
+                                     "批准后按计划执行，计划内操作免确认。）")
                 break
         else:
             messages.insert(0, {"role": "system",

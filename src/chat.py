@@ -874,6 +874,17 @@ class ChatApp:
                  bg=BG, fg=TEXT, justify="left", wraplength=600,
                  font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 8))
 
+        plan = data.get("plan")
+        if plan:
+            lines = ["执行计划（批准后按计划执行，计划内操作免确认）:"]
+            for i, s in enumerate(plan, 1):
+                tools = ", ".join(s.get("tools") or []) or "—"
+                lines.append(f"{i}. {s.get('step', '')}\n    需要: {tools}")
+                if s.get("reason"):
+                    lines.append(f"    原因: {s['reason']}")
+            tk.Label(body, text="\n".join(lines), bg=BG, fg=TEXT, justify="left",
+                     wraplength=600, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
+
         diff = data.get("diff")
         if diff:
             tk.Label(body, text="改动预览（diff）:", bg=BG, fg=TEXT_DIM,

@@ -575,6 +575,16 @@ class Cli:
                     c = "green" if dl.startswith("+") else ("red" if dl.startswith("-") else "dim")
                     print(color(f"  {dl[:200]}", c))
                 print(color("  ────────────────────────────────────", "dim"))
+            plan = payload.get("plan")
+            if plan:
+                print(color("  ── 执行计划（批准后按计划执行）──", "cyan"))
+                for i, s in enumerate(plan, 1):
+                    tools = ", ".join(s.get("tools") or []) or "—"
+                    print(color(f"    {i}. {s.get('step', '')}", "bold"))
+                    print(color(f"       需要: {tools}", "dim"))
+                    if s.get("reason"):
+                        print(color(f"       原因: {s['reason']}", "dim"))
+                print(color("  ────────────────────────────────────", "cyan"))
             options = payload.get("options") or ["yes", "no"]
             for i, opt in enumerate(options, 1):
                 print(color(f"     [{i}] {opt}", "dim"))

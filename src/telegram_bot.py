@@ -606,6 +606,15 @@ class Bot:
         text = f"❓ {question}"
         if diff:
             text += f"\n\n<pre>{diff[:1500]}</pre>"
+        plan = d.get("plan")
+        if plan:
+            lines = ["📋 执行计划（批准后按计划执行）:"]
+            for i, s in enumerate(plan, 1):
+                tools = ", ".join(s.get("tools") or []) or "—"
+                lines.append(f"{i}. {s.get('step', '')}\n   🛠 需要: {tools}")
+                if s.get("reason"):
+                    lines.append(f"   原因: {s['reason']}")
+            text += "\n\n" + "\n".join(lines)
         keyboard = {"inline_keyboard": [[
             {"text": "✓ 允许", "callback_data": f"yes:{d.get('id')}"},
             {"text": "✗ 拒绝", "callback_data": f"no:{d.get('id')}"},
