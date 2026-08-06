@@ -1,0 +1,8 @@
+{
+  "_说明": "API 配置样例。复制本文件为 chat_config.json 后填写 api_key；真实配置含密钥，已 gitignore 不会入库。api_url 兼容任意 OpenAI 格式接口（DeepSeek 填 https://api.deepseek.com，OpenAI 填 https://api.openai.com/v1，Ollama 填 http://localhost:11434/v1）。",
+  "api_url": "https://api.deepseek.com",
+  "api_key": "sk-你的Key",
+  "model": "deepseek-v4-flash",
+  "context_window": 1048576,
+  "confirm_mode": "auto"
+}

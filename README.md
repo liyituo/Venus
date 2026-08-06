@@ -20,6 +20,8 @@
 
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。
 
+也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
+
 ## WSL / Linux
 
 配好 Python 3.13 环境，然后：
@@ -107,6 +109,8 @@ scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh
 static/index.html   网页控制台
 tests/              四套测试（daemon / 编程工具 / agent 循环 / 会话）
 .github/workflows/  CI（push 自动跑四套测试）
+chat_config.example.json   API 配置样例（复制为 chat_config.json 后填 Key）
+mcp_config.example.json    MCP server 配置样例（复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
 telegram_config.json  bot 配置（含 token，已 gitignore，别提交）
 .pcagent/           会话历史 / 修改备份 / 运行日志（gitignore，不入库）
