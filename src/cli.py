@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -68,20 +69,34 @@ def color(text: str, code: str = "reset") -> str:
 # 方向键选择菜单（跨平台：Windows msvcrt / Linux termios，零依赖）
 # ======================================================================
 def _read_key() -> Optional[str]:
-    """读取单个按键。返回 'up'/'down'/'enter'/'esc'/普通字符；非交互环境返回 None。"""
+    """读取单个按键。返回 'up'/'down'/'enter'/'esc'/普通字符；非交互环境返回 None。
+
+    兼容两种键盘编码：
+    - 传统控制台功能键码（cmd / 旧 conhost）：方向键 = \x00|\xe0 + H/P
+    - VT 转义序列（Windows Terminal / 启用 ANSI 的终端）：方向键 = \x1b[A / \x1b[B
+    """
     try:
         if sys.platform == "win32":
             import msvcrt
             if not msvcrt.kbhit():
                 return None
             ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):            # 功能键前缀（方向键等）
+            if ch in ("\x00", "\xe0"):            # 传统功能键前缀（方向键等）
                 ch2 = msvcrt.getwch()
                 return {"H": "up", "P": "down"}.get(ch2, "enter")
+            if ch == "\x1b":
+                # VT 转义序列：\x1b [ A/B（Windows Terminal 等）；无后续则视为 Esc
+                seq = ""
+                for _ in range(2):
+                    if msvcrt.kbhit():
+                        seq += msvcrt.getwch()
+                if seq == "[A":
+                    return "up"
+                if seq == "[B":
+                    return "down"
+                return "esc"
             if ch in ("\r", "\n"):
                 return "enter"
-            if ch == "\x1b":
-                return "esc"
             return ch.lower()
         else:
             import termios
@@ -115,6 +130,7 @@ def select_menu(title: str, options: List[str], current: int = 0) -> Optional[in
         for i, opt in enumerate(options):
             print(color(f"  {'▶' if i == current else ' '} {opt}",
                         "bold" if i == current else "reset"))
+        print(color("（当前终端不支持交互选择，请用 /confirm-mode <模式名> 直接指定）", "dim"))
         return None
     if sys.platform == "win32":
         os.system("")   # 启用 Windows 控制台 ANSI 转义序列（Win10+）
@@ -144,8 +160,19 @@ def select_menu(title: str, options: List[str], current: int = 0) -> Optional[in
         sys.stdout.write("\033[2K\r")
         sys.stdout.flush()
 
+    idle = 0
     while True:
         key = _read_key()
+        if key is None:
+            # 键盘读取失效（非标准终端）：等 5 秒无输入则安全退出，避免挂死
+            idle += 1
+            if idle > 50:
+                cleanup()
+                print(color("（未检测到按键输入，已取消）", "dim"))
+                return None
+            time.sleep(0.1)
+            continue
+        idle = 0
         if key == "up":
             sel = (sel - 1) % n
             draw()
