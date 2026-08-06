@@ -311,6 +311,10 @@ class Bot:
         if choice in ("yes", "no") and request_id:
             self.llm("POST", "/api/v1/agent/respond",
                      {"request_id": request_id, "choice": choice}, timeout=10)
+        # 解冻渲染：确认已应答，恢复流式刷新
+        st = self.stream_state.get(chat_id)
+        if st:
+            st["frozen"] = False
         self.answer_callback(cq["id"], "已确认" if choice == "yes" else "已拒绝")
 
     # ------------------------------------------------------------------ Agent 流程
@@ -345,12 +349,15 @@ class Bot:
         holder = self.send_message(chat_id, "◌ 思考中…")
         state["msg_id"] = holder.get("result", {}).get("message_id")
 
-        # 渲染刷新线程：每 1 秒把累积内容编辑进消息
+        # 渲染刷新线程：每 1 秒把累积内容编辑进消息（ask 确认期间冻结，防止覆盖确认按钮）
         def renderer():
             last = ""
             while not state["done"]:
                 if time.monotonic() - state["start"] > STREAM_TIMEOUT:
                     break
+                if state.get("frozen"):
+                    time.sleep(STREAM_TICK)   # 确认框显示中：不刷新，保护按钮
+                    continue
                 content = self._render_text(state)
                 if content and content != last:
                     self.edit_message(chat_id, state["msg_id"], content)
@@ -458,7 +465,8 @@ class Bot:
         return None
 
     def _ask_user(self, chat_id: int, state: dict, d: dict) -> None:
-        """ask 确认：把当前消息替换为带按钮的确认框，等待用户点按钮回传。"""
+        """ask 确认：把当前消息替换为带按钮的确认框，等待用户点按钮回传。
+        冻结渲染线程，防止后续刷新把确认按钮覆盖掉。"""
         question = d.get("question") or "需要确认"
         diff = d.get("diff")
         text = f"❓ {question}"
@@ -468,6 +476,7 @@ class Bot:
             {"text": "✓ 允许", "callback_data": f"yes:{d.get('id')}"},
             {"text": "✗ 拒绝", "callback_data": f"no:{d.get('id')}"},
         ]]}
+        state["frozen"] = True
         self.edit_message(chat_id, state["msg_id"], text, keyboard=keyboard)
 
 
