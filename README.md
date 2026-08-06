@@ -74,6 +74,8 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、撤销修改（`undo` 同样展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令（Windows 上还拦 `format C:`、`rd /s /q`、`diskpart`）；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
 
+**计划审批模式（plan）**：任务执行前 agent 先提交计划表格（步骤 + 每步所需工具 + 原因），你一次批准后按计划执行——计划内声明的操作免确认，计划外操作仍会确认，未规划直接调写操作会被拒绝。只读查询（list_folder/read_file 等）无需规划。`/confirm-mode plan` 切换。
+
 ## MCP 外部工具
 
 通过 MCP（Model Context Protocol）接入生态工具，配置 `mcp_config.json`（含第三方 token，**已 gitignore 不入库**；示例见 `mcp_config.example.json`）：

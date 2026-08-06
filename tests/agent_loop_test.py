@@ -257,7 +257,8 @@ plan_seen2 = {"called": 0}
 def fake_noplan_upstream(api_url, payload, headers):
     return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
         {"id": "p3", "type": "function",
-         "function": {"name": "run_shell", "arguments": json.dumps({"command": "echo x"})}}]}}],
+         "function": {"name": "run_shell",
+                      "arguments": json.dumps({"command": "touch newfile.txt"})}}]}}],
         "usage": {}}
 
 L._call_upstream_raw = fake_noplan_upstream
@@ -267,6 +268,48 @@ events = collect_events(client, {"agent": True, "messages": [
 tr = next((p for k, p in events if k == "tool_result"), None)
 check("未规划工具被拒绝", tr is not None and "create_plan" in tr.get("result", ""), str(tr)[:150])
 check("未规划不弹确认（直接拒绝）", not any(k == "ask" for k, _ in events), str([k for k, _ in events]))
+
+# 4.3 只读操作免规划：未规划直接调 list_folder（只读）→ 直接执行
+plan_seen3 = {"called": 0}
+
+def fake_readonly_upstream(api_url, payload, headers):
+    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "p4", "type": "function",
+         "function": {"name": "list_folder", "arguments": "{}"}}]}}], "usage": {}}
+
+L._call_upstream_raw = fake_readonly_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "看看工作区"}]})
+tr = next((p for k, p in events if k == "tool_result"), None)
+check("只读操作免规划直接执行", tr is not None and tr.get("ok"), str(tr)[:150])
+check("只读操作无 ask", not any(k == "ask" for k, _ in events), "")
+
+# 4.4 批准后重复 create_plan → 提示
+plan_seen4 = {"called": 0}
+
+def fake_dup_plan_upstream(api_url, payload, headers):
+    n = plan_seen4["called"] + 1
+    plan_seen4["called"] = n
+    if n == 1:
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p5", "type": "function",
+             "function": {"name": "create_plan", "arguments": json.dumps({
+                 "steps": [{"step": "建文件", "tools": ["create_file"], "reason": "写代码"}]})}}]}}],
+            "usage": {}}
+    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "p6", "type": "function",
+         "function": {"name": "create_plan", "arguments": json.dumps({
+             "steps": [{"step": "再规划", "tools": ["create_file"], "reason": "x"}]})}}]}}],
+        "usage": {}}
+
+L._call_upstream_raw = fake_dup_plan_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "规划执行"}]})
+tr_dup = next((p for k, p in events if k == "tool_result"
+               and "重复规划" in p.get("result", "")), None)
+check("批准后重复规划被提示", tr_dup is not None, str(events)[:200])
 
 L._current_confirm_mode = _orig_confirm_mode
 

@@ -2178,6 +2178,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     plan_mode = _current_confirm_mode() == "plan"
     plan_submitted = not plan_mode
     approved_tools: set[str] = set()
+    PLAN_CONFIRM_TIMEOUT = 300   # 计划审批等待更宽松（看表格+思考需要时间）
 
     for step in range(1, MAX_TOOL_STEPS + 1):
         # 安全锁检查
@@ -2245,7 +2246,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                                    "计划内声明的操作不再逐个确认；计划外操作仍会确认。",
                                        "options": ["yes", "no"],
                                        "plan": plan_steps}))
-                        choice = _wait_confirm(ask_id)
+                        choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT)
                         if choice == "yes":
                             approved_tools = {t for s in plan_steps
                                               for t in (s.get("tools") or [])}
@@ -2257,11 +2258,20 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         else:
                             result = "计划被用户拒绝，请停止执行并询问用户如何调整"
                             ok = False
+                elif (fn["name"] in QUERY_TOOLS or
+                      (fn["name"] == "run_shell" and
+                       _is_readonly_shell((args.get("command") or "").strip()))):
+                    # 只读操作（查询类工具/只读 shell）天然无害：免规划直接执行
+                    ok, result = _execute_tool(fn["name"], fn["arguments"])
                 else:
-                    result = ("计划审批模式下，执行任何工具前必须先用 create_plan 提交计划"
+                    result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
                               "（列出步骤与所需工具，用户批准后才可执行）")
                     ok = False
             # ---- 常规执行（或计划已批准）----
+            elif plan_mode and fn["name"] == "create_plan":
+                # 计划已批准后重复规划：提示而非误导
+                result = "计划已提交并批准，直接按计划执行即可，无需重复规划；如需调整请询问用户"
+                ok = False
             elif plan_mode and fn["name"] in approved_tools:
                 # 计划内声明的工具：免确认直接执行
                 ok, result = _execute_tool(fn["name"], fn["arguments"])
