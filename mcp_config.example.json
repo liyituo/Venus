@@ -1,13 +1,31 @@
 {
+  "_说明": "MCP server 配置样例。复制本文件为 mcp_config.json 后按需修改；真实配置含第三方 token，已 gitignore 不会入库。字段：command=启动命令，args=参数，env=环境变量，transport=http 时用 url。",
+
   "servers": {
     "github": {
-      "command": "/path/to/github-mcp-server",
+      "command": "github-mcp-server",
       "args": ["stdio"],
-      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "你的PAT", "GITHUB_PERMISSION": "read-write"}
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_你的PAT",
+        "GITHUB_PERMISSION": "read-write"
+      },
+      "_说明": "GitHub 官方 MCP v1.8+。command 用官方 release 二进制全路径：Windows 为 tools/github-mcp-server.exe，Linux 为 /usr/local/bin/github-mcp-server。切勿用 npm 同名包（杂牌）。"
     },
     "chrome": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"]
+      "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"],
+      "_说明": "浏览器控制（需本机已装 Chrome；Windows 桌面场景）。"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-fs"],
+      "_说明": "可选：标准文件系统 server，开放指定目录。"
+    },
+    "http_example": {
+      "transport": "http",
+      "url": "http://127.0.0.1:8888/mcp",
+      "headers": {},
+      "_说明": "可选：HTTP 传输的 server（如远程部署的 MCP 服务）。"
     }
   }
 }
