@@ -56,14 +56,22 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 敏感操作会弹确认，超时默认拒绝：覆盖文件、修改代码（`replace_text` 会先展示 diff）、git 提交、非只读 shell、启动后台进程。`run_shell` 拦 `rm -rf /`、`mkfs`、`shutdown` 这类危险命令；鼠标甩到屏幕角落或按 Ctrl+Alt+Shift+X 立刻紧急止停。
 
+## 会话与数据
+
+- 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）
+- 重启程序自动恢复全部会话；chat / cli / 网页共享同一份历史（后端权威存储）
+- 任务清单存在工作区 `~/agent_workspace/.pcagent/todos.json`（跟随机器）
+- 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
+
 ## 目录结构
 
 ```
 src/                源代码（app / llm_server / 三个前端 / mock_llm 测试 API）
 scripts/            一键启动 .bat、start_wsl.sh
 static/index.html   网页控制台
-tests/smoke_test.py 冒烟测试（pyautogui 已打桩，不碰真实屏幕）
+tests/              smoke_test / llm_tools_test / agent_loop_test / session_test
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
+.pcagent/           本地会话历史（gitignore，不入库）
 ```
 
 ## 开发
