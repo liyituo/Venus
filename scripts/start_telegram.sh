@@ -1,11 +1,8 @@
 #!/bin/bash
-# PC Agent WSL 一键启动（隔离模式）——统一入口：
-#  - llm_server 以 --isolated 运行（禁屏幕工具，只留文件类），带代理（run_shell 可访问外网）
-#  - Telegram bot 若未运行则自动拉起（守护）
-#  - 最后进入 cli 终端
-export PYTHONUTF8=1
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+# Telegram Bot 前端启动（WSL）—— 代理已配置，llm_server 与 bot 共用
+# 注意：每个 nohup 后台进程启动后都要 sleep 保持 wsl 会话，
+# 否则未完成初始化的进程会在命令返回时被 WSL 清理。
+export PYTHONUTF8=1 LANG=C.UTF-8 LC_ALL=C.UTF-8
 export HTTP_PROXY=http://127.0.0.1:7897
 export HTTPS_PROXY=http://127.0.0.1:7897
 export NO_PROXY=localhost,127.0.0.1
@@ -18,7 +15,8 @@ fi
 if ! pgrep -f '[t]elegram_bot' > /dev/null 2>&1; then
   echo "启动 Telegram bot（@QuraxBot）..."
   nohup .venv/bin/python -u src/telegram_bot.py > telegram_bot.log 2>&1 &
-  sleep 3   # 保持 wsl 会话直到 bot 完成初始化，否则未就绪的后台进程会被清理
+  sleep 3
   tail -1 telegram_bot.log
+else
+  echo "Telegram bot 已在运行"
 fi
-exec .venv/bin/python src/cli.py --host localhost --port 8001
