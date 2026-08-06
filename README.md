@@ -289,6 +289,7 @@ OpenAI 兼容接口（真实模型，如 OpenAI / DeepSeek / Ollama）
 | `create_file` | 创建/覆盖写入文件（代码编写，限 100KB） |
 | `read_file` | 读取文件内容（限 200KB / 返回 1 万字符，防爆 token） |
 | `run_code` | 执行 Python 代码（file 或 code 参数；超时 30s 强制终止；输出限 3000 字符） |
+| `run_shell` | 执行 Linux shell 命令（管道/重定向/任意 cwd；**危险命令黑名单拦截**：`rm -rf /`、`mkfs`、`shutdown`、`dd` 写盘、fork bomb、`git push --force` 等；超时 30s；输出限 3000 字符） |
 | `stop` | 紧急止停（模型自主喊停） |
 
 **隔离模式（`--isolated`）**：禁用全部屏幕工具，仅保留文件类工具（`create_folder`/`list_folder`/`create_file`/`read_file`/`run_code`）——WSL 安全测试用，代码层面保证 agent 无法操作屏幕（已实测：隔离模式下模型明确拒绝"点击屏幕"类指令）。

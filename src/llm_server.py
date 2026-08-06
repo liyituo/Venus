@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -49,19 +50,39 @@ MAX_AGENT_SECONDS = 240         # 单次 agent 请求总耗时上限（含上游
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
 _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 agent 循环
 
-# 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件类工具。
+# 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件/系统类工具。
 # WSL 隔离测试环境使用，代码层面保证 agent 无法操作任何屏幕。
 _SCREEN_TOOLS = {"get_screen_size", "click", "type_text", "press_key"}
-_FILE_TOOLS = {"create_folder", "list_folder", "create_file", "read_file", "run_code"}
+_FILE_TOOLS = {"create_folder", "list_folder", "create_file", "read_file", "run_code", "run_shell"}
 ISOLATED = False
 
-# ---- 文件工具安全限制 ----
+# ---- 文件/系统工具安全限制 ----
 MAX_FILE_SIZE = 200_000      # read_file 单文件上限（字节）
 MAX_FILE_CHARS = 4000        # read_file 返回字符数上限（防爆 token）
 MAX_WRITE_CHARS = 100_000    # create_file 内容上限
 MAX_LIST_ENTRIES = 50        # list_folder 单目录条目上限
 RUN_CODE_TIMEOUT = 30        # run_code 执行超时（秒），超时即 kill
 RUN_CODE_OUTPUT_LIMIT = 2000 # run_code 输出截断（字符）
+RUN_SHELL_TIMEOUT = 30       # run_shell 执行超时（秒），超时即 kill
+RUN_SHELL_OUTPUT_LIMIT = 3000
+RUN_SHELL_MAX_CMD = 2000     # 命令长度上限
+
+# run_shell 危险命令黑名单（破坏性操作，正则匹配即拦截）
+DANGEROUS_PATTERNS = [
+    r"\brm\s+(-[a-zA-Z]*\s+)*/",            # rm -rf / 或 rm /xxx（根路径）
+    r"\brm\s+(-[a-zA-Z]*\s+)*~",            # rm -rf ~
+    r"\bmkfs\b",
+    r"\bdd\s+if=/dev/zero",
+    r"\bdd\s+of=/dev/",
+    r"\bshutdown\b", r"\breboot\b", r"\bpoweroff\b", r"\bhalt\b",
+    r"\binit\s+[06]\b",
+    r"\bmv\s+/\s+\S",                        # mv / xxx
+    r":\(\)\s*\{",                           # fork bomb
+    r"\bchmod\s+-R\s+777\s+/",               # 全盘权限
+    r">+\s*/dev/sd",                         # 写块设备
+    r"\bsudo\s+rm\b",
+    r"\bgit\s+push\s+(-f|--force)",          # 强制推送（防误覆盖远程）
+]
 
 # ---- Token 用量优化 ----
 MAX_HISTORY_MESSAGES = 20    # 发送给上游的消息数上限（保留 system + 最近 N 条）
@@ -484,6 +505,20 @@ AGENT_TOOLS = [
                        "required": []},
     }},
     {"type": "function", "function": {
+        "name": "run_shell",
+        "description": "在 Linux 系统中执行 shell 命令（ls/cat/grep/find/pip/apt/systemctl 等任意命令，"
+                       "支持管道 |、重定向 >、&& 等 shell 语法）。默认在工作区目录执行，可用 cwd 指定目录。"
+                       "执行超时 30 秒，输出最多 3000 字符。"
+                       "破坏性命令（rm -rf /、mkfs、shutdown、dd 写磁盘、fork bomb 等）会被拦截。"
+                       "注意：sudo 命令需要交互密码，非交互环境会失败。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "command": {"type": "string", "description": "要执行的 shell 命令"},
+                           "cwd": {"type": "string",
+                                   "description": "可选：执行目录（默认工作区 ~/agent_workspace，可用绝对路径如 /tmp）"}},
+                       "required": ["command"]},
+    }},
+    {"type": "function", "function": {
         "name": "stop",
         "description": "紧急止停：立即停止所有后续操作并拒绝新指令。当用户要求停止或发现操作可能造成损害时调用。",
         "parameters": {"type": "object", "properties": {}},
@@ -703,6 +738,35 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if proc.returncode != 0:
                 return False, json.dumps({"exit_code": proc.returncode, "stderr": stderr},
                                          ensure_ascii=False)
+            return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
+        if name == "run_shell":
+            command = (args.get("command") or "").strip()
+            if not command:
+                return False, "没有提供命令"
+            if len(command) > RUN_SHELL_MAX_CMD:
+                return False, f"命令过长（>{RUN_SHELL_MAX_CMD} 字符）"
+            # 危险命令黑名单
+            for pat in DANGEROUS_PATTERNS:
+                if re.search(pat, command):
+                    return False, f"危险命令已被拦截：{command[:80]}（破坏性操作禁止执行）"
+            cwd = (args.get("cwd") or "").strip() or str(_get_workspace())
+            try:
+                proc = subprocess.run(
+                    command, shell=True, cwd=cwd, capture_output=True, text=True,
+                    timeout=RUN_SHELL_TIMEOUT,
+                    executable="/bin/bash" if sys.platform != "win32" else None,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"执行超时（>{RUN_SHELL_TIMEOUT}s），已强制终止"
+            except FileNotFoundError:
+                return False, f"目录不存在：{cwd}"
+            except Exception as exc:
+                return False, f"执行失败：{exc}"
+            stdout = (proc.stdout or "")[:RUN_SHELL_OUTPUT_LIMIT]
+            stderr = (proc.stderr or "")[:RUN_SHELL_OUTPUT_LIMIT]
+            if proc.returncode != 0:
+                return False, json.dumps({"exit_code": proc.returncode,
+                                          "stderr": stderr or stdout}, ensure_ascii=False)
             return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
         if name in ("click", "type_text", "press_key"):
             code, data = _call_daemon("POST", "/api/v1/execute", {"action": name, **args})
