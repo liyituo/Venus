@@ -4,3 +4,4 @@ uvicorn[standard]>=0.32
 pyautogui>=0.9.54
 Pillow>=10.4
 pynput>=1.7.6   # 可选：紧急止停全局热键（Ctrl+Alt+Shift+X），不装也能运行
+fastmcp>=2.0

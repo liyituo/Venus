@@ -15,3 +15,6 @@ chat_config.json.bak
 
 # Telegram bot 配置（含 bot token，严禁入库）
 telegram_config.json
+
+# MCP server 配置（含第三方 token，严禁入库）
+mcp_config.json

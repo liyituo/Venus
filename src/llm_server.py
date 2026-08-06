@@ -115,6 +115,8 @@ def _confirm_policy(name: str, args: dict) -> str:
     if mode == "strict":
         return "allow" if is_query else "ask"
     # auto
+    if name.startswith("mcp_"):
+        return "ask"    # MCP 外部工具保守处理：一律确认（trusted 模式已放行）
     return "ask" if _needs_confirm(name, args) else "allow"
 
 
@@ -1421,10 +1423,40 @@ def _safe_float(value, default: float, lo: float, hi: float) -> float:
 
 
 def _agent_tools() -> list[dict]:
-    """按运行模式返回可用工具：隔离模式只保留文件类工具。"""
+    """按运行模式返回可用工具：隔离模式只保留文件类工具（MCP 外部工具一并排除）。"""
     if ISOLATED:
         return [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
-    return AGENT_TOOLS
+    tools = list(AGENT_TOOLS)
+    mcp = _ensure_mcp()
+    if mcp is not None:
+        tools.extend(mcp.all_tools())     # MCP server 工具动态并入（mcp_<server>_<tool>）
+    return tools
+
+
+# ---- MCP 客户端（外部工具接入，mcp_config.json 配置）----
+_mcp_manager = None
+
+
+def _load_mcp_config() -> dict:
+    """读取 mcp_config.json 的 servers 段（含 token，已 gitignore；示例见 mcp_config.example.json）。"""
+    try:
+        p = BASE_DIR.parent / "mcp_config.json"
+        if p.exists():
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            return cfg.get("servers") or {}
+    except Exception as exc:
+        log.warning("mcp_config.json 解析失败：%s", exc)
+    return {}
+
+
+def _ensure_mcp():
+    """惰性初始化 MCP 管理器（首次访问工具列表时连接各 server）。"""
+    global _mcp_manager
+    if _mcp_manager is None:
+        from mcp_client import McpManager
+        _mcp_manager = McpManager(_load_mcp_config())
+        _mcp_manager.start()
+    return _mcp_manager
 
 
 def _is_readonly_shell(command: str) -> bool:
@@ -2088,6 +2120,12 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if code == 200:
                 return True, json.dumps({"ok": True}, ensure_ascii=False)
             return False, f"执行失败：{data.get('detail', code)}"
+        if name.startswith("mcp_"):
+            # MCP 外部工具转发（mcp_<server>_<tool>）
+            mcp = _ensure_mcp()
+            if mcp is None or not mcp.conns:
+                return False, "MCP 未配置（mcp_config.json 为空）"
+            return mcp.call(name, arguments)
         return False, f"未知工具：{name}"
     except Exception as exc:
         return False, f"工具执行异常：{exc}"

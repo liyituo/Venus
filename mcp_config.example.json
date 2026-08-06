@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "echo": {
+      "command": "python",
+      "args": ["tests/mcp_echo_server.py"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-fs"]
+    }
+  }
+}
