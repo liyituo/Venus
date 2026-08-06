@@ -20,7 +20,7 @@ jobs:
           pip install --quiet -r requirements.txt httpx python-xlib
 
       - name: 冒烟测试（daemon）
-        run: python tests/smoke_test.py
+        run: xvfb-run -a python tests/smoke_test.py
 
       - name: 编程工具测试（检索/编辑/undo/git/进程/todo/超时）
         run: python tests/llm_tools_test.py
