@@ -1,10 +1,9 @@
 """agent 循环端到端测试：打桩上游响应，验证 ask(diff) / todo_update / system 注入。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 SSE 流在后台线程消费；确认请求通过直接操作 _confirm_table 自动应答（TestClient
 单事件循环，流式期间不能并发 POST respond）。
 """
+import os
 import json
 import sys
 import tempfile
@@ -12,9 +11,16 @@ import threading
 import time
 from pathlib import Path
 
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import llm_server as L  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+# CI/无配置环境：注入假配置（测试不走真实上游，仅过 _validate_config）
+L.load_config = lambda: {"api_url": "http://127.0.0.1:9", "api_key": "test",
+                         "model": "test-model", "context_window": 65536,
+                         "confirm_mode": "auto"}
 
 _TMP = tempfile.mkdtemp(prefix="pcagent_loop_")
 WS = Path(_TMP)

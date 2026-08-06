@@ -1,18 +1,18 @@
 """llm_server 编程工具冒烟测试：检索/编辑/git/进程/todo/repo_map 分支逻辑。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 直接调用 _execute_tool（纯函数），workspace 指向临时目录，不碰真实文件系统。
 不触发上游 API 调用（不测试 _agent_loop 循环本身）。
 """
-import json
 import os
+import json
 import re
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import llm_server as L  # noqa: E402

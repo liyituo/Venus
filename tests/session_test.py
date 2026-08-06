@@ -1,13 +1,14 @@
 """会话持久化测试：CRUD + 原子写 + 重启恢复 + 上限。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 用 TestClient 打 HTTP 端点；会话文件重定向到临时目录（monkeypatch _session_file）。
 """
+import os
 import json
 import sys
 import tempfile
 from pathlib import Path
+
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import llm_server as L  # noqa: E402
