@@ -460,6 +460,16 @@ def _summarize_result(result: str, ok: bool) -> str:
     return (result or "").strip()[:100]
 
 
+def _fmt_args(arguments: str, limit: int = 120) -> str:
+    """工具调用参数显示：JSON 解析后截断（replace_text 的 old/new 等长文本不刷屏）。"""
+    try:
+        args = json.loads(arguments or "{}")
+        text = ", ".join(f"{k}={v}" for k, v in args.items()) or "—"
+    except Exception:
+        text = str(arguments or "—")
+    return text[:limit] + (" …" if len(text) > limit else "")
+
+
 # ======================================================================
 # CLI
 # ======================================================================
@@ -522,11 +532,7 @@ class Cli:
     # ---- 事件渲染 ----
     def on_event(self, kind: str, payload) -> Optional[str]:
         if kind == "tool_call":
-            try:
-                args = json.loads(payload.get("arguments") or "{}")
-                arg_str = ", ".join(f"{k}={v}" for k, v in args.items()) or "—"
-            except Exception:
-                arg_str = str(payload.get("arguments", "—"))
+            arg_str = _fmt_args(payload.get("arguments") or "")
             step = payload.get("step")
             step_str = f"（轮次 {step}/{payload.get('max_steps')}）" if step else ""
             print(color(f"  ⚙ [{payload.get('name')}] {arg_str} {step_str}", "blue"), flush=True)
@@ -832,7 +838,7 @@ class Cli:
         print(color("== API 与模型 ==", "cyan"))
         print(color("  /apiconfig        查看/设置 API（url=/key=/model=）", "reset"))
         print(color("  /model            查看/切换模型（/model 模型名）", "reset"))
-        print(color("  /confirm-mode     问询模式（auto/strict/trusted/query）", "reset"))
+        print(color("  /confirm-mode     问询模式：↑/↓ 方向键选择，回车确认", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))

@@ -106,6 +106,16 @@ def _summarize_result(result: str, ok: bool) -> str:
     return (result or "").strip()[:100]
 
 
+def _fmt_args(arguments: str, limit: int = 120) -> str:
+    """工具调用参数显示：JSON 解析后截断（replace_text 的 old/new 等长文本不刷屏）。"""
+    try:
+        args = json.loads(arguments or "{}")
+        text = ", ".join(f"{k}={v}" for k, v in args.items()) or "—"
+    except Exception:
+        text = str(arguments or "—")
+    return text[:limit] + (" …" if len(text) > limit else "")
+
+
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
@@ -809,11 +819,7 @@ class ChatApp:
         handle, data = payload
         if handle is not self._stream_handle:
             return
-        try:
-            args = json.loads(data.get("arguments") or "{}")
-            arg_str = ", ".join(f"{k}={v}" for k, v in args.items()) or "—"
-        except Exception:
-            arg_str = data.get("arguments", "—")
+        arg_str = _fmt_args(data.get("arguments") or "")
         step_info = f" · 轮次 {data.get('step')}/{data.get('max_steps')}" if data.get("step") else ""
         self._agent_log.append(f"`[⚙ {data.get('name')}]` {arg_str}{step_info}")
         self._log(f"tool call: {data.get('name')} {arg_str}{step_info}", "info")

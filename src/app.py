@@ -431,7 +431,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PC Agent Daemon",
-    version="0.2.0",
+    version="0.7.0",
     description="异步解耦的桌面自动化守护进程：网页控制电脑（点击 / 输入 / 按键 / 截图）",
     lifespan=lifespan,
 )

@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "chat_config.json"
+APP_VERSION = "0.7.0"       # 系统版本（health 端点返回，前端可展示）
 UPSTREAM_TIMEOUT = 180  # 模型生成可能较慢（reasoner 更慢）
 DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 
@@ -346,7 +347,7 @@ class LlmError(Exception):
         self.message = message
 
 
-app = FastAPI(title="LLM Backend", version="0.3.0")
+app = FastAPI(title="LLM Backend", version=APP_VERSION)
 
 
 @app.get("/api/v1/confirm-mode", summary="查看当前问询模式")
@@ -528,6 +529,7 @@ async def health() -> dict:
     cfg = load_config()
     return {
         "ok": True,
+        "version": APP_VERSION,
         "configured": bool(cfg.get("api_url") and cfg.get("api_key")),
         "api_url": normalize_url(cfg.get("api_url")),
         "model": cfg.get("model") or "",
