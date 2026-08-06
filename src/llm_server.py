@@ -803,13 +803,12 @@ AGENT_SYSTEM_SUFFIX = (
     "4. 多步骤长任务用 create_todo 先列计划，每完成一步用 update_todo 更新状态。\n"
     "5. 后台服务（dev server 等）用 start_process 启动，process_output 看输出。\n"
     "6. 运行测试/一次性命令用 run_code 或 run_shell；修改代码后主动运行相关测试验证。\n"
-    "使用规则：\n"
-    "1. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
-    "2. 覆盖文件、修改代码、提交 git、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
-    "3. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
+    "7. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
+    "8. 覆盖文件、修改代码、提交 git、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
+    "9. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
     "先用文字列出选项让用户选择，等待用户答复后再行动。\n"
-    "4. 完成任务后，用简短的中文总结你做了什么。\n"
-    "5. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
+    "10. 完成任务后，用简短的中文总结你做了什么。\n"
+    "11. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
 )
 
 
@@ -880,22 +879,21 @@ def _safe_join(workspace: Path, rel: str) -> Path | None:
 
 
 def _iter_workspace_files(workspace: Path, root: Path | None = None, max_files: int = 5000):
-    """深度优先遍历工作区文件：跳过 SKIP_DIRS 与隐藏目录。
+    """惰性遍历工作区文件（os.walk 逐目录，不整树载入内存）：跳过 SKIP_DIRS 与隐藏目录。
     yield (绝对路径, 相对工作区的 posix 路径)。"""
     root = root or workspace
     ws_res = workspace.resolve()
     count = 0
-    for abs_p in sorted(root.rglob("*")):
-        if abs_p.is_dir():
-            continue
-        parts = abs_p.relative_to(ws_res).parts
-        # 只检查目录段：隐藏目录 / 已知构建目录跳过；隐藏文件（如 .env）保留
-        if any(part in SKIP_DIRS or part.startswith(".") for part in parts[:-1]):
-            continue
-        yield abs_p, abs_p.relative_to(ws_res).as_posix()
-        count += 1
-        if count >= max_files:
-            return
+    for dirpath, dirnames, filenames in os.walk(root):
+        # 剪枝：隐藏目录与已知构建目录不进子目录
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in SKIP_DIRS and not d.startswith("."))
+        for fn in sorted(filenames):
+            abs_p = Path(dirpath) / fn
+            yield abs_p, abs_p.relative_to(ws_res).as_posix()
+            count += 1
+            if count >= max_files:
+                return
 
 
 _SYMBOL_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)(.*)$")
@@ -1111,6 +1109,26 @@ def _count_lines(abs_p: Path) -> int:
         return 0
 
 
+def _file_summary(abs_p: Path, max_lines: int = 2000) -> tuple[int, list[str]]:
+    """一次读取返回 (总行数, 符号表)：只收集前 max_lines 行做符号提取，避免全文件驻留。"""
+    total = 0
+    head: list[str] = []
+    try:
+        if abs_p.stat().st_size > MAX_SYMBOLS_FILE_SIZE:
+            return 0, []
+        with abs_p.open("r", encoding="utf-8", errors="replace") as f:
+            if "\x00" in f.read(4096):     # 二进制文件跳过
+                return 0, []
+            f.seek(0)
+            for line in f:
+                total += 1
+                if len(head) < max_lines:
+                    head.append(line)
+    except OSError:
+        return 0, []
+    return total, _extract_symbols("".join(head))
+
+
 def _repo_map_text(workspace: Path, rel: str, depth: int, max_entries: int) -> str:
     """生成项目结构摘要（目录树 + 文件行数 + 顶层符号），30 秒 TTL 缓存。"""
     key = f"{rel}|{depth}|{max_entries}"
@@ -1127,9 +1145,9 @@ def _repo_map_text(workspace: Path, rel: str, depth: int, max_entries: int) -> s
         if level > depth:
             continue
         indent = "  " * (level - 1)
-        syms = _extract_symbols_file(abs_p)
+        n, syms = _file_summary(abs_p)
         suffix = f"  [{', '.join(syms[:6])}]" if syms else ""
-        out.append(f"{indent}{abs_p.name}  {_count_lines(abs_p)}行{suffix}")
+        out.append(f"{indent}{abs_p.name}  {n}行{suffix}")
         count += 1
         if count >= max_entries:
             out.append("...(条目过多已截断，可缩小范围)")
@@ -1163,6 +1181,23 @@ def _make_replace_diff(args: dict) -> str | None:
         text.splitlines(keepends=True), new_text.splitlines(keepends=True),
         fromfile=f"a/{args['file']}", tofile=f"b/{args['file']}", n=2))
     return diff[:REPLACE_DIFF_CHARS] or None
+
+
+def _safe_int(value, default: int, lo: int, hi: int) -> int:
+    """工具参数容错：模型偶发传错类型/非法值时回退默认，而不是抛异常。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi)
+
+
+def _safe_float(value, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi)
 
 
 def _agent_tools() -> list[dict]:
@@ -1427,8 +1462,8 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if not root.exists():
                 return False, f"路径不存在：{rel or '.'}"
             file_pat = (args.get("file_pattern") or "").strip()
-            max_results = min(max(1, int(args.get("max_results") or 20)), SEARCH_MAX_RESULTS)
-            ctx = min(max(0, int(args.get("context_lines") or SEARCH_CONTEXT_LINES)), 5)
+            max_results = _safe_int(args.get("max_results"), 20, 1, SEARCH_MAX_RESULTS)
+            ctx = _safe_int(args.get("context_lines"), SEARCH_CONTEXT_LINES, 0, 5)
             hits = []   # (rel, lineno, text, before, after)
             for abs_p, rel_p in _iter_workspace_files(workspace, root=root):
                 if file_pat and not fnmatch.fnmatch(abs_p.name, file_pat):
@@ -1440,7 +1475,7 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                         lines = f.readlines()
                 except OSError:
                     continue
-                if "\x00" in "".join(lines[:100]):
+                if "\x00" in "".join(lines[:10]):   # 二进制文件跳过（只查头部，省拼接）
                     continue
                 for i, line in enumerate(lines):
                     if rx.search(line):
@@ -1470,7 +1505,7 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             pattern = (args.get("pattern") or "").strip()
             if not pattern:
                 return False, "没有提供文件名模式（如 *.py）"
-            max_results = min(max(1, int(args.get("max_results") or 50)), 200)
+            max_results = _safe_int(args.get("max_results"), 50, 1, 200)
             files = []
             for abs_p, rel_p in _iter_workspace_files(workspace):
                 if not (fnmatch.fnmatch(abs_p.name, pattern) or fnmatch.fnmatch(rel_p, pattern)):
@@ -1515,7 +1550,7 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if count == 0:
                 return False, ("未找到要替换的内容：old 与文件内容不一致（注意空格/缩进/换行，"
                                "或先用 read_file 查看实际内容）")
-            occ = int(args.get("occurrence") or 1)
+            occ = _safe_int(args.get("occurrence"), 1, 1, 10 ** 9)
             if occ > count:
                 return False, (f"occurrence={occ} 超出出现次数 {count}；"
                                f"可省略 occurrence 或把 old 写长一点保证唯一")
@@ -1561,7 +1596,7 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                     out = out[:REPLACE_DIFF_CHARS * 2] + "\n...(diff 过长已截断)"
                 return True, json.dumps({"repo": rel_root, "diff": out}, ensure_ascii=False)
             if name == "git_log":
-                n = min(max(1, int(args.get("n") or 10)), 30)
+                n = _safe_int(args.get("n"), 10, 1, 30)
                 ok, out = _run_git(root, "log", "--oneline", f"-{n}")
                 if not ok:
                     return False, f"git log 失败：{out}"
@@ -1609,8 +1644,8 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
                 return False, "pid 必须是整数"
             if pid <= 0:
                 return False, "无效 pid"
-            tail = min(max(int(args.get("tail") or 2000), 1), 5000)
-            wait = min(max(float(args.get("wait_seconds") or 0), 0), PROCESS_WAIT_MAX)
+            tail = _safe_int(args.get("tail"), 2000, 1, 5000)
+            wait = _safe_float(args.get("wait_seconds"), 0, 0, PROCESS_WAIT_MAX)
             return _process_output_impl(pid, tail, wait)
         if name == "stop_process":
             try:
@@ -1670,9 +1705,8 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
         if name == "repo_map":
             workspace = _get_workspace()
             rel = (args.get("path") or "").strip()
-            depth = min(max(int(args.get("depth") or 3), 1), REPO_MAP_MAX_DEPTH)
-            max_entries = min(max(int(args.get("max_entries") or 200), 10),
-                              REPO_MAP_MAX_ENTRIES)
+            depth = _safe_int(args.get("depth"), 3, 1, REPO_MAP_MAX_DEPTH)
+            max_entries = _safe_int(args.get("max_entries"), 200, 10, REPO_MAP_MAX_ENTRIES)
             return True, _repo_map_text(workspace, rel, depth, max_entries)
         if name in ("click", "type_text", "press_key"):
             code, data = _call_daemon("POST", "/api/v1/execute", {"action": name, **args})
