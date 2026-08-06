@@ -192,10 +192,23 @@ class AgentClient:
         except Exception as e:
             return {"ok": False, "detail": str(e)}
 
-    def stream_chat(self, messages: List[dict], on_event) -> Optional[str]:
-        """阻塞读取 SSE 流；on_event(kind, payload) 回调。返回错误信息或 None。
+    def _send_respond(self, request_id: str, choice: str) -> None:
+        """把用户的确认选择发回 llm_server。"""
+        body = json.dumps({"request_id": request_id, "choice": choice}).encode("utf-8")
+        req = urllib.request.Request(self.base + "/api/v1/agent/respond", data=body,
+                                     headers=self._headers(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except Exception:
+            pass  # 响应失败时 llm_server 侧会超时默认拒绝，安全兜底
 
-        kind: delta(str) / tool_call(dict) / tool_result(dict)
+    def stream_chat(self, messages: List[dict], on_event) -> Optional[str]:
+        """阻塞读取 SSE 流；on_event(kind, payload) 回调。
+        ask 事件：回调返回用户选择（str），随后自动发回 llm_server。
+        返回错误信息或 None。
+
+        kind: delta(str) / tool_call(dict) / tool_result(dict) / ask(dict)
         """
         body = json.dumps({"messages": messages, "agent": True}).encode("utf-8")
         req = urllib.request.Request(self.base + "/api/v1/chat/stream", data=body,
@@ -217,6 +230,13 @@ class AgentClient:
                             return json.loads(payload).get("detail", payload)
                         except Exception:
                             return payload
+                    if event == "ask":
+                        event = ""
+                        data = _try_json(payload)
+                        if "id" in data:
+                            choice = on_event("ask", data) or "no"
+                            self._send_respond(data["id"], choice)
+                        continue
                     if event == "tool_call":
                         event = ""
                         on_event("tool_call", _try_json(payload))
@@ -286,7 +306,7 @@ class Cli:
         print(color("已清空当前会话历史", "cyan"))
 
     # ---- 事件渲染 ----
-    def on_event(self, kind: str, payload) -> None:
+    def on_event(self, kind: str, payload) -> Optional[str]:
         if kind == "tool_call":
             try:
                 args = json.loads(payload.get("arguments") or "{}")
@@ -303,6 +323,29 @@ class Cli:
         elif kind == "delta":
             self._last_content += payload
             print(payload, end="", flush=True)
+        elif kind == "ask":
+            # 敏感操作确认：显示问题与选项，等待用户输入，返回选择
+            try:
+                args = json.loads(payload.get("arguments") or "{}")
+                arg_str = ", ".join(f"{k}={v}" for k, v in args.items()) or ""
+            except Exception:
+                arg_str = str(payload.get("arguments", ""))
+            print()
+            print(color(f"  ❓ {payload.get('question', '需要确认')}", "yellow"))
+            if arg_str:
+                print(color(f"     {arg_str}", "dim"))
+            options = payload.get("options") or ["yes", "no"]
+            for i, opt in enumerate(options, 1):
+                print(color(f"     [{i}] {opt}", "dim"))
+            try:
+                line = input(color("  选择 (数字 / yes / no，直接回车=拒绝): ", "bold")).strip()
+            except (EOFError, KeyboardInterrupt):
+                return "no"
+            if line.isdigit() and 1 <= int(line) <= len(options):
+                return options[int(line) - 1]
+            if line.lower() in ("y", "yes", "是", "确认", "同意", "ok"):
+                return "yes"
+            return "no"
 
     # ---- 发送 ----
     def send(self, text: str) -> None:

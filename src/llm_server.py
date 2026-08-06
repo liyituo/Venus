@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import queue
@@ -49,6 +50,22 @@ MAX_CONSECUTIVE_FAILURES = 4    # 连续失败熔断阈值：达到即停止整�
 MAX_AGENT_SECONDS = 240         # 单次 agent 请求总耗时上限（含上游生成时间）
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
 _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 agent 循环
+
+# ---- 敏感操作确认机制 ----
+CONFIRM_TIMEOUT = 120          # 等待用户确认超时（秒），超时默认拒绝（安全方向）
+_confirm_table: dict = {}      # request_id -> {"event": Event, "choice": str|None}
+_confirm_lock = threading.Lock()
+_confirm_counter = itertools.count(1)
+
+# run_shell 只读命令白名单：命中则无需确认（其余命令默认需要确认）
+READONLY_SHELL = re.compile(
+    r"^\s*(ls|cat|head|tail|grep|find|echo|pwd|whoami|date|df|du|uname|ps|env|"
+    r"which|type|file|stat|wc|sort|cut|awk|sed -n|history|printenv|id|hostname|"
+    r"uptime|free|getconf|locale)\b"
+)
+
+# 确认请求需要发 ask 事件的敏感工具
+CONFIRM_TOOLS = {"create_file", "run_shell"}
 
 # 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件/系统类工具。
 # WSL 隔离测试环境使用，代码层面保证 agent 无法操作任何屏幕。
@@ -530,8 +547,11 @@ AGENT_SYSTEM_SUFFIX = (
     "使用规则：\n"
     "1. 执行点击前，先调用 get_screen_size 获取屏幕分辨率，坐标必须在该范围内。\n"
     "2. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
-    "3. 完成任务后，用简短的中文总结你做了什么。\n"
-    "4. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
+    "3. 覆盖文件、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
+    "4. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
+    "先用文字列出选项让用户选择，等待用户答复后再行动。\n"
+    "5. 完成任务后，用简短的中文总结你做了什么。\n"
+    "6. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。"
 )
 
 
@@ -606,6 +626,65 @@ def _agent_tools() -> list[dict]:
     if ISOLATED:
         return [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
     return AGENT_TOOLS
+
+
+def _is_readonly_shell(command: str) -> bool:
+    """判断 shell 命令是否只读（免确认）。重定向到真实文件视为写操作。"""
+    if re.search(r">\s*(?!/?dev/null\b)\S", command):   # > file 或 >> file（排除 >/dev/null、2>/dev/null）
+        return False
+    return bool(READONLY_SHELL.match(command))
+
+
+def _needs_confirm(name: str, args: dict) -> bool:
+    """判断工具调用是否需要用户确认。"""
+    if name not in CONFIRM_TOOLS:
+        return False
+    if name == "create_file":
+        # 覆盖已存在的文件才需要确认（新建文件不需要）
+        workspace = _get_workspace()
+        target = _safe_join(workspace, args.get("path", ""))
+        return target is not None and target.exists()
+    if name == "run_shell":
+        command = (args.get("command") or "").strip()
+        return bool(command) and not _is_readonly_shell(command)
+    return False
+
+
+def _confirm_question(name: str, args: dict) -> str:
+    """生成人类可读的确认问题。"""
+    if name == "create_file":
+        return f"要覆盖已存在的文件 `{args.get('path')}` 吗？"
+    if name == "run_shell":
+        return f"要执行系统命令 `{(args.get('command') or '')[:80]}` 吗？"
+    return "确认执行该操作吗？"
+
+
+def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT) -> str | None:
+    """等待用户对确认请求的响应；超时返回 None（视为拒绝）。"""
+    ev = threading.Event()
+    with _confirm_lock:
+        _confirm_table[request_id] = {"event": ev, "choice": None}
+    ev.wait(timeout)
+    with _confirm_lock:
+        entry = _confirm_table.pop(request_id, None)
+        return entry["choice"] if entry else None
+
+
+class AskResponse(BaseModel):
+    request_id: str = Field(..., description="确认请求 ID")
+    choice: str = Field(..., description="用户选择：yes / no 或选项文本")
+
+
+@app.post("/api/v1/agent/respond", summary="响应 Agent 的确认请求")
+async def agent_respond(req: AskResponse) -> dict:
+    with _confirm_lock:
+        entry = _confirm_table.get(req.request_id)
+        if entry is None:
+            raise HTTPException(404, "确认请求不存在或已超时（默认按拒绝处理）")
+        entry["choice"] = req.choice
+        entry["event"].set()
+    log.info("confirm %s -> %s", req.request_id, req.choice)
+    return {"ok": True, "choice": req.choice}
 
 
 def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
@@ -835,10 +914,29 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 q.put(("error", "已由用户中止"))
                 return
             fn = tc["function"]
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
             q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
                                  "arguments": fn["arguments"],
                                  "step": step, "max_steps": MAX_TOOL_STEPS}))
-            ok, result = _execute_tool(fn["name"], fn["arguments"])
+            # ---- 敏感操作确认：发 ask 事件，等待用户响应（超时默认拒绝）----
+            if _needs_confirm(fn["name"], args):
+                ask_id = f"ask-{next(_confirm_counter)}"
+                q.put(("ask", {"id": ask_id, "name": fn["name"],
+                               "arguments": fn["arguments"],
+                               "question": _confirm_question(fn["name"], args),
+                               "options": ["yes", "no"]}))
+                choice = _wait_confirm(ask_id)
+                if choice != "yes":
+                    log.info("tool %s rejected by user (%s)", fn["name"], choice)
+                    result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+                    ok = False
+                else:
+                    ok, result = _execute_tool(fn["name"], fn["arguments"])
+            else:
+                ok, result = _execute_tool(fn["name"], fn["arguments"])
             # 工具结果截断：避免大结果（read_file 等）撑爆上下文
             if len(result) > MAX_TOOL_RESULT_CHARS:
                 result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
@@ -877,6 +975,8 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
                 yield f"event: tool_call\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             elif kind == "tool_result":
                 yield f"event: tool_result\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            elif kind == "ask":
+                yield f"event: ask\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             elif kind == "delta":
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': data}}]}, ensure_ascii=False)}\n\n"
     except asyncio.CancelledError:
