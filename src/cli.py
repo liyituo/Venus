@@ -176,6 +176,31 @@ class AgentClient:
         except Exception as e:
             return {"ok": False, "detail": str(e)}
 
+    def get_confirm_mode(self):
+        req = urllib.request.Request(self.base + "/api/v1/confirm-mode", headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "detail": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}
+
+    def set_confirm_mode(self, mode: str):
+        body = json.dumps({"mode": mode}).encode("utf-8")
+        req = urllib.request.Request(self.base + "/api/v1/confirm-mode", data=body,
+                                     headers=self._headers(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return {"ok": False, "detail": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}
+
     def update_config(self, fields: dict):
         """更新 API 配置（api_url/api_key/model/context_window），实时生效。"""
         body = json.dumps(fields).encode("utf-8")
@@ -422,6 +447,8 @@ class Cli:
             self.handle_apiconfig(parts[1:])
         elif cmd == "/model":
             self.handle_model(parts[1:])
+        elif cmd == "/confirm-mode":
+            self.handle_confirm_mode(parts[1:])
         elif cmd == "/config":
             self.handle_config(parts[1:])
         else:
@@ -530,6 +557,25 @@ class Cli:
         else:
             print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
 
+    def handle_confirm_mode(self, args: List[str]) -> None:
+        """问询模式：/confirm-mode [auto|strict|trusted|query]"""
+        if not args:
+            r = self.client.get_confirm_mode()
+            if not r.get("ok"):
+                print(color(f"✗ 获取模式失败：{r.get('detail', '?')}", "red"))
+                return
+            print(color(f"当前问询模式: {r.get('mode')}", "bold"))
+            for m, desc in (r.get("descriptions") or {}).items():
+                mark = "→" if m == r.get("mode") else " "
+                print(color(f"  {mark} {m:<8} {desc}", "dim" if m != r.get("mode") else "reset"))
+            print(color("  切换: /confirm-mode auto|strict|trusted|query", "dim"))
+            return
+        r = self.client.set_confirm_mode(args[0])
+        if r.get("ok"):
+            print(color(f"✓ 问询模式已切换为 {r.get('mode')}：{r.get('description', '')}", "green"))
+        else:
+            print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
+
     def handle_config(self, args: List[str]) -> None:
         cfg = load_config()
         for a in args:
@@ -557,6 +603,7 @@ class Cli:
         print(color("== API 与模型 ==", "cyan"))
         print(color("  /apiconfig        查看/设置 API（url=/key=/model=）", "reset"))
         print(color("  /model            查看/切换模型（/model 模型名）", "reset"))
+        print(color("  /confirm-mode     问询模式（auto/strict/trusted/query）", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))

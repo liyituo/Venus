@@ -67,6 +67,42 @@ READONLY_SHELL = re.compile(
 # 确认请求需要发 ask 事件的敏感工具
 CONFIRM_TOOLS = {"create_file", "run_shell"}
 
+# ---- 问询模式（四种）----
+CONFIRM_MODES = ("auto", "strict", "trusted", "query")
+CONFIRM_MODE_DESC = {
+    "auto":    "智能：敏感写操作确认，只读命令免确认（默认）",
+    "strict":  "严格：所有修改/执行类操作都需确认",
+    "trusted": "信任：全部自动执行（危险命令黑名单仍拦截）",
+    "query":   "只读：仅允许查询操作，一切修改直接拒绝",
+}
+QUERY_TOOLS = {"list_folder", "read_file", "get_screen_size"}  # 查询类工具（任何模式都放行）
+
+
+def _current_confirm_mode() -> str:
+    return str(load_config().get("confirm_mode", "auto"))
+
+
+def _confirm_policy(name: str, args: dict) -> str:
+    """按当前问询模式决定工具处理方式。
+    返回：allow（直接执行）/ ask（需用户确认）/ deny（直接拒绝）
+    """
+    mode = _current_confirm_mode()
+    if mode == "trusted":
+        return "allow"
+    is_query = name in QUERY_TOOLS or (
+        name == "run_shell" and _is_readonly_shell((args.get("command") or "").strip()))
+    if mode == "query":
+        return "allow" if is_query else "deny"
+    if mode == "strict":
+        return "allow" if is_query else "ask"
+    # auto
+    return "ask" if _needs_confirm(name, args) else "allow"
+
+
+class ConfirmModeRequest(BaseModel):
+    mode: str = Field(..., description="auto / strict / trusted / query")
+
+
 # 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件/系统类工具。
 # WSL 隔离测试环境使用，代码层面保证 agent 无法操作任何屏幕。
 _SCREEN_TOOLS = {"get_screen_size", "click", "type_text", "press_key"}
@@ -167,6 +203,7 @@ def load_config() -> dict:
         "api_key": "",
         "model": "deepseek-v4-flash",
         "context_window": 65536,   # 模型上下文窗口（token），用于容量显示与压缩阈值
+        "confirm_mode": "auto",    # 问询模式：auto/strict/trusted/query
     }
     if CONFIG_PATH.exists():
         try:
@@ -228,6 +265,27 @@ class LlmError(Exception):
 
 
 app = FastAPI(title="LLM Backend", version="0.3.0")
+
+
+@app.get("/api/v1/confirm-mode", summary="查看当前问询模式")
+async def get_confirm_mode() -> dict:
+    return {"ok": True, "mode": _current_confirm_mode(),
+            "modes": list(CONFIRM_MODES), "descriptions": CONFIRM_MODE_DESC}
+
+
+@app.post("/api/v1/confirm-mode", summary="切换问询模式（实时生效，持久化保存）")
+async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
+    if req.mode not in CONFIRM_MODES:
+        raise HTTPException(422, f"无效模式，可选：{' / '.join(CONFIRM_MODES)}")
+    cfg = load_config()
+    cfg["confirm_mode"] = req.mode
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(500, f"配置写入失败：{exc}") from exc
+    log.info("confirm mode -> %s", req.mode)
+    return {"ok": True, "mode": req.mode, "description": CONFIRM_MODE_DESC[req.mode]}
+
 
 # 可选 token 鉴权：--token 启动时启用，所有请求须带 X-Api-Token 头
 AUTH_TOKEN = ""
@@ -921,8 +979,13 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
                                  "arguments": fn["arguments"],
                                  "step": step, "max_steps": MAX_TOOL_STEPS}))
-            # ---- 敏感操作确认：发 ask 事件，等待用户响应（超时默认拒绝）----
-            if _needs_confirm(fn["name"], args):
+            # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
+            policy = _confirm_policy(fn["name"], args)
+            if policy == "deny":
+                ok = False
+                result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
+                          f"如需执行请先切换到其他问询模式")
+            elif policy == "ask":
                 ask_id = f"ask-{next(_confirm_counter)}"
                 q.put(("ask", {"id": ask_id, "name": fn["name"],
                                "arguments": fn["arguments"],
