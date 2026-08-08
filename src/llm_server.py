@@ -104,8 +104,8 @@ def _current_confirm_mode() -> str:
 
 
 # 只读 MCP server 前缀：其全部工具视为查询操作（auto 免确认 / plan 免规划）
-# 当前仅 tavily（网络搜索/提取，无本地副作用）；后续接入只读服务照此追加
-MCP_READONLY_PREFIXES = ("mcp_tavily_",)
+# 当前：tavily（网络搜索/提取）、amap（地图查询，脚本 scripts/mcp_servers/amap_server.py）
+MCP_READONLY_PREFIXES = ("mcp_tavily_", "mcp_amap_")
 
 # 混合型 server（如 spotify：搜索只读、播放写）按工具名精确标记只读
 MCP_READONLY_TOOLS = {

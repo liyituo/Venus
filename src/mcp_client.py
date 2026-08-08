@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 
 log = logging.getLogger("mcp-client")
 
@@ -199,10 +200,9 @@ class McpManager:
             return
         for conn in self.conns.values():
             if conn.stop_event is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        conn.stop_event.set(), self._loop).result(timeout=5)
-                except Exception:
-                    pass
+                # Event.set 是同步方法：跨线程投递必须用 call_soon_threadsafe
+                # （run_coroutine_threadsafe 需要协程，直接传会 TypeError 被吞、事件永不置位）
+                self._loop.call_soon_threadsafe(conn.stop_event.set)
+        time.sleep(1)   # 给重连等待/服务协程退出窗口
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop = None

@@ -119,6 +119,28 @@ check("spotify 播放保持确认",
 check("spotify 建歌单保持确认",
       L._confirm_policy("mcp_spotify_create_playlist", {}) == "ask", "")
 
+# 3.7 高德地图 MCP（amap_server.py，整 server 只读）
+check("amap 前缀识别为只读",
+      L._is_readonly_mcp("mcp_amap_poi_search") and
+      L._confirm_policy("mcp_amap_direction", {}) == "allow", "")
+
+# ============ 5. 高德 MCP server 连接 ============
+print("== 5. 高德 MCP server ==")
+_AMAP = str(Path(__file__).resolve().parent.parent / "scripts" / "mcp_servers" / "amap_server.py")
+# 空 key：只测连接与工具注册；「未配置」分支不依赖网络/真实 key
+mgr3 = McpManager({"amap": {"command": _PY, "args": [_AMAP],
+                            "env": {"AMAP_MAPS_API_KEY": ""}}})
+mgr3.start()
+conn3 = mgr3.conns["amap"]
+check("amap server 连接", conn3.session is not None, conn3.error[:80])
+names3 = [t["name"] for t in conn3.tools]
+check("工具注册", "poi_search" in names3 and "direction" in names3
+      and "regeocode" in names3, str(names3))
+# 无 key 调用返回明确提示（不依赖网络/真实 key；server 正常返回提示文本）
+ok3, res3 = mgr3.call("mcp_amap_poi_search", json.dumps({"keyword": "加油站"}))
+check("无 key 调用有明确提示", ok3 and "AMAP_MAPS_API_KEY" in res3, res3[:80])
+mgr3.stop()
+
 # ============ 4. 断连重连（指数退避循环存活） ============
 print("== 4. 断连重连 ==")
 _BAD = str(Path(__file__).resolve().parent / "mcp_bad_server.py")
