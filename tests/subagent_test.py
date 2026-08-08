@@ -51,6 +51,11 @@ def collect_events(client, body):
     def consume():
         try:
             with client.stream("POST", "/api/v1/chat/stream", json=body) as r:
+                if r.status_code != 200:
+                    # 422 等校验错误：打印响应体 detail（定位 CI 失败的关键）
+                    out.append(("HTTP_ERROR",
+                                f"{r.status_code}: {r.read().decode('utf-8', 'replace')[:800]}"))
+                    return
                 ev = ""
                 for line in r.iter_lines():
                     if not line:
