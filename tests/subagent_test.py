@@ -75,19 +75,24 @@ def collect_events(client, body):
 
     t = threading.Thread(target=consume, daemon=True)
     t.start()
-    t.join(timeout=40)
+    t.join(timeout=90)
+    if t.is_alive():
+        out.append(("TIMEOUT", f"collect_events 90s 超时（已收集 {len(out)} 条事件）"))
     return out
 
 
 def auto_respond():
-    """后台线程：自动应答所有确认请求（yes）。"""
+    """后台线程：自动应答所有确认请求（yes）；30 秒无新请求后自动退出。"""
     def loop():
-        while True:
+        idle = 0
+        while idle < 1500:   # 30 秒无确认请求则退出，避免 CI 上线程残留
             with L._confirm_lock:
                 ids = [k for k, v in L._confirm_table.items() if v["choice"] is None]
             if not ids:
                 time.sleep(0.02)
+                idle += 1
                 continue
+            idle = 0
             with L._confirm_lock:
                 for rid in ids:
                     entry = L._confirm_table.get(rid)
