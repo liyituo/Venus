@@ -91,6 +91,30 @@ description: 每日简报：搜科技新闻 + 查系统状态，汇总成简报
 
 启动时只把**技能清单**（名称 + 一句话）注入系统提示，模型判断任务匹配时用 `load_skill` 加载全文——惰性注入，技能再多也不撑上下文。技能要求的操作**不绕过确认模式**。
 
+## 子 Agent 与视觉操作
+
+`agents/<名称>.json` 定义专业子代理（system_prompt + 工具白名单 + 可选 model 覆盖），`delegate` 工具自动委派任务——子 agent 在**独立上下文 + 工具白名单**里执行，事件实时透传前端，结果摘要返回主循环：
+
+```json
+{
+  "name": "vision",
+  "description": "视觉分析专家：查看图片/截图并描述内容",
+  "system_prompt": "你是视觉分析专家。用 view_image 查看图片。",
+  "tools": ["view_image", "read_file", "list_folder"]
+}
+```
+
+- 安全护栏：子 agent **不能再委派**（深度 ≤ 2 层）、轮数上限 6、写操作仍走确认、plan 模式仅主循环生效
+- `/agents`（cli/Telegram）查看列表；任务适合子 agent 时模型自动 `delegate`，也可显式说「委派给 vision」
+
+**视觉操作（view_image）**：把图片（工作区路径，如 Telegram 上传的截图）发给配置的视觉模型分析。DeepSeek 无视觉能力，需在 `chat_config.json` 配一个 OpenAI 兼容视觉模型，如通义千问 qwen-vl：
+
+```json
+"vision_api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+"vision_api_key": "sk-你的Key",
+"vision_model": "qwen-vl-max"
+```
+
 ## 安全
 
 ### 确认模式（5 种，`/confirm-mode` 切换，默认 auto）
@@ -175,8 +199,8 @@ src/                源代码（app / llm_server / 五个前端 / mock_llm 测�
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
-tests/              八套测试（共 215 断言）
-.github/workflows/  CI（push 自动跑八套测试）
+tests/              九套测试（共 232 断言）
+.github/workflows/  CI（push 自动跑九套测试）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
