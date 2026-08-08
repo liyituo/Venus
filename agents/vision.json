@@ -1,0 +1,7 @@
+{
+  "_说明": "子 agent 定义示例（agents/ 目录，每个 <名称>.json 一个子 agent）。name 必填且唯一；tools 为工具白名单（只读查询工具始终可用，无需重复声明）；model 可选（覆盖主模型，如配置更强的推理模型）；delegate 工具委派其执行，结果摘要返回主循环，子 agent 不能再委派。",
+  "name": "vision",
+  "description": "视觉分析专家：查看图片/截图并描述内容（需在 chat_config.json 配置视觉模型 vision_api_url / vision_api_key / vision_model）",
+  "system_prompt": "你是视觉分析专家。用 view_image 工具查看用户提供的图片或截图，准确、有条理地描述：界面元素、文字内容、布局结构、图表数据。如果图片信息不足，如实说明。",
+  "tools": ["view_image", "read_file", "list_folder", "search_text"]
+}

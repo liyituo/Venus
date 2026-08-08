@@ -95,7 +95,7 @@ QUERY_TOOLS = {  # 查询类工具（任何模式都放行）
     "search_text", "glob_files", "list_symbols",
     "git_status", "git_diff", "git_log",
     "process_output", "list_processes", "list_todos", "repo_map",
-    "load_skill", "system_status",
+    "load_skill", "system_status", "view_image",
 }
 
 
@@ -146,7 +146,7 @@ _FILE_TOOLS = {
     "git_status", "git_diff", "git_log", "git_commit",
     "start_process", "process_output", "stop_process", "list_processes",
     "create_todo", "update_todo", "list_todos", "repo_map",
-    "load_skill", "system_status",
+    "load_skill", "system_status", "view_image", "delegate",
 }
 ISOLATED = False
 
@@ -311,6 +311,9 @@ def load_config() -> dict:
         "context_window": 65536,   # 模型上下文窗口（token），用于容量显示与压缩阈值
         "confirm_mode": "auto",    # 问询模式：auto/strict/trusted/query
         "reasoning_mode": "max",   # 推理强度：max/high/off（DeepSeek v4 系列）
+        "vision_api_url": "",      # 视觉模型（view_image 用）：OpenAI 兼容地址，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+        "vision_api_key": "",
+        "vision_model": "",
     }
     if CONFIG_PATH.exists():
         try:
@@ -580,6 +583,12 @@ async def stats() -> dict:
         "cache_hit_rate_pct": round(rate * 100, 1),
         "note": "cached_tokens 来自上游 prompt_tokens_details（DeepSeek 上下文硬盘缓存）",
     }
+
+
+@app.get("/api/v1/agents", summary="可用子 agent 列表（供前端 /agents 展示）")
+async def list_agents() -> dict:
+    return {"ok": True, "agents": [
+        {k: v for k, v in a.items() if k != "system_prompt"} for a in _scan_agents()]}
 
 
 @app.get("/api/v1/health", summary="LLM 后端健康检查")
@@ -951,6 +960,27 @@ AGENT_TOOLS = [
         "description": "查询系统资源状态（只读）：磁盘使用率、内存、CPU 负载、运行时间。",
         "parameters": {"type": "object", "properties": {}, "required": []},
     }},
+    {"type": "function", "function": {
+        "name": "delegate",
+        "description": "把子任务委派给专业子 agent（独立上下文 + 工具白名单执行，结果摘要返回）。"
+                       "适合视觉分析、专项审查等需要独立上下文的子任务；子 agent 清单见系统提示。"
+                       "子 agent 不能再委派。",
+        "parameters": {"type": "object", "properties": {
+            "agent": {"type": "string", "description": "子 agent 名称（系统提示中的可用子 agent 列表）"},
+            "task": {"type": "string", "description": "要委派的任务描述（尽量具体）"},
+            "max_steps": {"type": "integer", "default": 6, "description": "子 agent 工具轮数上限（默认 6）"},
+        }, "required": ["agent", "task"]},
+    }},
+    {"type": "function", "function": {
+        "name": "view_image",
+        "description": "视觉分析：把图片（工作区内路径）发给配置的视觉模型，返回内容描述。"
+                       "适合分析截图、界面、图表、照片。需要 chat_config.json 配置视觉模型"
+                       "（vision_api_url/vision_api_key/vision_model）。",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "图片路径（相对工作区）"},
+            "question": {"type": "string", "description": "可选：针对图片的具体问题（默认描述内容）"},
+        }, "required": ["path"]},
+    }},
 ]
 
 # ---- Skill 包（用户导入的技能包：skills/<名称>/SKILL.md）----
@@ -1045,6 +1075,44 @@ def _system_status_text() -> str:
     except OSError:
         pass
     return "\n".join(parts) or "无法获取系统状态"
+
+
+# ---- 子 Agent（agents/<名称>.json：专业子代理，delegate 委派执行）----
+AGENTS_DIR = BASE_DIR.parent / "agents"
+MAX_AGENT_DEPTH = 2          # 委派深度上限：主 agent(0) → 子 agent(1)，子 agent 不能再委派
+SUBAGENT_MAX_STEPS = 6       # 子 agent 单次任务的工具轮数上限（更保守）
+SUBAGENT_REPLY_CHARS = 2000  # 子 agent 最终回复回传主循环的长度上限
+MAX_IMAGE_BYTES = 10_000_000 # view_image 图片大小上限（10MB）
+VISION_SYSTEM_NOTE = "（视觉分析：view_image 需在配置中提供 vision_api_url/vision_api_key/vision_model）"
+
+
+def _scan_agents() -> list[dict]:
+    """扫描 agents/ 下的子 agent 定义（每个 <名称>.json）。"""
+    out = []
+    if not AGENTS_DIR.is_dir():
+        return out
+    for f in sorted(AGENTS_DIR.glob("*.json")):
+        try:
+            spec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(spec, dict) or not spec.get("name"):
+            continue
+        out.append(spec)
+    return out
+
+
+def _agent_catalog_text() -> str:
+    """可用子 agent 清单（注入 system，模型按需 delegate 委派）。"""
+    agents = _scan_agents()
+    if not agents:
+        return ""
+    lines = ["可用子 agent（任务专业性强/需要专注上下文时用 delegate 委派，子 agent 独立上下文执行，"
+             "结果摘要返回；子 agent 不能再委派）："]
+    for a in agents:
+        lines.append(f"- {a['name']}：{a.get('description') or '无描述'}"
+                     f"{'（模型 ' + a['model'] + '）' if a.get('model') else ''}")
+    return "\n".join(lines)
 
 
 AGENT_SYSTEM_SUFFIX = (
@@ -1680,6 +1748,93 @@ def _needs_confirm(name: str, args: dict) -> bool:
     return False
 
 
+def _exec_view_image(args: dict) -> tuple[bool, str]:
+    """把工作区图片发给配置的视觉模型，返回内容描述（无本地副作用）。"""
+    path = (args.get("path") or "").strip()
+    question = ((args.get("question") or "").strip()
+                or "描述这张图片的内容，重点说明可见的文字、界面元素、布局。")
+    if not path:
+        return False, "view_image 需要 path 参数"
+    workspace = _get_workspace()
+    target = _safe_join(workspace, path)
+    if target is None or not target.is_file():
+        return False, f"图片不存在：{path}"
+    size = target.stat().st_size
+    if size > MAX_IMAGE_BYTES:
+        return False, f"图片过大（{size // 2**20}MB > 10MB 上限）"
+    cfg = load_config()
+    vurl = normalize_url(cfg.get("vision_api_url") or "")
+    vkey = (cfg.get("vision_api_key") or "").strip()
+    vmodel = (cfg.get("vision_model") or "").strip()
+    if not (vurl and vkey and vmodel):
+        return False, ("未配置视觉模型：请在 chat_config.json 设置 "
+                       "vision_api_url / vision_api_key / vision_model")
+    import base64
+    try:
+        b64 = base64.b64encode(target.read_bytes()).decode()
+    except OSError as exc:
+        return False, f"读取图片失败：{exc}"
+    payload = {
+        "model": vmodel,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]}],
+        "max_tokens": 800,
+    }
+    # 视觉模型不走推理参数（thinking/reasoning_effort 不适用于视觉接口）
+    try:
+        data = _call_upstream_raw(vurl, payload, {
+            "Content-Type": "application/json", "Authorization": f"Bearer {vkey}"})
+    except LlmError as exc:
+        return False, f"视觉模型调用失败：{exc.message}"
+    content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+    if not content:
+        return False, "视觉模型返回空内容"
+    return True, content
+
+
+def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
+                   model: str | None, temperature: float,
+                   q: queue.Queue | None, cancel: threading.Event | None,
+                   depth: int) -> tuple[bool, str]:
+    """委派子任务给子 agent：独立上下文 + 工具白名单循环执行，结果摘要返回。"""
+    agent_name = (args.get("agent") or "").strip()
+    task = (args.get("task") or "").strip()
+    agents = _scan_agents()
+    spec = next((a for a in agents if a["name"] == agent_name), None)
+    if spec is None:
+        avail = "、".join(a["name"] for a in agents) or "无"
+        return False, f"子 agent 不存在：{agent_name}。可用：{avail}"
+    if not task:
+        return False, "delegate 需要 task 参数（要委派的任务描述）"
+    if depth + 1 >= MAX_AGENT_DEPTH:
+        return False, f"委派深度已达上限（{MAX_AGENT_DEPTH} 层），子 agent 不能再委派"
+    if api_url is None or q is None:
+        return False, "delegate 仅在 agent 循环内可用"
+    if cancel is not None and cancel.is_set():
+        return False, "任务已由用户中止"
+    # 工具白名单：声明的工具 + 只读工具兜底；不存在/未知的忽略（_agent_loop 过滤）
+    known = {t["function"]["name"] for t in _agent_tools()}
+    allowed = {t for t in (set(spec.get("tools") or []) | QUERY_TOOLS) if t in known}
+    if not allowed:
+        return False, f"子 agent {agent_name} 没有可用的工具（tools 白名单为空或全部无效）"
+    sub_msgs = [{"role": "system",
+                 "content": (spec.get("system_prompt") or "").strip() + AGENT_SYSTEM_SUFFIX
+                 + _skill_catalog_text()}]
+    sub_msgs.append({"role": "user", "content": task})
+    sub_model = spec.get("model") or model
+    log.info("delegate -> %s（depth %d，%d 工具）：%s",
+             agent_name, depth + 1, len(allowed), task[:80])
+    reply = _agent_loop(api_url, headers, sub_msgs, sub_model, temperature,
+                        q, cancel, depth=depth + 1,
+                        max_steps=_safe_int(args.get("max_steps"), SUBAGENT_MAX_STEPS, 1, 10),
+                        tools_filter=allowed)
+    summary = (reply or "（子 agent 无回复）").strip()[:SUBAGENT_REPLY_CHARS]
+    return True, f"子 agent {agent_name} 执行完毕，最终回复：\n{summary}"
+
+
 def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
     """生成 (确认问题, diff 文本)。diff 为空时前端不展示 diff 区域。"""
     if name == "create_file":
@@ -1854,7 +2009,16 @@ async def session_clear(sid: int) -> dict:
     return {"ok": True, "cleared": sid}
 
 
-def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
+def _execute_tool(name: str, arguments: str,
+                  api_url: str | None = None, headers: dict | None = None,
+                  model: str | None = None, temperature: float = 0.7,
+                  q: queue.Queue | None = None, cancel: threading.Event | None = None,
+                  depth: int = 0) -> tuple[bool, str]:
+    """执行工具，返回 (ok, 结果文本)。在工作线程中调用。
+
+    delegate 需要上游上下文（api_url/headers/model/q/cancel/depth），
+    由 agent 循环传入；纯函数测试/其他调用可省略。
+    """
     """执行工具，返回 (ok, 结果文本)。在工作线程中调用。"""
     if ISOLATED and name in _SCREEN_TOOLS:
         return False, "隔离模式：屏幕操作工具已禁用（llm_server 以 --isolated 运行）"
@@ -2331,6 +2495,10 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             return True, text
         if name == "system_status":
             return True, _system_status_text()
+        if name == "view_image":
+            return _exec_view_image(args)
+        if name == "delegate":
+            return _exec_delegate(args, api_url, headers, model, temperature, q, cancel, depth)
         if name.startswith("mcp_"):
             # MCP 外部工具转发（mcp_<server>_<tool>）
             mcp = _ensure_mcp()
@@ -2349,42 +2517,57 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
 
 def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 model: str, temperature: float, q: queue.Queue,
-                cancel: threading.Event) -> None:
+                cancel: threading.Event, depth: int = 0,
+                max_steps: int | None = None,
+                tools_filter: set[str] | None = None) -> str:
     """后台线程：工具调用循环，事件经 queue 发送给 SSE 生成器。
 
     安全锁：轮数上限 / 总调用数上限 / 连续失败熔断 / 总时长上限 / 取消事件。
     事件: ("tool_call", {...}) / ("tool_result", {...}) /
           ("delta", text) / ("done", None) / ("error", msg)
+    返回最终回复文本（主循环忽略；delegate 用它取子 agent 结果）。
+    depth > 0 时（子 agent 循环）：工具轮数用 max_steps、tools 用白名单、
+    不套用计划审批模式（授权已在主层完成）。
     """
     start = time.monotonic()
     tool_calls_total = 0
     consecutive_failures = 0
+    step_limit = max_steps or MAX_TOOL_STEPS
     # ---- 计划审批模式状态（plan）：任务先列计划，统一批准后按计划执行 ----
-    plan_mode = _current_confirm_mode() == "plan"
+    # 仅主循环（depth=0）生效；子 agent 的授权由主层批准委托
+    plan_mode = _current_confirm_mode() == "plan" and depth == 0
     plan_submitted = not plan_mode
     approved_tools: set[str] = set()
     PLAN_CONFIRM_TIMEOUT = 300   # 计划审批等待更宽松（看表格+思考需要时间）
 
-    for step in range(1, MAX_TOOL_STEPS + 1):
+    for step in range(1, step_limit + 1):
         # 安全锁检查
         if cancel.is_set():
-            q.put(("error", "已由用户中止"))
-            return
+            if depth == 0:
+                q.put(("error", "已由用户中止"))
+            return "已由用户中止"
         if time.monotonic() - start > MAX_AGENT_SECONDS:
-            q.put(("error", f"任务超过总时长上限 {MAX_AGENT_SECONDS}s，已自动中止"))
-            return
+            if depth == 0:
+                q.put(("error", f"任务超过总时长上限 {MAX_AGENT_SECONDS}s，已自动中止"))
+            return f"任务超过总时长上限 {MAX_AGENT_SECONDS}s，已自动中止"
         if tool_calls_total >= MAX_TOOL_CALLS_TOTAL:
-            q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
-            return
+            if depth == 0:
+                q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
+            return f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"
 
         payload = {"model": model, "messages": messages, "temperature": temperature,
                    "tools": _agent_tools()}
+        if tools_filter is not None:
+            # 子 agent：工具白名单（只保留声明的工具）
+            payload["tools"] = [t for t in payload["tools"]
+                                if t["function"]["name"] in tools_filter]
         _apply_reasoning(payload)
         try:
             data = _call_upstream_raw(api_url, payload, headers)
         except LlmError as exc:
-            q.put(("error", exc.message))
-            return
+            if depth == 0:
+                q.put(("error", exc.message))
+            return f"上游错误：{exc.message}"
         msg = data["choices"][0]["message"]
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
@@ -2392,14 +2575,16 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             content = msg.get("content") or ""
             for i in range(0, len(content), 4):
                 q.put(("delta", content[i:i + 4]))
-            q.put(("done", None))
+            if depth == 0:
+                q.put(("done", None))
             log.info("agent done after %d step(s)", step)
-            return
+            return content or "（模型未返回内容）"
 
         # 模型要求调用工具
         if cancel.is_set():
-            q.put(("error", "已由用户中止"))
-            return
+            if depth == 0:
+                q.put(("error", "已由用户中止"))
+            return "已由用户中止"
         tool_calls_total += len(tool_calls)
         log.info("agent step %d: %d tool call(s) (total %d)", step,
                  len(tool_calls), tool_calls_total)
@@ -2407,8 +2592,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                          "tool_calls": tool_calls})
         for tc in tool_calls:
             if cancel.is_set():
-                q.put(("error", "已由用户中止"))
-                return
+                if depth == 0:
+                    q.put(("error", "已由用户中止"))
+                return "已由用户中止"
             fn = tc["function"]
             try:
                 args = json.loads(fn.get("arguments") or "{}")
@@ -2448,7 +2634,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                       (fn["name"] == "run_shell" and
                        _is_readonly_shell((args.get("command") or "").strip()))):
                     # 只读操作（查询类工具/只读 shell/只读 MCP）天然无害：免规划直接执行
-                    ok, result = _execute_tool(fn["name"], fn["arguments"])
+                    ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
                 else:
                     result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
                               "（列出步骤与所需工具，用户批准后才可执行）")
@@ -2460,7 +2646,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 ok = False
             elif plan_mode and fn["name"] in approved_tools:
                 # 计划内声明的工具：免确认直接执行
-                ok, result = _execute_tool(fn["name"], fn["arguments"])
+                ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
             else:
                 # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
                 policy = _confirm_policy(fn["name"], args)
@@ -2481,9 +2667,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
                         ok = False
                     else:
-                        ok, result = _execute_tool(fn["name"], fn["arguments"])
+                        ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
                 else:
-                    ok, result = _execute_tool(fn["name"], fn["arguments"])
+                    ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
             # 工具结果截断：避免大结果（read_file 等）撑爆上下文
             if len(result) > MAX_TOOL_RESULT_CHARS:
                 result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
@@ -2497,8 +2683,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 q.put(("error", f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，"
                                 f"熔断器已触发，任务自动中止"))
-                return
-    q.put(("error", f"工具调用超过 {MAX_TOOL_STEPS} 轮上限，已自动中止"))
+                return f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，熔断器已触发"
+    q.put(("error", f"工具调用超过 {step_limit} 轮上限，已自动中止"))
+    return f"工具调用超过 {step_limit} 轮上限，已自动中止"
 
 
 async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict],
@@ -2564,6 +2751,8 @@ async def chat_stream(req: ChatRequest):
                     m["content"] += todo_note
                 # 注入可用技能包清单（只注入清单，全文按需 load_skill）
                 m["content"] += _skill_catalog_text()
+                # 注入可用子 agent 清单（delegate 委派）
+                m["content"] += _agent_catalog_text()
                 # 计划审批模式：提示先规划
                 if _current_confirm_mode() == "plan":
                     m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
@@ -2573,7 +2762,7 @@ async def chat_stream(req: ChatRequest):
         else:
             messages.insert(0, {"role": "system",
                                 "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
-                                + _skill_catalog_text()})
+                                + _skill_catalog_text() + _agent_catalog_text()})
         return StreamingResponse(
             _agent_stream_events(api_url, headers, messages, model, req.temperature),
             media_type="text/event-stream",

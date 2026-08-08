@@ -357,6 +357,8 @@ class Bot:
                 self.cmd_send(chat_id, text)
             elif text.startswith("/schedule"):
                 self.cmd_schedule(chat_id, text)
+            elif text == "/agents":
+                self.cmd_agents(chat_id)
             elif text.startswith("/"):
                 self.send_message(chat_id, f"未知命令：{text}（/help 查看）")
             else:
@@ -407,13 +409,29 @@ class Bot:
         except Exception as exc:
             self.send_message(chat_id, f"文件接收失败：{exc}")
 
+    def cmd_agents(self, chat_id: int) -> None:
+        """列出可用子 agent（delegate 委派执行，对话里直接说任务即可自动匹配）。"""
+        status, data = self.llm("GET", "/api/v1/agents")
+        if status != 200:
+            self.send_message(chat_id, f"获取子 agent 列表失败：{data.get('detail', '')}")
+            return
+        agents = data.get("agents") or []
+        if not agents:
+            self.send_message(chat_id, "暂无子 agent（在 agents/ 目录添加 <名称>.json 即启用）")
+            return
+        lines = ["可用子 agent（说任务时自动委派）："]
+        for a in agents:
+            extra = f"（模型 {a['model']}）" if a.get("model") else ""
+            lines.append(f"· {a['name']}{extra}：{a.get('description') or '无描述'}")
+        self.send_message(chat_id, "\n".join(lines))
+
     def cmd_help(self, chat_id: int) -> None:
         self.send_message(chat_id, (
             "PC Agent（Telegram 前端）\n"
             "直接发消息即可，Agent 自主调用工具。\n\n"
             "/new 新建会话\n/sessions 会话列表\n/switch N 切换会话\n"
             "/status 状态\n/stats Token 用量\n/send <路径> 发送工作区文件给你\n"
-            "/schedule 定时任务\n/help 帮助\n\n"
+            "/schedule 定时任务\n/agents 子 agent 列表\n/help 帮助\n\n"
             "敏感操作（改文件/提交 git/执行命令）会弹确认按钮。"))
 
     def cmd_send(self, chat_id: int, text: str) -> None:

@@ -324,6 +324,17 @@ class AgentClient:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             return {"ok": False, "detail": f"HTTP {e.code}"}
+
+    def get_agents(self):
+        """可用子 agent 列表。"""
+        req = urllib.request.Request(self.base + "/api/v1/agents", headers=self._headers())
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "detail": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}
         except Exception as e:
             return {"ok": False, "detail": str(e)}
 
@@ -701,6 +712,8 @@ class Cli:
             self.handle_confirm_mode(parts[1:])
         elif cmd == "/reasoning":
             self.handle_reasoning(parts[1:])
+        elif cmd == "/agents":
+            self.handle_agents()
         elif cmd == "/config":
             self.handle_config(parts[1:])
         else:
@@ -883,6 +896,22 @@ class Cli:
         else:
             print(color(f"✗ 切换失败：{r.get('detail', '?')}", "red"))
 
+    def handle_agents(self) -> None:
+        """列出可用子 agent（delegate 委派执行，对话里说任务即可自动匹配）。"""
+        r = self.client.get_agents()
+        if not r.get("ok"):
+            print(color(f"✗ 获取子 agent 列表失败：{r.get('detail', '?')}", "red"))
+            return
+        agents = r.get("agents") or []
+        if not agents:
+            print(color("暂无子 agent（在 agents/ 目录添加 <名称>.json 即启用）", "dim"))
+            return
+        print(color("=== 子 Agent（delegate 自动委派）===", "bold"))
+        for a in agents:
+            extra = f"（模型 {a['model']}）" if a.get("model") else ""
+            print(color(f"  {a['name']}{extra}", "bold"))
+            print(color(f"    {a.get('description') or '无描述'}", "dim"))
+
     def handle_config(self, args: List[str]) -> None:
         cfg = load_config()
         for a in args:
@@ -912,6 +941,7 @@ class Cli:
         print(color("  /model            查看/切换模型（/model 模型名）", "reset"))
         print(color("  /confirm-mode     问询模式：↑/↓ 方向键选择，回车确认", "reset"))
         print(color("  /reasoning        推理强度：↑/↓ 选择 最高(max)/高(high)/关闭(off)", "reset"))
+        print(color("  /agents           子 agent 列表（视觉分析等，自动委派）", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))
