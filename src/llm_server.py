@@ -102,6 +102,15 @@ def _current_confirm_mode() -> str:
     return str(load_config().get("confirm_mode", "auto"))
 
 
+# 只读 MCP server 前缀：其全部工具视为查询操作（auto 免确认 / plan 免规划）
+# 当前仅 tavily（网络搜索/提取，无本地副作用）；后续接入只读服务照此追加
+MCP_READONLY_PREFIXES = ("mcp_tavily_",)
+
+
+def _is_readonly_mcp(name: str) -> bool:
+    return any(name.startswith(p) for p in MCP_READONLY_PREFIXES)
+
+
 def _confirm_policy(name: str, args: dict) -> str:
     """按当前问询模式决定工具处理方式。
     返回：allow（直接执行）/ ask（需用户确认）/ deny（直接拒绝）
@@ -109,7 +118,7 @@ def _confirm_policy(name: str, args: dict) -> str:
     mode = _current_confirm_mode()
     if mode == "trusted":
         return "allow"
-    is_query = name in QUERY_TOOLS or (
+    is_query = name in QUERY_TOOLS or _is_readonly_mcp(name) or (
         name == "run_shell" and _is_readonly_shell((args.get("command") or "").strip()))
     if mode == "query":
         return "allow" if is_query else "deny"
@@ -117,6 +126,8 @@ def _confirm_policy(name: str, args: dict) -> str:
         return "allow" if is_query else "ask"
     # auto
     if name.startswith("mcp_"):
+        if _is_readonly_mcp(name):
+            return "allow"    # 只读 MCP（如 tavily 搜索）：免确认
         return "ask"    # MCP 外部工具保守处理：一律确认（trusted 模式已放行）
     return "ask" if _needs_confirm(name, args) else "allow"
 
@@ -2295,10 +2306,10 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         else:
                             result = "计划被用户拒绝，请停止执行并询问用户如何调整"
                             ok = False
-                elif (fn["name"] in QUERY_TOOLS or
+                elif (fn["name"] in QUERY_TOOLS or _is_readonly_mcp(fn["name"]) or
                       (fn["name"] == "run_shell" and
                        _is_readonly_shell((args.get("command") or "").strip()))):
-                    # 只读操作（查询类工具/只读 shell）天然无害：免规划直接执行
+                    # 只读操作（查询类工具/只读 shell/只读 MCP）天然无害：免规划直接执行
                     ok, result = _execute_tool(fn["name"], fn["arguments"])
                 else:
                     result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"

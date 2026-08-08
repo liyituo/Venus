@@ -86,6 +86,21 @@ policy = L._confirm_policy("mcp_echo_add", {})
 L._current_confirm_mode = _orig_mode
 check("trusted 模式放行", policy == "allow", policy)
 
+# 3.5 只读 MCP 白名单（tavily 搜索免确认/免规划，其余 MCP 保持保守确认）
+check("tavily 前缀识别为只读",
+      L._is_readonly_mcp("mcp_tavily_tavily-search") and
+      not L._is_readonly_mcp("mcp_github_create_issue"), "")
+policy = L._confirm_policy("mcp_tavily_tavily-search", {})
+check("auto 模式 tavily 免确认", policy == "allow", policy)
+policy = L._confirm_policy("mcp_github_create_issue", {})
+check("auto 模式其他 MCP 仍确认", policy == "ask", policy)
+L._current_confirm_mode = lambda: "query"
+policy = L._confirm_policy("mcp_tavily_tavily-search", {})
+check("query 模式 tavily 放行", policy == "allow", policy)
+policy = L._confirm_policy("mcp_github_create_issue", {})
+L._current_confirm_mode = _orig_mode
+check("query 模式其他 MCP 拒绝", policy == "deny", policy)
+
 mgr.stop()
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

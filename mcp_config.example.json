@@ -16,6 +16,14 @@
       "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"],
       "_说明": "浏览器控制（需本机已装 Chrome；Windows 桌面场景）。"
     },
+    "tavily": {
+      "command": "npx",
+      "args": ["-y", "tavily-mcp@latest"],
+      "env": {
+        "TAVILY_API_KEY": "tvly-你的Key"
+      },
+      "_说明": "网络搜索（免费 1000 次/月，tavily.com 注册）。只读 MCP server：搜索/提取类工具免确认、免规划。若 npx 不在 PATH（如 WSL），command 用 node 绝对路径直跑 build/index.js，并显式补 PATH/HOME（env 会替换子进程完整环境）。"
+    },
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-fs"],
