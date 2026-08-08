@@ -44,4 +44,11 @@ jobs:
         run: python tests/skill_system_test.py
 
       - name: 子 agent 测试（delegate 委派/事件透传/深度限制/白名单/view_image）
-        run: python tests/subagent_test.py
+        run: |
+          python -X faulthandler -u tests/subagent_test.py 2>&1 | tee /tmp/subagent_out.txt
+          EXIT=${PIPESTATUS[0]}
+          if [ $EXIT -ne 0 ]; then
+            echo "::error::subagent_test 失败，输出尾部："
+            tail -60 /tmp/subagent_out.txt
+            exit $EXIT
+          fi
