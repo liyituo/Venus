@@ -1844,6 +1844,16 @@ def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
     return True, f"子 agent {agent_name} 执行完毕，最终回复：\n{summary}"
 
 
+def _timed_execute(fn_name: str, arguments: str, *ctx) -> tuple[bool, str]:
+    """执行工具并记录耗时（>=1s 记日志：MCP/网络类工具挂起时可定位）。"""
+    t0 = time.monotonic()
+    ok, result = _execute_tool(fn_name, arguments, *ctx)
+    dt = time.monotonic() - t0
+    if dt >= 1.0:
+        log.info("tool %s 执行 %.1fs（ok=%s）", fn_name, dt, ok)
+    return ok, result
+
+
 def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
     """生成 (确认问题, diff 文本)。diff 为空时前端不展示 diff 区域。"""
     if name == "create_file":
@@ -2595,8 +2605,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 q.put(("error", "已由用户中止"))
             return "已由用户中止"
         tool_calls_total += len(tool_calls)
-        log.info("agent step %d: %d tool call(s) (total %d)", step,
-                 len(tool_calls), tool_calls_total)
+        names = ",".join((tc.get("function") or {}).get("name", "?") for tc in tool_calls)
+        log.info("agent step %d: [%s] (total %d)", step, names, tool_calls_total)
         messages.append({"role": "assistant", "content": msg.get("content") or None,
                          "tool_calls": tool_calls})
         for tc in tool_calls:
@@ -2643,7 +2653,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                       (fn["name"] == "run_shell" and
                        _is_readonly_shell((args.get("command") or "").strip()))):
                     # 只读操作（查询类工具/只读 shell/只读 MCP）天然无害：免规划直接执行
-                    ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
                 else:
                     result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
                               "（列出步骤与所需工具，用户批准后才可执行）")
@@ -2655,7 +2665,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 ok = False
             elif plan_mode and fn["name"] in approved_tools:
                 # 计划内声明的工具：免确认直接执行
-                ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+                ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
             else:
                 # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
                 policy = _confirm_policy(fn["name"], args)
@@ -2676,9 +2686,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
                         ok = False
                     else:
-                        ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+                        ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
                 else:
-                    ok, result = _execute_tool(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
             # 工具结果截断：避免大结果（read_file 等）撑爆上下文
             if len(result) > MAX_TOOL_RESULT_CHARS:
                 result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
