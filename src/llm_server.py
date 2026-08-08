@@ -107,9 +107,18 @@ def _current_confirm_mode() -> str:
 # 当前仅 tavily（网络搜索/提取，无本地副作用）；后续接入只读服务照此追加
 MCP_READONLY_PREFIXES = ("mcp_tavily_",)
 
+# 混合型 server（如 spotify：搜索只读、播放写）按工具名精确标记只读
+MCP_READONLY_TOOLS = {
+    "mcp_spotify_search_tracks", "mcp_spotify_search_artists", "mcp_spotify_search_albums",
+    "mcp_spotify_get_album_tracks", "mcp_spotify_get_my_playlists",
+    "mcp_spotify_get_my_top_artists", "mcp_spotify_get_my_top_tracks",
+    "mcp_spotify_get_now_playing", "mcp_spotify_get_playlist_tracks",
+    "mcp_spotify_get_saved_tracks", "mcp_spotify_get_server_version",
+}
+
 
 def _is_readonly_mcp(name: str) -> bool:
-    return any(name.startswith(p) for p in MCP_READONLY_PREFIXES)
+    return any(name.startswith(p) for p in MCP_READONLY_PREFIXES) or name in MCP_READONLY_TOOLS
 
 
 def _confirm_policy(name: str, args: dict) -> str:

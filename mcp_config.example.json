@@ -1,10 +1,11 @@
 {
   "_说明": "MCP server 配置样例。复制本文件为 mcp_config.json 后按需修改；真实配置含第三方 token，已 gitignore 不会入库。字段：command=启动命令，args=参数，env=环境变量，transport=http 时用 url。",
-
   "servers": {
     "github": {
       "command": "github-mcp-server",
-      "args": ["stdio"],
+      "args": [
+        "stdio"
+      ],
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_你的PAT",
         "GITHUB_PERMISSION": "read-write"
@@ -13,12 +14,20 @@
     },
     "chrome": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"],
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--browser",
+        "chrome"
+      ],
       "_说明": "浏览器控制（需本机已装 Chrome；Windows 桌面场景）。"
     },
     "tavily": {
       "command": "npx",
-      "args": ["-y", "tavily-mcp@latest"],
+      "args": [
+        "-y",
+        "tavily-mcp@latest"
+      ],
       "env": {
         "TAVILY_API_KEY": "tvly-你的Key"
       },
@@ -26,7 +35,11 @@
     },
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-fs"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp/mcp-fs"
+      ],
       "_说明": "可选：标准文件系统 server，开放指定目录。"
     },
     "http_example": {
@@ -34,6 +47,18 @@
       "url": "http://127.0.0.1:8888/mcp",
       "headers": {},
       "_说明": "可选：HTTP 传输的 server（如远程部署的 MCP 服务）。"
+    },
+    "spotify": {
+      "command": "uvx",
+      "args": [
+        "mcp-spotify"
+      ],
+      "env": {
+        "SPOTIFY_CLIENT_ID": "你的ClientID",
+        "SPOTIFY_CLIENT_SECRET": "你的ClientSecret",
+        "SPOTIFY_REDIRECT_URI": "http://127.0.0.1:8888/callback"
+      },
+      "_说明": "Spotify 播放/歌单/搜索（需 Premium + dashboard.spotify.com 建 Developer App；首次调用走 OAuth，token 缓存 ~/.spotify_mcp_cache；WSL 下 env 需补 HTTP_PROXY/HOME；搜索查询免确认，播放/建歌单弹确认）"
     }
   }
 }

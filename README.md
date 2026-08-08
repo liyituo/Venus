@@ -163,15 +163,19 @@ CLI `/reasoning`（或 `/reasoning max|high|off`）、Chat 设置下拉、配置
                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "你的PAT"}},
     "chrome": {"command": "npx", "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome"]},
     "tavily": {"command": "npx", "args": ["-y", "tavily-mcp@latest"],
-               "env": {"TAVILY_API_KEY": "tvly-你的Key"}}
+               "env": {"TAVILY_API_KEY": "tvly-你的Key"}},
+    "spotify": {"command": "uvx", "args": ["mcp-spotify"],
+                "env": {"SPOTIFY_CLIENT_ID": "你的ID", "SPOTIFY_CLIENT_SECRET": "你的Secret",
+                        "SPOTIFY_REDIRECT_URI": "http://127.0.0.1:8888/callback"}}
   }
 }
 ```
 
-- 启动时连接各 server，工具以 `mcp_<server>_<tool>` 命名动态并入（如 `mcp_github_create_issue`、`mcp_tavily_tavily_search`），health 可见
-- MCP 工具调用**默认弹确认**（trusted 模式放行 / query 模式拒绝）；**只读 MCP server（tavily 网络搜索类）免确认、免规划**
+- 启动时连接各 server，工具以 `mcp_<server>_<tool>` 命名动态并入（如 `mcp_github_create_issue`、`mcp_tavily_tavily_search`、`mcp_spotify_search_tracks`），health 可见
+- MCP 工具调用**默认弹确认**（trusted 模式放行 / query 模式拒绝）；**只读 MCP server（tavily 网络搜索类）免确认、免规划**；混合型 server（spotify）按工具区分——搜索/歌单查询免确认，播放/建歌单等写操作保持确认
 - 官方 GitHub MCP 用 release 二进制（`github-mcp-server stdio`），不要用 npm 上的同名杂牌包
-- 若 server 需要走代理/特殊环境（如 WSL 里的 npx、node），在 `env` 里显式补 `HTTP_PROXY`、`PATH` 等——MCP 的 `env` 会替换子进程完整环境，缺 PATH 时 npx 会启动失败
+- 若 server 需要走代理/特殊环境（如 WSL 里的 npx、node、uvx），在 `env` 里显式补 `HTTP_PROXY`、`HOME` 等——MCP 的 `env` 会替换子进程完整环境，缺 PATH 时 npx 会启动失败
+- Spotify 首次授权：dashboard.spotify.com 建 Developer App（Redirect URI 必须 `http://127.0.0.1:8888/callback`，不能用 localhost），配好 env 后首次调用走 OAuth，token 缓存 `~/.spotify_mcp_cache`；换区不影响凭据，仅 Premium 空窗期 API 不可用
 
 ## 会话与数据
 

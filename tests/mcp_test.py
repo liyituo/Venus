@@ -107,6 +107,18 @@ policy = L._confirm_policy("mcp_github_create_issue", {})
 L._current_confirm_mode = _orig_mode
 check("query 模式其他 MCP 拒绝", policy == "deny", policy)
 
+# 3.6 混合型 server 工具级只读（spotify：搜索免确认、播放保持确认）
+check("spotify 搜索免确认",
+      L._is_readonly_mcp("mcp_spotify_search_tracks") and
+      L._confirm_policy("mcp_spotify_search_tracks", {}) == "allow", "")
+check("spotify 歌单查询免确认",
+      L._confirm_policy("mcp_spotify_get_my_playlists", {}) == "allow", "")
+check("spotify 播放保持确认",
+      not L._is_readonly_mcp("mcp_spotify_play_track") and
+      L._confirm_policy("mcp_spotify_play_track", {}) == "ask", "")
+check("spotify 建歌单保持确认",
+      L._confirm_policy("mcp_spotify_create_playlist", {}) == "ask", "")
+
 # ============ 4. 断连重连（指数退避循环存活） ============
 print("== 4. 断连重连 ==")
 _BAD = str(Path(__file__).resolve().parent / "mcp_bad_server.py")
