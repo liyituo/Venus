@@ -26,8 +26,15 @@ import threading
 log = logging.getLogger("mcp-client")
 
 
+RECONNECT_BASE = 5     # 重连起始等待（秒）
+RECONNECT_MAX = 120    # 重连等待上限（指数退避封顶）
+
+
 class McpConnection:
-    """单个 MCP server 连接：常驻协程持有 stdio/http context，工具调用跨任务转发。"""
+    """单个 MCP server 连接：常驻协程持有 stdio/http context，工具调用跨任务转发。
+
+    连接断开（server 崩溃/子进程退出）后自动指数退避重连，无需重启 llm_server。
+    """
 
     def __init__(self, name: str, config: dict):
         self.name = name
@@ -39,32 +46,48 @@ class McpConnection:
         self.stop_event: asyncio.Event | None = None
 
     async def _run(self) -> None:
-        """常驻连接协程（在 manager 事件循环中运行，context 进出同一任务）。"""
-        try:
-            if self.config.get("transport", "stdio") == "stdio":
-                from mcp import ClientSession, StdioServerParameters
-                from mcp.client.stdio import stdio_client
-                params = StdioServerParameters(
-                    command=self.config["command"],
-                    args=self.config.get("args") or [],
-                    env=self.config.get("env") or None,
-                )
-                async with stdio_client(params) as (read, write):
-                    await self._serve(ClientSession(read, write))
-            else:
-                from mcp import ClientSession
-                from mcp.client.streamable_http import streamablehttp_client
-                async with streamablehttp_client(
-                    self.config["url"], headers=self.config.get("headers") or {}
-                ) as (read, write):
-                    await self._serve(ClientSession(read, write))
-        except Exception as exc:
-            self.error = str(exc)[:300]
-            log.warning("MCP server %s 异常：%s", self.name, self.error)
-        finally:
-            if self.ready is not None:
-                self.ready.set()          # 唤醒等待方（session 可能为 None = 失败）
-            self.session = None
+        """常驻连接协程：连接 → 服务 → 断开后退避重连，直到显式停止。"""
+        delay = RECONNECT_BASE
+        while self.stop_event is None or not self.stop_event.is_set():
+            try:
+                if self.config.get("transport", "stdio") == "stdio":
+                    from mcp import ClientSession, StdioServerParameters
+                    from mcp.client.stdio import stdio_client
+                    params = StdioServerParameters(
+                        command=self.config["command"],
+                        args=self.config.get("args") or [],
+                        env=self.config.get("env") or None,
+                    )
+                    async with stdio_client(params) as (read, write):
+                        await self._serve(ClientSession(read, write))
+                else:
+                    from mcp import ClientSession
+                    from mcp.client.streamable_http import streamablehttp_client
+                    async with streamablehttp_client(
+                        self.config["url"], headers=self.config.get("headers") or {}
+                    ) as (read, write):
+                        await self._serve(ClientSession(read, write))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.error = str(exc)[:300]
+                if delay <= RECONNECT_BASE:
+                    log.warning("MCP server %s 连接失败：%s（%.0fs 后重连）",
+                                self.name, self.error, delay)
+                else:
+                    log.warning("MCP server %s 连接断开：%s（%.0fs 后重连）",
+                                self.name, self.error, delay)
+            finally:
+                self.session = None
+                if self.ready is not None and not self.ready.is_set():
+                    self.ready.set()      # 首次失败也唤醒等待方（session=None=失败）
+            # 退避等待；stop_event 置位时立即退出
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, RECONNECT_MAX)
 
     async def _serve(self, session) -> None:
         async with session:

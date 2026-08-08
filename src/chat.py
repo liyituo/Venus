@@ -597,8 +597,11 @@ class ChatApp:
             self._tasks.put(("sessions", self._load_sessions_from_server))
         cfg = load_config()
         if data.get("configured"):
+            rm = data.get("reasoning_mode") or "max"
+            rm_label = {"max": "最高", "high": "高", "off": "关闭"}.get(rm, rm)
             self.llm_status.config(
-                text=f"ready · {data.get('model')}\n{data.get('api_url')}",
+                text=f"ready · {data.get('model')}\n{data.get('api_url')}\n"
+                     f"推理: {rm_label} · 确认: {cfg.get('confirm_mode', 'auto')}",
                 fg=OK)
         else:
             self.llm_status.config(

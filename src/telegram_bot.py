@@ -184,10 +184,21 @@ class Bot:
             return {"ok": False, "description": str(exc)[:200]}
 
     def send_message(self, chat_id: int, text: str, keyboard=None) -> dict:
-        params = {"chat_id": chat_id, "text": text[:MAX_TEXT]}
         if keyboard is not None:
-            params["reply_markup"] = json.dumps(keyboard)
-        return self.api("sendMessage", params)
+            # 带按钮的消息不分段（确认框文本短）；保持原有行为
+            return self.api("sendMessage", {
+                "chat_id": chat_id, "text": text[:MAX_TEXT],
+                "reply_markup": json.dumps(keyboard)})
+        if len(text) <= MAX_TEXT:
+            return self.api("sendMessage", {"chat_id": chat_id, "text": text})
+        # 超长自动分段：Telegram 单条上限 4096，超长硬截断会让后半段丢失
+        last = None
+        for i in range(0, len(text), MAX_TEXT):
+            last = self.api("sendMessage", {"chat_id": chat_id, "text": text[i:i + MAX_TEXT]})
+            if not last.get("ok"):
+                log.warning("分段发送第 %d 段失败：%s", i // MAX_TEXT + 1,
+                            last.get("description", "?"))
+        return last
 
     def edit_message(self, chat_id: int, msg_id: int, text: str, keyboard=None) -> dict:
         params = {"chat_id": chat_id, "message_id": msg_id, "text": text[:MAX_TEXT]}

@@ -5,6 +5,7 @@
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -105,6 +106,21 @@ check("query 模式 tavily 放行", policy == "allow", policy)
 policy = L._confirm_policy("mcp_github_create_issue", {})
 L._current_confirm_mode = _orig_mode
 check("query 模式其他 MCP 拒绝", policy == "deny", policy)
+
+# ============ 4. 断连重连（指数退避循环存活） ============
+print("== 4. 断连重连 ==")
+_BAD = str(Path(__file__).resolve().parent / "mcp_bad_server.py")
+mgr2 = McpManager({"bad": {"command": _PY, "args": [_BAD]}})
+mgr2.start()
+conn = mgr2.conns["bad"]
+time.sleep(2)
+check("崩溃 server 记录错误", bool(conn.error), conn.error[:80])
+check("session 为 None（未连上）", conn.session is None, "")
+time.sleep(6)   # 跨过 RECONNECT_BASE(5s) 重试窗口
+check("重连循环存活（协程未退出）", conn.task is not None and not conn.task.done(),
+      str(conn.task))
+mgr2.stop()
+check("stop 后退出重连", conn.task.done(), str(conn.task))
 
 mgr.stop()
 print(f"\n结果: {passed} 通过, {failed} 失败")

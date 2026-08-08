@@ -200,6 +200,7 @@ PROCESS_OUTPUT_LINES = 2000      # 进程输出环形缓冲行数
 PROCESS_OUTPUT_LIMIT = 4000      # process_output 单次返回字符上限
 PROCESS_WAIT_MAX = 60            # process_output wait_seconds 上限
 MAX_TODOS = 30                   # 任务清单上限
+TODOS_NOTE_MAX_CHARS = 1200      # 任务清单注入 system 的字符上限（防膨胀）
 TODO_STATUSES = ("pending", "in_progress", "completed", "failed", "cancelled")
 REPO_MAP_TTL = 30                # repo_map 缓存秒数
 REPO_MAP_MAX_ENTRIES = 300
@@ -388,6 +389,14 @@ class LlmError(Exception):
 
 
 app = FastAPI(title="LLM Backend", version=APP_VERSION)
+
+
+@app.on_event("startup")
+async def _warmup_mcp() -> None:
+    """启动时后台预连接 MCP server：首个请求不等待连接（懒加载兜底仍在）。"""
+    if os.environ.get("PCAGENT_DISABLE_MCP"):
+        return
+    threading.Thread(target=_ensure_mcp, daemon=True, name="mcp-warmup").start()
 
 
 @app.get("/api/v1/confirm-mode", summary="查看当前问询模式")
@@ -1379,7 +1388,11 @@ def _todos_system_note() -> str:
     for t in todos[-MAX_TODOS:]:
         desc = f" — {t.get('description')}" if t.get("description") else ""
         lines.append(f"- [#{t['id']}] {t['status']}: {t['title']}{desc}")
-    return "\n".join(lines)
+    note = "\n".join(lines)
+    # 防膨胀：todo 多/描述长时截断（系统注入的预算有限）
+    if len(note) > TODOS_NOTE_MAX_CHARS:
+        note = note[:TODOS_NOTE_MAX_CHARS] + "\n...（任务清单过长已截断）"
+    return note
 
 
 # ---- 会话持久化（权威存储在项目目录 .pcagent/，跟随程序 / U 盘移动，已 gitignore）----
@@ -2323,7 +2336,10 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             mcp = _ensure_mcp()
             if mcp is None or not mcp.conns:
                 return False, "MCP 未配置（mcp_config.json 为空）"
-            return mcp.call(name, arguments)
+            ok, result = mcp.call(name, arguments)
+            if not ok:
+                log.warning("MCP 工具 %s 调用失败：%s", name, result[:200])
+            return ok, result
         if name == "create_plan":
             return False, "create_plan 仅在计划审批模式（/confirm-mode plan）下使用，由 agent 循环处理"
         return False, f"未知工具：{name}"
@@ -2601,15 +2617,20 @@ async def _stream_events(api_url: str, payload: dict, headers: dict):
     q: queue.Queue = queue.Queue()
     loop = asyncio.get_running_loop()
     loop.run_in_executor(None, _upstream_reader, api_url, payload, headers, q)
-    while True:
-        # q.get 是阻塞调用，放在线程池执行，不阻塞事件循环
-        kind, data = await loop.run_in_executor(None, q.get)
-        if kind == "done":
-            break
-        if kind == "error":
-            yield f"event: error\ndata: {json.dumps({'detail': data})}\n\n"
-            break
-        yield data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    try:
+        while True:
+            # q.get 是阻塞调用，放在线程池执行，不阻塞事件循环
+            kind, data = await loop.run_in_executor(None, q.get)
+            if kind == "done":
+                break
+            if kind == "error":
+                yield f"event: error\ndata: {json.dumps({'detail': data})}\n\n"
+                break
+            yield data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    except asyncio.CancelledError:
+        # 客户端断开：无法强停上游读取线程（urllib 阻塞），记录后正常退出
+        log.info("chat stream 客户端断开，上游读取线程将自然结束")
+        raise
 
 
 def _call_llm(api_url: str, payload: dict, headers: dict) -> dict:
