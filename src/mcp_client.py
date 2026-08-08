@@ -144,13 +144,20 @@ class McpManager:
 
     # ---- 工具调用（工作线程同步调用）----
     def call(self, tool_name: str, arguments: str) -> tuple[bool, str]:
-        parts = tool_name.split("_", 2)
-        if len(parts) != 3 or parts[0] != "mcp":
+        if not tool_name.startswith("mcp_"):
             return False, "无效的 MCP 工具名"
-        _, server, tool = parts
-        conn = self.conns.get(server)
-        if conn is None or conn.session is None:
-            return False, f"MCP server '{server}' 未连接：{conn.error if conn else '未配置'}"
+        # 按已注册连接反查 server + 工具名：避免分隔符歧义
+        # （工具名/schema 由 server 定义，常含下划线；用前缀匹配而非 split）
+        conn, server, tool = None, None, None
+        for name, c in self.conns.items():
+            prefix = f"mcp_{name}_"
+            if tool_name.startswith(prefix):
+                conn, server, tool = c, name, tool_name[len(prefix):]
+                break
+        if conn is None:
+            return False, f"未知的 MCP 工具：{tool_name}"
+        if conn.session is None:
+            return False, f"MCP server '{server}' 未连接：{conn.error or '未知错误'}"
         try:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:

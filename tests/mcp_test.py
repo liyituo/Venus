@@ -13,7 +13,9 @@ from mcp_client import McpManager  # noqa: E402
 
 _PY = sys.executable
 _ECHO = str(Path(__file__).resolve().parent / "mcp_echo_server.py")
-CONFIG = {"echo": {"command": _PY, "args": [_ECHO]}}
+# my_echo：server 名含下划线，验证工具名反查不受分隔符歧义影响
+CONFIG = {"echo": {"command": _PY, "args": [_ECHO]},
+          "my_echo": {"command": _PY, "args": [_ECHO]}}
 
 passed = failed = 0
 
@@ -50,9 +52,12 @@ check("add 调用", ok and res == "7", res)
 ok, res = mgr.call("mcp_echo_add", json.dumps({"a": "x"}))
 check("参数错误回传", not ok, res[:80])
 ok, res = mgr.call("mcp_nonexist_tool", "{}")
-check("未连接 server", not ok, res)
+check("未知 server 拒绝", not ok, res)
 ok, res = mgr.call("not_mcp_tool", "{}")
 check("非 MCP 名拒绝", not ok, res)
+# server 名含下划线：前缀反查（旧 split 实现会误拆为 server="my"）
+ok, res = mgr.call("mcp_my_echo_echo", json.dumps({"text": "嵌套下划线"}))
+check("server 名含下划线可调用", ok and "嵌套下划线" in res, res)
 
 # ============ 3. llm_server 集成 ============
 print("== 3. 与 llm_server 集成 ==")

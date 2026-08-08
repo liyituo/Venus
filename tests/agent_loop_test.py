@@ -287,7 +287,6 @@ check("只读操作无 ask", not any(k == "ask" for k, _ in events), "")
 
 # 4.4 批准后重复 create_plan → 提示
 plan_seen4 = {"called": 0}
-
 def fake_dup_plan_upstream(api_url, payload, headers):
     n = plan_seen4["called"] + 1
     plan_seen4["called"] = n
@@ -310,6 +309,25 @@ events = collect_events(client, {"agent": True, "messages": [
 tr_dup = next((p for k, p in events if k == "tool_result"
                and "重复规划" in p.get("result", "")), None)
 check("批准后重复规划被提示", tr_dup is not None, str(events)[:200])
+
+# 4.5 只读 MCP 工具（tavily 搜索）免规划：未规划直接调用 → 走执行分支而非拒绝
+plan_seen5 = {"called": 0}
+
+def fake_mcp_readonly_upstream(api_url, payload, headers):
+    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "p7", "type": "function",
+         "function": {"name": "mcp_tavily_tavily_search",
+                      "arguments": json.dumps({"query": "test"})}}]}}], "usage": {}}
+
+L._call_upstream_raw = fake_mcp_readonly_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "搜一下"}]})
+tr = next((p for k, p in events if k == "tool_result"), None)
+# 测试环境 MCP 未配置：应走执行分支（报未配置），而非被拒绝（提示 create_plan）
+check("plan 模式只读 MCP 免规划（走执行分支）",
+      tr is not None and "create_plan" not in tr.get("result", ""), str(tr)[:150])
+check("plan 模式只读 MCP 无 ask", not any(k == "ask" for k, _ in events), "")
 
 L._current_confirm_mode = _orig_confirm_mode
 

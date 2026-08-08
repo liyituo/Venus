@@ -54,7 +54,7 @@ DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 MAX_TOOL_STEPS = 10             # 单次请求最多工具轮数
 MAX_TOOL_CALLS_TOTAL = 30       # 单次请求工具调用总数上限（一轮可含多个调用）
 MAX_CONSECUTIVE_FAILURES = 4    # 连续失败熔断阈值：达到即停止整个任务
-MAX_AGENT_SECONDS = 240         # 单次 agent 请求总耗时上限（含上游生成时间）
+MAX_AGENT_SECONDS = 420         # 单次 agent 请求总耗时上限（含上游生成时间；max 推理思考较久，放宽至 7 分钟）
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
 _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 agent 循环
 
