@@ -17,6 +17,10 @@ import llm_server as L  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 _TMP = Path(tempfile.mkdtemp(prefix="pcagent_subagent_"))
+# CI/无配置环境：注入假配置（测试不走真实上游，仅过 _validate_config）
+L.load_config = lambda: {"api_url": "http://127.0.0.1:9", "api_key": "test",
+                         "model": "test-model", "context_window": 65536,
+                         "confirm_mode": "auto", "reasoning_mode": "max"}
 L.AGENTS_DIR = _TMP / "agents"
 L.AGENTS_DIR.mkdir()
 # 造一个 vision 子 agent（与真实示例同构）
