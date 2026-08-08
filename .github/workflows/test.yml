@@ -39,3 +39,6 @@ jobs:
 
       - name: 推理强度测试（max/high/off 映射与持久化）
         run: python tests/reasoning_test.py
+
+      - name: Skill 包与系统监控测试（扫描/加载/免确认/降级）
+        run: python tests/skill_system_test.py

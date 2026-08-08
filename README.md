@@ -46,6 +46,10 @@ wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python telegram_bot.py &"
 
 白名单 `allowed_chat_ids` 留空时，第一个发 `/start` 的人自动成为管理员；敏感操作在手机上弹允许/拒绝按钮。
 
+bot 命令：`/status` `/stats` `/sessions` `/switch N` `/send <路径>`（把工作区文件发到你手机）`/schedule`（定时任务，见下）。
+
+**定时任务（`/schedule`）**：`/schedule add 08:00 搜索今日科技新闻并总结` 添加，到点自动执行并把结果推送到手机；`/schedule` 查看，`/schedule del <id>` 删除，`/schedule off|on <id>` 暂停/恢复。任务存 `.pcagent/schedules.json`，重启不丢。
+
 ## 命令行
 
 ```
@@ -67,6 +71,25 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 - **执行**：跑 Python（`run_code`）、shell 命令（`run_shell`）、后台进程（`start_process`）
 - **规划**：`create_todo` 列任务清单，前端实时显示，重启后保留
 - **索引**：`repo_map` 生成项目结构摘要（目录树 + 符号表）
+- **系统**：`system_status` 查磁盘/内存/CPU 负载（只读）
+- **技能**：`load_skill` 加载用户导入的技能包（见下节）
+
+## 技能包（Skill）
+
+把常用工作流写成 `skills/<名称>/SKILL.md`（frontmatter 写 `name`/`description`），丢进目录即导入，无需重启：
+
+```markdown
+---
+name: daily-brief
+description: 每日简报：搜科技新闻 + 查系统状态，汇总成简报
+---
+# 每日简报
+1. 用 system_status 查资源
+2. 用 tavily 搜索今日科技新闻
+3. 汇总输出
+```
+
+启动时只把**技能清单**（名称 + 一句话）注入系统提示，模型判断任务匹配时用 `load_skill` 加载全文——惰性注入，技能再多也不撑上下文。技能要求的操作**不绕过确认模式**。
 
 ## 安全
 
@@ -131,17 +154,29 @@ CLI `/reasoning`（或 `/reasoning max|high|off`）、Chat 设置下拉、配置
 - 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）；重启自动恢复，chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
 - 文件修改自动备份到 `.pcagent/backups/`（`undo` 回滚用，50 条上限）
 - 运行日志写入 `.pcagent/server.log` 与 `.pcagent/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
-- 任务清单存在工作区 `.pcagent/todos.json`（跟随机器）
+- 任务清单存在工作区 `.pcagent/todos.json`（跟随机器）；定时任务存 `.pcagent/schedules.json`
 - 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
+
+## 进程守护（Linux）
+
+WSL 里两个服务由 systemd 托管，崩溃自动拉起、开机自启（模板见 `scripts/systemd/`）：
+
+```
+cp scripts/systemd/pc-agent-*.service ~/.config/systemd/user/
+systemctl --user enable --now pc-agent-llm pc-agent-bot
+```
+
+已内置代理环境变量；`journalctl --user -u pc-agent-llm -n 50` 看日志。
 
 ## 目录结构
 
 ```
 src/                源代码（app / llm_server / 五个前端 / mock_llm 测试 API）
-scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh
+scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
-tests/              七套测试（共 193 断言）
-.github/workflows/  CI（push 自动跑七套测试）
+skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
+tests/              八套测试（共 215 断言）
+.github/workflows/  CI（push 自动跑八套测试）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
@@ -155,14 +190,15 @@ mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
 ```
 .venv\Scripts\python tests\smoke_test.py        # daemon 冒烟（21 断言，不碰真实屏幕）
 .venv\Scripts\python tests\llm_tools_test.py    # 编程工具（69 断言：检索/编辑/undo/git/进程/todo/repo）
-.venv\Scripts\python tests\agent_loop_test.py   # agent 循环端到端（31 断言：ask+diff/todo/上下文上界/plan）
+.venv\Scripts\python tests\agent_loop_test.py   # agent 循环端到端（33 断言：ask+diff/todo/上下文上界/plan）
 .venv\Scripts\python tests\session_test.py      # 会话持久化（30 断言：CRUD/重启恢复/上限）
-.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（15 断言：echo server 全链路）
+.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（21 断言：echo server 全链路/命名解析/白名单）
 .venv\Scripts\python tests\cli_session_test.py  # CLI 会话（13 断言：摘要/懒加载/降级）
 .venv\Scripts\python tests\reasoning_test.py    # 推理强度（14 断言：档位映射/持久化/校验）
+.venv\Scripts\python tests\skill_system_test.py # 技能包与系统监控（14 断言：扫描/加载/免确认/降级）
 .venv\Scripts\python src\mock_llm.py            # 无 Key 时本地假 API 验证全链路
 ```
 
-推送后 GitHub Actions 自动跑七套测试（共 193 断言），回归结果在 Actions 页面一眼可见。
+推送后 GitHub Actions 自动跑八套测试（共 215 断言），回归结果在 Actions 页面一眼可见。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。

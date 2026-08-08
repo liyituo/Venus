@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 import queue
+import re
 import sys
 import threading
 import time
@@ -36,6 +37,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "telegram_config.json"
 CHATS_FILE = BASE_DIR.parent / ".pcagent" / "telegram_chats.json"
+SCHEDULES_FILE = BASE_DIR.parent / ".pcagent" / "schedules.json"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -107,6 +109,8 @@ class Bot:
         self.opener = _proxy_opener(self.cfg.get("proxy") or "")
         self.llm_url = (self.cfg.get("llm_url") or "http://127.0.0.1:8001").rstrip("/")
         self.chats: dict[int, dict] = self._load_chats()   # chat_id -> {"session_id": int}
+        self.schedules: list[dict] = self._load_schedules()  # 定时任务
+        self._stop = threading.Event()
         self.messages: dict[int, list[dict]] = {}          # chat_id -> [user/assistant]
         self.busy: set[int] = set()                        # 正在流式的 chat_id
         self.stream_state: dict[int, dict] = {}            # 流式渲染状态
@@ -143,6 +147,23 @@ class Bot:
                                   encoding="utf-8")
         except OSError as exc:
             print(f"[bot] chats 持久化失败：{exc}", file=sys.stderr)
+
+    def _load_schedules(self) -> list[dict]:
+        try:
+            if SCHEDULES_FILE.exists():
+                data = json.loads(SCHEDULES_FILE.read_text(encoding="utf-8"))
+                return data if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
+
+    def _save_schedules(self) -> None:
+        try:
+            SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SCHEDULES_FILE.write_text(
+                json.dumps(self.schedules, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError as exc:
+            log.warning("定时任务保存失败：%s", exc)
 
     # ------------------------------------------------------------------ Telegram API
     def api(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
@@ -266,6 +287,11 @@ class Bot:
             sys.exit(1)
         log.info("已连接 @%s，开始轮询", r['result'].get('username', '?'))
         print(f"[bot] 已连接 @{r['result'].get('username', '?')}，开始轮询…")
+        # 启动定时任务调度线程
+        threading.Thread(target=self._scheduler_loop, daemon=True,
+                         name="scheduler").start()
+        if self.schedules:
+            log.info("定时任务已加载：%d 个", len(self.schedules))
         # 拉取上下文窗口（压缩阈值基准）；失败用默认
         status, data = self.llm("GET", "/api/v1/health")
         if status == 200 and data.get("context_window"):
@@ -316,6 +342,10 @@ class Bot:
                 self.cmd_status(chat_id)
             elif text == "/stats":
                 self.cmd_stats(chat_id)
+            elif text.startswith("/send"):
+                self.cmd_send(chat_id, text)
+            elif text.startswith("/schedule"):
+                self.cmd_schedule(chat_id, text)
             elif text.startswith("/"):
                 self.send_message(chat_id, f"未知命令：{text}（/help 查看）")
             else:
@@ -371,8 +401,127 @@ class Bot:
             "PC Agent（Telegram 前端）\n"
             "直接发消息即可，Agent 自主调用工具。\n\n"
             "/new 新建会话\n/sessions 会话列表\n/switch N 切换会话\n"
-            "/status 状态\n/stats Token 用量\n/help 帮助\n\n"
+            "/status 状态\n/stats Token 用量\n/send <路径> 发送工作区文件给你\n"
+            "/schedule 定时任务\n/help 帮助\n\n"
             "敏感操作（改文件/提交 git/执行命令）会弹确认按钮。"))
+
+    def cmd_send(self, chat_id: int, text: str) -> None:
+        """/send <路径>：把工作区内的文件发送给用户（multipart 上传，20MB 上限）。"""
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            self.send_message(chat_id, "用法：/send <路径>（相对工作区或绝对路径，限工作区内）")
+            return
+        ws = Path.home() / "agent_workspace"
+        raw = parts[1].strip()
+        full = (ws / raw) if not Path(raw).is_absolute() else Path(raw)
+        try:
+            full = full.resolve()
+            full.relative_to(ws.resolve())
+        except (ValueError, OSError):
+            self.send_message(chat_id, f"拒绝：路径必须位于工作区 `{ws}` 内")
+            return
+        threading.Thread(target=self._do_send, args=(chat_id, full), daemon=True).start()
+
+    def _do_send(self, chat_id: int, path: Path) -> None:
+        """发送文件（multipart/form-data，纯标准库构造）。"""
+        try:
+            if not path.is_file():
+                self.send_message(chat_id, f"文件不存在：`{path}`")
+                return
+            size = path.stat().st_size
+            if size > MAX_UPLOAD_BYTES:
+                self.send_message(chat_id, f"文件过大（{size // 1024} KB > 20MB 上限）")
+                return
+            fname = re.sub(r'[\r\n"]', "_", path.name)[:120]
+            url = (f"https://api.telegram.org/bot{self.cfg.get('bot_token', '')}"
+                   f"/sendDocument")
+            boundary = "----pcagent" + str(int(time.time() * 1000))
+            head = (f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="document"; filename="{fname}"\r\n'
+                    f"Content-Type: application/octet-stream\r\n\r\n")
+            body = head.encode("utf-8") + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            with self.opener.open(req, timeout=120) as resp:
+                r = json.loads(resp.read().decode("utf-8"))
+            if r.get("ok"):
+                self.send_message(chat_id, f"已发送 `{fname}`（{size // 1024} KB）")
+            else:
+                self.send_message(chat_id, f"发送失败：{r.get('description', '?')}")
+        except Exception as exc:
+            self.send_message(chat_id, f"文件发送失败：{exc}")
+
+    # ------------------------------------------------------------------ 定时任务
+    def cmd_schedule(self, chat_id: int, text: str) -> None:
+        """/schedule：列出；/schedule add HH:MM <任务描述>；/schedule del <id>；
+        /schedule off|on <id>。到点自动执行并推送结果。"""
+        parts = text.split()
+        if len(parts) == 1:
+            if not self.schedules:
+                self.send_message(
+                    chat_id, "暂无定时任务。\n用法：/schedule add 08:00 搜索今日科技新闻并总结")
+                return
+            lines = ["定时任务："]
+            for s in self.schedules:
+                state = "开" if s.get("enabled", True) else "关"
+                lines.append(f"#{s['id']} [{state}] {s.get('time')} "
+                             f"{s.get('prompt', '')[:40]}"
+                             f"{'（上次 ' + s['last_run'] + '）' if s.get('last_run') else ''}")
+            self.send_message(chat_id, "\n".join(lines))
+            return
+        sub = parts[1].lower()
+        if sub == "add":
+            if len(parts) < 4:
+                self.send_message(chat_id, "用法：/schedule add HH:MM <任务描述>")
+                return
+            hhmm = parts[2]
+            if not re.fullmatch(r"\d{2}:\d{2}", hhmm):
+                self.send_message(chat_id, "时间格式应为 HH:MM（24 小时制）")
+                return
+            prompt = " ".join(parts[3:])
+            sid = f"s{len(self.schedules) + 1}"
+            self.schedules.append({"id": sid, "time": hhmm, "prompt": prompt,
+                                   "chat_id": chat_id, "last_run": "", "enabled": True})
+            self._save_schedules()
+            self.send_message(chat_id, f"✓ 已添加定时任务 #{sid}：每天 {hhmm} 执行「{prompt[:40]}」")
+        elif sub in ("del", "off", "on"):
+            if len(parts) < 3:
+                self.send_message(chat_id, f"用法：/schedule {sub} <id>")
+                return
+            target = next((s for s in self.schedules if s["id"] == parts[2]), None)
+            if target is None:
+                self.send_message(chat_id, f"定时任务不存在：{parts[2]}（/schedule 查看）")
+                return
+            if sub == "del":
+                self.schedules.remove(target)
+                self.send_message(chat_id, f"已删除定时任务 #{target['id']}")
+            else:
+                target["enabled"] = (sub == "on")
+                self.send_message(chat_id, f"定时任务 #{target['id']} 已{'开启' if sub == 'on' else '暂停'}")
+            self._save_schedules()
+        else:
+            self.send_message(chat_id, "未知子命令（add / del / on / off），/schedule 查看用法")
+
+    def _scheduler_loop(self) -> None:
+        """调度线程：每 30 秒检查 HH:MM 是否到点（每天一次），触发 agent_flow 并推送结果。"""
+        while not self._stop.is_set():
+            now = time.strftime("%H:%M")
+            today = time.strftime("%Y-%m-%d")
+            for s in list(self.schedules):
+                if not s.get("enabled", True) or s.get("time") != now:
+                    continue
+                if (s.get("last_run") or "").startswith(today):
+                    continue    # 今天已触发
+                s["last_run"] = f"{today} {now}"
+                self._save_schedules()
+                log.info("定时任务 %s 触发: %s", s["id"], s.get("prompt", "")[:50])
+                threading.Thread(target=self.agent_flow,
+                                 args=(s.get("chat_id"), s.get("prompt", "")),
+                                 daemon=True).start()
+            self._stop.wait(30)
 
     def cmd_sessions(self, chat_id: int) -> None:
         status, data = self.llm("GET", "/api/v1/sessions")

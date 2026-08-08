@@ -95,6 +95,7 @@ QUERY_TOOLS = {  # 查询类工具（任何模式都放行）
     "search_text", "glob_files", "list_symbols",
     "git_status", "git_diff", "git_log",
     "process_output", "list_processes", "list_todos", "repo_map",
+    "load_skill", "system_status",
 }
 
 
@@ -145,6 +146,7 @@ _FILE_TOOLS = {
     "git_status", "git_diff", "git_log", "git_commit",
     "start_process", "process_output", "stop_process", "list_processes",
     "create_todo", "update_todo", "list_todos", "repo_map",
+    "load_skill", "system_status",
 }
 ISOLATED = False
 
@@ -927,7 +929,114 @@ AGENT_TOOLS = [
                            "max_entries": {"type": "integer", "default": 200, "description": "最多返回条目数"}},
                        "required": []},
     }},
+    {"type": "function", "function": {
+        "name": "load_skill",
+        "description": "加载用户导入的技能包全文（skills/<名称>/SKILL.md，含步骤与注意事项）。"
+                       "任务与某个技能匹配时调用；清单见系统提示中的可用技能包。",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "技能名（目录名或 frontmatter 的 name）"},
+        }, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "system_status",
+        "description": "查询系统资源状态（只读）：磁盘使用率、内存、CPU 负载、运行时间。",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
 ]
+
+# ---- Skill 包（用户导入的技能包：skills/<名称>/SKILL.md）----
+SKILLS_DIR = BASE_DIR.parent / "skills"
+SKILL_MAX_CHARS = 8000       # load_skill 返回全文上限（防爆 token）
+
+
+def _parse_skill_frontmatter(text: str) -> tuple[str, str]:
+    """解析 SKILL.md 头部 frontmatter（--- 包裹的 name/description）。"""
+    name = desc = ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end > 0:
+            for line in text[3:end].splitlines():
+                k, _, v = line.partition(":")
+                k, v = k.strip().lower(), v.strip().strip('"').strip("'")
+                if k == "name":
+                    name = v
+                elif k == "description":
+                    desc = v
+    return name, desc
+
+
+def _scan_skills() -> list[dict]:
+    """扫描 skills/ 下的技能包（每个子目录一份 SKILL.md），按目录名排序。"""
+    out = []
+    if not SKILLS_DIR.is_dir():
+        return out
+    for d in sorted(SKILLS_DIR.iterdir()):
+        f = d / "SKILL.md"
+        if d.is_dir() and f.is_file():
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            name, desc = _parse_skill_frontmatter(text)
+            out.append({"name": name or d.name, "description": desc,
+                        "dir": d.name, "text": text})
+    return out
+
+
+def _skill_catalog_text() -> str:
+    """可用技能清单（只注入清单不注入全文，模型按需 load_skill 加载）。"""
+    skills = _scan_skills()
+    if not skills:
+        return ""
+    lines = ["可用技能包（任务匹配某技能时，用 load_skill 加载该技能全文再执行）："]
+    for s in skills:
+        lines.append(f"- {s['name']}：{s['description'] or '无描述'}")
+    return "\n".join(lines)
+
+
+def _system_status_text() -> str:
+    """系统资源快照（只读，纯标准库）：磁盘 / 内存 / CPU 负载 / 运行时间。
+
+    Linux 读 /proc；Windows 只取磁盘（其余项优雅降级）。
+    """
+    import shutil
+    parts = []
+    for p in ("/", str(Path.home())):
+        try:
+            u = shutil.disk_usage(p)
+            pct = u.used * 100 // u.total
+            parts.append(f"磁盘 {p}: 总 {u.total // 2**30}G 已用 {u.used // 2**30}G "
+                         f"可用 {u.free // 2**30}G（{pct}%）")
+        except OSError:
+            pass
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            mem = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    mem[k] = int(v.strip().split()[0])
+        if mem.get("MemTotal"):
+            total, avail = mem["MemTotal"], mem.get("MemAvailable", 0)
+            used = total - avail
+            parts.append(f"内存: 总 {total // 2**20}G 已用 {used // 2**20}G "
+                         f"可用 {avail // 2**20}G（{used * 100 // total}%）")
+    except OSError:
+        pass
+    try:
+        with open("/proc/loadavg", encoding="utf-8") as f:
+            la = f.read().split()
+        parts.append(f"CPU 负载(1/5/15 分钟): {la[0]} {la[1]} {la[2]}（核数 {os.cpu_count()}）")
+    except OSError:
+        pass
+    try:
+        with open("/proc/uptime", encoding="utf-8") as f:
+            secs = float(f.read().split()[0])
+        parts.append(f"系统已运行: {int(secs // 86400)}天{int(secs % 86400 // 3600)}小时")
+    except OSError:
+        pass
+    return "\n".join(parts) or "无法获取系统状态"
+
 
 AGENT_SYSTEM_SUFFIX = (
     "\n\n你是 PC Agent，一个可以控制用户电脑的智能体。你可以通过工具操作电脑、编写和修改代码。\n"
@@ -2196,6 +2305,19 @@ def _execute_tool(name: str, arguments: str) -> tuple[bool, str]:
             if code == 200:
                 return True, json.dumps({"ok": True}, ensure_ascii=False)
             return False, f"执行失败：{data.get('detail', code)}"
+        if name == "load_skill":
+            sname = (args.get("name") or "").strip()
+            skills = _scan_skills()
+            hit = next((s for s in skills if s["name"] == sname), None)
+            if hit is None:
+                avail = "、".join(s["name"] for s in skills) or "无"
+                return False, f"技能不存在：{sname}。可用技能：{avail}"
+            text = hit["text"]
+            if len(text) > SKILL_MAX_CHARS:
+                text = text[:SKILL_MAX_CHARS] + "\n...(技能过长已截断)"
+            return True, text
+        if name == "system_status":
+            return True, _system_status_text()
         if name.startswith("mcp_"):
             # MCP 外部工具转发（mcp_<server>_<tool>）
             mcp = _ensure_mcp()
@@ -2424,6 +2546,8 @@ async def chat_stream(req: ChatRequest):
                 todo_note = _todos_system_note()
                 if todo_note:
                     m["content"] += todo_note
+                # 注入可用技能包清单（只注入清单，全文按需 load_skill）
+                m["content"] += _skill_catalog_text()
                 # 计划审批模式：提示先规划
                 if _current_confirm_mode() == "plan":
                     m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
@@ -2432,7 +2556,8 @@ async def chat_stream(req: ChatRequest):
                 break
         else:
             messages.insert(0, {"role": "system",
-                                "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()})
+                                "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
+                                + _skill_catalog_text()})
         return StreamingResponse(
             _agent_stream_events(api_url, headers, messages, model, req.temperature),
             media_type="text/event-stream",

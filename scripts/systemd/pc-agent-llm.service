@@ -1,0 +1,19 @@
+[Unit]
+Description=PC Agent LLM Server (isolated)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=PYTHONUTF8=1
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=HTTP_PROXY=http://127.0.0.1:7897
+Environment=HTTPS_PROXY=http://127.0.0.1:7897
+Environment=NO_PROXY=localhost,127.0.0.1
+ExecStart=%h/.venv/bin/python %h/src/llm_server.py --port 8001 --isolated
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
