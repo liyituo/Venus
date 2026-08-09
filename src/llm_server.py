@@ -398,12 +398,15 @@ ROUTER_PROMPT = (
     "用户请求：{query}"
 )
 
-# 核心工具集：永远注入（不参与路由），保证查询/任务管理/视觉/技能始终可用
+# 核心工具集：永远注入（不参与路由），保证查询/任务管理/视觉/技能始终可用。
+# create_plan/stop/delegate 为功能与安全必需：plan 模式提交计划、紧急止停、子 agent 委派；
+# create_file 为高频基础写操作（新建不确认，仅覆盖确认）。
 ROUTER_CORE_TOOLS = {
     "list_folder", "read_file", "search_text", "glob_files", "list_symbols",
     "git_status", "git_diff", "git_log", "list_todos", "repo_map",
     "system_status", "load_skill", "view_image",
     "process_output", "list_processes", "create_todo", "update_todo",
+    "create_plan", "stop", "delegate", "create_file",
 }
 
 # 类别 → 追加工具（MCP 按前缀动态展开）
@@ -434,14 +437,17 @@ _router_cache: dict[str, tuple[float, str | None]] = {}   # key -> (时间戳, �
 _router_lock = threading.Lock()
 
 
-def _route_rules(query: str) -> str | None:
-    """关键词规则路由：命中返回类别，未命中返回 None（交给模型路由）。"""
+def _route_rules(query: str) -> frozenset[str] | None:
+    """关键词规则路由：返回所有命中的类别（多关键词合并，如「写个播放器」→ code+music）。
+
+    单类别互斥会让「写个播放器脚本」这类请求只命中 music、丢掉代码工具。
+    """
     q = (query or "").lower()
+    hits = set()
     for cats, kws in ROUTER_RULES:
-        for kw in kws:
-            if kw.lower() in q:
-                return cats[0]
-    return None
+        if any(kw.lower() in q for kw in kws):
+            hits.add(cats[0])
+    return frozenset(hits) if hits else None
 
 
 def _parse_route_output(text: str) -> str | None:
@@ -543,14 +549,101 @@ def _route_tools(messages: list[dict]) -> list[dict] | None:
     return tools
 
 
-def _tools_for_category(cat: str) -> list[dict]:
+def _active_mcp_servers(messages: list[dict], max_rounds: int = 2) -> set[str]:
+    """多轮任务保持：最近 N 轮 assistant tool_calls 里用过的 MCP server。
+
+    路由只按最后一条用户消息分类，多轮任务第二轮会丢掉上一轮的 server
+    （如「播放周杰伦的歌」→ music，下一轮「暂停」→ general 无 spotify）。
+    扫描最近几条 assistant 消息的工具调用记录，把这些 server 的工具保持注入。
+    """
+    servers: set[str] = set()
+    rounds = 0
+    for m in reversed(messages):
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        rounds += 1
+        for tc in m["tool_calls"]:
+            name = (tc.get("function") or {}).get("name", "")
+            if name.startswith("mcp_"):
+                servers.add(name.split("_", 2)[1])
+        if rounds >= max_rounds:
+            break
+    return servers
+
+
+def _tools_for_category(cat: str, known: set[str], all_tools: list[dict]) -> list[dict]:
     """类别 → 工具定义列表（核心集 ∪ 类别工具，过滤不存在的）。"""
-    known = {t["function"]["name"] for t in _agent_tools()}
     names = set(ROUTER_CORE_TOOLS) | ROUTER_CATEGORY_LOCAL.get(cat, set())
     for prefix in ROUTER_CATEGORY_PREFIXES.get(cat, ()):
         names |= {n for n in known if n.startswith(prefix)}
     names &= known
-    return [t for t in _agent_tools() if t["function"]["name"] in names]
+    return [t for t in all_tools if t["function"]["name"] in names]
+
+
+def _route_tools(messages: list[dict]) -> list[dict] | None:
+    """路由入口：返回应注入的工具子集；返回 None = 降级（全量工具）。
+
+    调用链：开关检查 → 缓存 → 规则（多类别合并）→ 模型 → 宽松解析；
+    再叠加「活跃 MCP server」（多轮任务保持）。任一步失败回退全量。
+    """
+    cfg = load_config()
+    if not cfg.get("tool_router"):
+        return None
+    # 取最后一条用户消息作路由依据
+    query = next((m.get("content", "") for m in reversed(messages)
+                  if m.get("role") == "user"), "")
+    if not query:
+        return None
+    cache_key = query[:80]
+    now = time.monotonic()
+    with _router_lock:
+        hit = _router_cache.get(cache_key)
+        if hit and now - hit[0] < ROUTER_CACHE_TTL:
+            cats = hit[1]
+            if cats is not None:
+                tools = _build_routed_tools(cats, messages)
+                log.info("router 缓存命中: %s（%d 工具）", ",".join(sorted(cats)), len(tools))
+                return tools
+            return None
+    # 规则前置（多类别合并）
+    cats = _route_rules(query)
+    src = "规则"
+    if cats is None:
+        # 模型路由
+        try:
+            out = _call_router(query, cfg)
+            cat = _parse_route_output(out)
+            cats = frozenset({cat}) if cat else None
+            src = "模型"
+        except Exception as exc:
+            log.warning("router 模型调用失败（降级全量）: %s", exc)
+            cats = None
+    with _router_lock:
+        _router_cache[cache_key] = (time.monotonic(), cats)
+    if cats is None:
+        log.info("router 未命中（降级全量）: %.60s", query)
+        return None
+    tools = _build_routed_tools(cats, messages)
+    log.info("router %s命中 %s: %d 工具（%.60s）", src,
+             ",".join(sorted(cats)), len(tools), query)
+    return tools
+
+
+def _build_routed_tools(cats: frozenset[str], messages: list[dict]) -> list[dict]:
+    """类别集合 + 活跃 MCP server → 工具定义列表。"""
+    all_tools = _agent_tools()
+    known = {t["function"]["name"] for t in all_tools}
+    names = set(ROUTER_CORE_TOOLS)
+    for cat in cats:
+        names |= ROUTER_CATEGORY_LOCAL.get(cat, set())
+        for prefix in ROUTER_CATEGORY_PREFIXES.get(cat, ()):
+            names |= {n for n in known if n.startswith(prefix)}
+    # 活跃 MCP server（多轮任务保持）：上一轮用过的 server 工具继续注入
+    for server in _active_mcp_servers(messages):
+        prefix = f"mcp_{server}_"
+        names |= {n for n in known if n.startswith(prefix)}
+    names &= known
+    return [t for t in all_tools if t["function"]["name"] in names]
 
 
 class ChatRequest(BaseModel):
@@ -2771,8 +2864,9 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             # 子 agent：工具白名单（只保留声明的工具），优先于路由
             payload["tools"] = [t for t in payload["tools"]
                                 if t["function"]["name"] in tools_filter]
-        elif depth == 0 and tools_filter is None:
+        elif depth == 0 and tools_filter is None and not (plan_mode and plan_submitted):
             # 主循环：工具路由过滤（开关关/降级时 _route_tools 返回 None = 全量）
+            # plan 模式批准后跳过路由：计划内工具可能被路由过滤导致计划执行失败
             routed = _route_tools(messages)
             if routed is not None:
                 payload["tools"] = routed

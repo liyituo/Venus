@@ -39,17 +39,19 @@ def check(name, ok, detail=""):
         print(f"  ✗ {name}  {detail}")
 
 
-# ============ 1. 规则前置 ============
+# ============ 1. 规则前置（多类别合并） ============
 print("== 1. 规则路由 ==")
 cases = [
-    ("播放周杰伦的歌", "music"), ("把这首歌加入歌单", "music"),
-    ("导航去机场", "map"), ("附近有什么咖啡厅", "map"),
-    ("看看 github issue", "github"), ("帮我写个脚本", "code"),
-    ("搜索一下 python 新特性", "search"), ("你好", None),
+    ("播放周杰伦的歌", frozenset({"music"})), ("把这首歌加入歌单", frozenset({"music"})),
+    ("导航去机场", frozenset({"map"})), ("附近有什么咖啡厅", frozenset({"map"})),
+    ("看看 github issue", frozenset({"github"})), ("帮我写个脚本", frozenset({"code"})),
+    ("搜索一下 python 新特性", frozenset({"search"})), ("你好", None),
+    # 多关键词合并：写播放器 → code + music（不能只给 music 丢掉代码工具）
+    ("帮我写个播放音乐的脚本", frozenset({"code", "music"})),
 ]
 for query, expect in cases:
     got = L._route_rules(query)
-    check(f"规则[{query[:10]}...] → {got}", got == expect, f"期望 {expect}")
+    check(f"规则[{query[:12]}...] → {got}", got == expect, f"期望 {expect}")
 
 # ============ 2. 宽松解析 ============
 print("== 2. 宽松解析 ==")
@@ -79,14 +81,31 @@ _fake_tools = (
 _orig_agent_tools = L._agent_tools
 L._agent_tools = lambda: _fake_tools
 try:
-    music_tools = {t["function"]["name"] for t in L._tools_for_category("music")}
+    music_tools = {t["function"]["name"] for t in L._tools_for_category("music", {x["function"]["name"] for x in _fake_tools}, _fake_tools)}
     check("核心工具恒在", L.ROUTER_CORE_TOOLS <= music_tools, str(len(music_tools)))
     check("music 含 spotify", any(n.startswith("mcp_spotify_") for n in music_tools), "")
     check("music 不含 tavily", not any(n.startswith("mcp_tavily_") for n in music_tools), "")
-    code_tools = {t["function"]["name"] for t in L._tools_for_category("code")}
+    code_tools = {t["function"]["name"] for t in L._tools_for_category("code", {x["function"]["name"] for x in _fake_tools}, _fake_tools)}
     check("code 含写工具", "replace_text" in code_tools and "run_shell" in code_tools, "")
-    general_tools = {t["function"]["name"] for t in L._tools_for_category("general")}
+    general_tools = {t["function"]["name"] for t in L._tools_for_category("general", {x["function"]["name"] for x in _fake_tools}, _fake_tools)}
     check("general = 核心集", general_tools == set(L.ROUTER_CORE_TOOLS), "")
+    # 核心集安全工具恒在（create_plan/stop/delegate/create_file）
+    check("核心集含安全工具",
+          {"create_plan", "stop", "delegate", "create_file"} <= set(L.ROUTER_CORE_TOOLS), "")
+    # 多类别合并
+    both = {t["function"]["name"] for t in L._build_routed_tools(frozenset({"code", "music"}), [])}
+    check("多类别合并（code+music）",
+          "replace_text" in both and any(n.startswith("mcp_spotify_") for n in both), "")
+    # 活跃 server 保持：上一轮用过 spotify → 下一轮 general 仍保留 spotify
+    hist = [{"role": "user", "content": "播放音乐"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "x", "type": "function",
+                 "function": {"name": "mcp_spotify_1", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "x", "content": "ok"},
+            {"role": "user", "content": "暂停"}]
+    kept = {t["function"]["name"] for t in L._build_routed_tools(frozenset({"general"}), hist)}
+    check("活跃 server 保持注入（多轮任务不丢）",
+          any(n.startswith("mcp_spotify_") for n in kept), "")
 finally:
     L._agent_tools = _orig_agent_tools
 
