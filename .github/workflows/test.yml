@@ -55,3 +55,6 @@ jobs:
 
       - name: 工具路由测试（规则/解析/映射/缓存/降级/集成）
         run: python tests/tool_router_test.py
+
+      - name: 子 agent 定义结构测试（JSON/name 唯一/tools 合法）
+        run: python tests/agent_defs_test.py

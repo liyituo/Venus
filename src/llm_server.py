@@ -1261,7 +1261,7 @@ AGENT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "agent": {"type": "string", "description": "子 agent 名称（系统提示中的可用子 agent 列表）"},
             "task": {"type": "string", "description": "要委派的任务描述（尽量具体）"},
-            "max_steps": {"type": "integer", "default": 6, "description": "子 agent 工具轮数上限（默认 6）"},
+            "max_steps": {"type": "integer", "default": 10, "description": "子 agent 工具轮数上限（默认 10，最大 12）"},
         }, "required": ["agent", "task"]},
     }},
     {"type": "function", "function": {
@@ -1373,7 +1373,7 @@ def _system_status_text() -> str:
 # ---- 子 Agent（agents/<名称>.json：专业子代理，delegate 委派执行）----
 AGENTS_DIR = BASE_DIR.parent / "agents"
 MAX_AGENT_DEPTH = 2          # 委派深度上限：主 agent(0) → 子 agent(1)，子 agent 不能再委派
-SUBAGENT_MAX_STEPS = 6       # 子 agent 单次任务的工具轮数上限（更保守）
+SUBAGENT_MAX_STEPS = 10      # 子 agent 单次任务的工具轮数上限（与主循环一致；深度任务如代码审查需多轮）
 SUBAGENT_REPLY_CHARS = 2000  # 子 agent 最终回复回传主循环的长度上限
 MAX_IMAGE_BYTES = 10_000_000 # view_image 图片大小上限（10MB）
 VISION_SYSTEM_NOTE = "（视觉分析：view_image 需在配置中提供 vision_api_url/vision_api_key/vision_model）"
@@ -2122,7 +2122,7 @@ def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
              agent_name, depth + 1, len(allowed), task[:80])
     reply = _agent_loop(api_url, headers, sub_msgs, sub_model, temperature,
                         q, cancel, depth=depth + 1,
-                        max_steps=_safe_int(args.get("max_steps"), SUBAGENT_MAX_STEPS, 1, 10),
+                        max_steps=_safe_int(args.get("max_steps"), SUBAGENT_MAX_STEPS, 1, 12),
                         tools_filter=allowed)
     summary = (reply or "（子 agent 无回复）").strip()[:SUBAGENT_REPLY_CHARS]
     return True, f"子 agent {agent_name} 执行完毕，最终回复：\n{summary}"
