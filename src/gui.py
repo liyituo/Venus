@@ -110,28 +110,28 @@ class GuiApp:
     def _build_ui(self) -> None:
         self.root.title("PC Agent Daemon 控制台")
         self.root.geometry("1100x700")
-        self.root.configure(bg="#0d1117")
+        self.root.configure(bg="#050505")
 
         # 顶部状态栏
-        bar = tk.Frame(self.root, bg="#161b22", bd=0, highlightthickness=1,
-                       highlightbackground="#30363d")
+        bar = tk.Frame(self.root, bg="#141419", bd=0, highlightthickness=1,
+                       highlightbackground="#2a2a35")
         bar.pack(fill="x")
-        tk.Label(bar, text="🖥️ PC Agent Daemon", bg="#161b22", fg="#e6edf3",
+        tk.Label(bar, text="🖥️ PC Agent Daemon", bg="#141419", fg="#f8fafc",
                  font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=12, pady=8)
-        self.badge = tk.Label(bar, text="连接中…", bg="#161b22", fg="#8b949e",
+        self.badge = tk.Label(bar, text="连接中…", bg="#141419", fg="#94a3b8",
                               font=("Microsoft YaHei UI", 11, "bold"), padx=10)
         self.badge.pack(side="left", padx=8)
-        self.toast_lbl = tk.Label(bar, text="", bg="#161b22", fg="#8b949e",
+        self.toast_lbl = tk.Label(bar, text="", bg="#141419", fg="#94a3b8",
                                   font=("Microsoft YaHei UI", 10))
         self.toast_lbl.pack(side="left", padx=8)
         self.topmost_var = tk.BooleanVar(value=False)
         tk.Checkbutton(bar, text="窗口置顶", variable=self.topmost_var,
                        command=lambda: self.root.attributes("-topmost", self.topmost_var.get()),
-                       bg="#161b22", fg="#8b949e", activebackground="#161b22",
-                       activeforeground="#e6edf3", selectcolor="#161b22",
+                       bg="#141419", fg="#94a3b8", activebackground="#141419",
+                       activeforeground="#f8fafc", selectcolor="#141419",
                        font=("Microsoft YaHei UI", 10)).pack(side="right", padx=10)
         self.btn_reset = tk.Button(bar, text="恢复 (Reset)", command=self._submit_reset,
-                                   bg="#161b22", fg="#4ade80", activebackground="#1c2128",
+                                   bg="#141419", fg="#4ade80", activebackground="#1e1e26",
                                    activeforeground="#4ade80", relief="flat", bd=0,
                                    padx=12, pady=4, cursor="hand2",
                                    font=("Microsoft YaHei UI", 10, "bold"))
@@ -143,94 +143,94 @@ class GuiApp:
         self.btn_stop.pack(side="right", padx=10, pady=6)
 
         # 主体：左侧预览 + 右侧控制面板
-        main = tk.Frame(self.root, bg="#0d1117")
+        main = tk.Frame(self.root, bg="#050505")
         main.pack(fill="both", expand=True, padx=10, pady=10)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
 
         preview_frame = tk.Frame(main, bg="#000000", highlightthickness=1,
-                                 highlightbackground="#30363d")
+                                 highlightbackground="#2a2a35")
         preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.canvas = tk.Canvas(preview_frame, bg="#000000", highlightthickness=0,
                                 cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.create_text(400, 240, fill="#8b949e", font=("Microsoft YaHei UI", 12),
+        self.canvas.create_text(400, 240, fill="#94a3b8", font=("Microsoft YaHei UI", 12),
                                 text="正在连接 Daemon…", tags="placeholder")
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         tk.Label(preview_frame, text="点击画面 = 在对应位置点击电脑",
-                 bg="#000000", fg="#8b949e", font=("Microsoft YaHei UI", 9),
+                 bg="#000000", fg="#94a3b8", font=("Microsoft YaHei UI", 9),
                  anchor="w").pack(fill="x", padx=8, pady=4)
 
-        side = tk.Frame(main, bg="#0d1117", width=330)
+        side = tk.Frame(main, bg="#050505", width=330)
         side.grid(row=0, column=1, sticky="ns")
         side.pack_propagate(False)
 
         # 状态信息
-        info = tk.Frame(side, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
+        info = tk.Frame(side, bg="#141419", highlightthickness=1, highlightbackground="#2a2a35")
         info.pack(fill="x", pady=(0, 8))
         self._kv_rows = {}
         for label in ("屏幕权限", "屏幕分辨率", "排队任务", "最近动作", "FAILSAFE"):
-            row = tk.Frame(info, bg="#161b22")
+            row = tk.Frame(info, bg="#141419")
             row.pack(fill="x", padx=10, pady=2)
-            tk.Label(row, text=label, bg="#161b22", fg="#8b949e", width=8, anchor="w",
+            tk.Label(row, text=label, bg="#141419", fg="#94a3b8", width=8, anchor="w",
                      font=("Microsoft YaHei UI", 10)).pack(side="left")
-            val = tk.Label(row, text="—", bg="#161b22", fg="#e6edf3", anchor="w",
+            val = tk.Label(row, text="—", bg="#141419", fg="#f8fafc", anchor="w",
                            font=("Microsoft YaHei UI", 10))
             val.pack(side="left", fill="x", expand=True)
             self._kv_rows[label] = val
 
         # 命令面板
-        cmd = tk.Frame(side, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
+        cmd = tk.Frame(side, bg="#141419", highlightthickness=1, highlightbackground="#2a2a35")
         cmd.pack(fill="x", pady=(0, 8))
-        tk.Label(cmd, text="命令面板", bg="#161b22", fg="#8b949e",
+        tk.Label(cmd, text="命令面板", bg="#141419", fg="#94a3b8",
                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
 
-        text_row = tk.Frame(cmd, bg="#161b22")
+        text_row = tk.Frame(cmd, bg="#141419")
         text_row.pack(fill="x", padx=10, pady=2)
-        self.text_entry = tk.Entry(text_row, bg="#1c2128", fg="#e6edf3", insertbackground="#e6edf3",
+        self.text_entry = tk.Entry(text_row, bg="#1e1e26", fg="#f8fafc", insertbackground="#f8fafc",
                                    relief="flat", font=("Microsoft YaHei UI", 10))
         self.text_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        tk.Button(text_row, text="输入文字", command=self._submit_type, bg="#21262d", fg="#e6edf3",
-                  activebackground="#30363d", relief="flat", cursor="hand2",
+        tk.Button(text_row, text="输入文字", command=self._submit_type, bg="#2a2a35", fg="#f8fafc",
+                  activebackground="#2a2a35", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei UI", 10)).pack(side="left", padx=(6, 0))
 
-        key_row = tk.Frame(cmd, bg="#161b22")
+        key_row = tk.Frame(cmd, bg="#141419")
         key_row.pack(fill="x", padx=10, pady=2)
-        self.key_entry = tk.Entry(key_row, bg="#1c2128", fg="#e6edf3", insertbackground="#e6edf3",
+        self.key_entry = tk.Entry(key_row, bg="#1e1e26", fg="#f8fafc", insertbackground="#f8fafc",
                                   relief="flat", font=("Consolas", 10))
         self.key_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        tk.Button(key_row, text="按键", command=self._submit_key, bg="#21262d", fg="#e6edf3",
-                  activebackground="#30363d", relief="flat", cursor="hand2",
+        tk.Button(key_row, text="按键", command=self._submit_key, bg="#2a2a35", fg="#f8fafc",
+                  activebackground="#2a2a35", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei UI", 10)).pack(side="left", padx=(6, 0))
 
-        chips = tk.Frame(cmd, bg="#161b22")
+        chips = tk.Frame(cmd, bg="#141419")
         chips.pack(fill="x", padx=10, pady=6)
         for i, key in enumerate(["enter", "esc", "tab", "space", "ctrl+c", "ctrl+v", "ctrl+a", "alt+tab"]):
-            tk.Button(chips, text=key, bg="#21262d", fg="#c9d1d9", activebackground="#30363d",
+            tk.Button(chips, text=key, bg="#2a2a35", fg="#c9d1d9", activebackground="#2a2a35",
                       relief="flat", cursor="hand2", font=("Consolas", 9), padx=6,
                       command=lambda k=key: self._submit_execute({"action": "press_key", "key": k})
                       ).grid(row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
         chips.columnconfigure((0, 1, 2, 3), weight=1)
         self.dbl_var = tk.BooleanVar(value=False)
         tk.Checkbutton(cmd, text="画面点击使用双击", variable=self.dbl_var,
-                       bg="#161b22", fg="#8b949e", activebackground="#161b22",
-                       activeforeground="#e6edf3", selectcolor="#161b22",
+                       bg="#141419", fg="#94a3b8", activebackground="#141419",
+                       activeforeground="#f8fafc", selectcolor="#141419",
                        font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=10, pady=(0, 8))
         self.refresh_var = tk.BooleanVar(value=True)
         tk.Checkbutton(cmd, text="自动刷新画面", variable=self.refresh_var,
-                       bg="#161b22", fg="#8b949e", activebackground="#161b22",
-                       activeforeground="#e6edf3", selectcolor="#161b22",
+                       bg="#141419", fg="#94a3b8", activebackground="#141419",
+                       activeforeground="#f8fafc", selectcolor="#141419",
                        font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=10, pady=(0, 4))
-        tk.Button(cmd, text="刷新画面", command=self._submit_refresh, bg="#21262d", fg="#e6edf3",
-                  activebackground="#30363d", relief="flat", cursor="hand2",
+        tk.Button(cmd, text="刷新画面", command=self._submit_refresh, bg="#2a2a35", fg="#f8fafc",
+                  activebackground="#2a2a35", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=10, pady=(0, 10))
 
         # 日志区
-        log_frame = tk.Frame(side, bg="#161b22", highlightthickness=1, highlightbackground="#30363d")
+        log_frame = tk.Frame(side, bg="#141419", highlightthickness=1, highlightbackground="#2a2a35")
         log_frame.pack(fill="both", expand=True)
-        tk.Label(log_frame, text="日志", bg="#161b22", fg="#8b949e",
+        tk.Label(log_frame, text="日志", bg="#141419", fg="#94a3b8",
                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-        self.log_text = tk.Text(log_frame, bg="#0d1117", fg="#8b949e", relief="flat",
+        self.log_text = tk.Text(log_frame, bg="#050505", fg="#94a3b8", relief="flat",
                                 font=("Consolas", 9), height=8, state="disabled", wrap="none")
         self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -485,18 +485,18 @@ class GuiApp:
         self._submit_execute({"action": "click", "x": x, "y": y, "clicks": clicks}, silent=True)
 
     # ----------------------------------------------------------- 通用
-    def _toast(self, msg: str, color: str = "#8b949e") -> None:
+    def _toast(self, msg: str, color: str = "#94a3b8") -> None:
         self.toast_lbl.config(text=msg, fg=color)
         self.root.after(3000, lambda: self.toast_lbl.config(text=""))
 
     def _ui_log(self, msg: str, kind: str = "info") -> None:
-        colors = {"ok": "#4ade80", "err": "#f87171", "info": "#8b949e"}
+        colors = {"ok": "#4ade80", "err": "#f87171", "info": "#94a3b8"}
         self.log_text.config(state="normal")
         stamp = time.strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{stamp}] {msg}\n", kind)
         self.log_text.tag_configure("ok", foreground="#4ade80")
         self.log_text.tag_configure("err", foreground="#f87171")
-        self.log_text.tag_configure("info", foreground="#8b949e")
+        self.log_text.tag_configure("info", foreground="#94a3b8")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
