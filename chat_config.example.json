@@ -8,5 +8,8 @@
   "reasoning_mode": "max",
   "vision_api_url": "",
   "vision_api_key": "",
-  "vision_model": ""
+  "vision_model": "",
+  "tool_router": false,
+  "tool_router_url": "http://127.0.0.1:11434",
+  "tool_router_model": "gemma3:1b"
 }

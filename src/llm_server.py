@@ -323,6 +323,9 @@ def load_config() -> dict:
         "vision_api_url": "",      # 视觉模型（view_image 用）：OpenAI 兼容地址，如 https://dashscope.aliyuncs.com/compatible-mode/v1
         "vision_api_key": "",
         "vision_model": "",
+        "tool_router": False,      # 工具路由：本地小模型先选工具子集，防 MCP 工具定义挤爆上下文
+        "tool_router_url": "http://127.0.0.1:11434",   # Ollama 地址（Windows 侧，Mirrored 网络直通）
+        "tool_router_model": "gemma3:1b",
     }
     if CONFIG_PATH.exists():
         try:
@@ -371,6 +374,185 @@ def normalize_url(raw: str) -> str:
     return url + "/v1/chat/completions"
 
 
+# ==========================================================================
+# 工具路由（Tool Router）：本地小模型先选工具子集，防 MCP 工具定义挤爆上下文。
+# 流程：规则关键词命中 → 直接用；未命中 → gemma3:1b 分类 → 宽松解析；
+#       结果 ∪ 核心工具集（永远注入）；Ollama 不可达/超时 → 全量工具（降级）。
+# 只影响「主模型可见的工具」，不影响权限/确认机制；子 agent 白名单优先于路由。
+# ==========================================================================
+ROUTER_TIMEOUT = 5.0        # 路由调用超时（秒）：gemma3:1b 热推理 ~2.2s，留余量
+ROUTER_CACHE_TTL = 300      # 路由结果缓存（秒）：同类请求只路由一次
+# 模型可能输出中文类别：映射回英文
+ROUTER_CN_CATEGORY = {"音乐": "music", "搜索": "search", "地图": "map",
+                      "代码": "code", "其他": "general", "天气": "search",
+                      "查询": "search", "系统": "general", "任务": "general"}
+ROUTER_PROMPT = (
+    "你是工具路由器。根据用户请求，从以下类别中选择最合适的一个：\n"
+    "- music: 播放/歌单/歌曲/音乐/歌手/专辑（Spotify）\n"
+    "- search: 网络搜索/查询信息/新闻/资讯/天气（Tavily）\n"
+    "- map: 地图/导航/路线/附近/位置/怎么走（高德）\n"
+    "- code: 代码/文件/脚本/编辑/创建/删除/git/终端/命令/运行/测试（本地编程工具）\n"
+    "- github: 仓库/issue/PR/CI/提交记录\n"
+    "- general: 其他/寒暄/系统状态/任务管理\n"
+    "只输出 JSON：{{\"category\": \"xxx\", \"reason\": \"一句话理由\"}}\n"
+    "用户请求：{query}"
+)
+
+# 核心工具集：永远注入（不参与路由），保证查询/任务管理/视觉/技能始终可用
+ROUTER_CORE_TOOLS = {
+    "list_folder", "read_file", "search_text", "glob_files", "list_symbols",
+    "git_status", "git_diff", "git_log", "list_todos", "repo_map",
+    "system_status", "load_skill", "view_image",
+    "process_output", "list_processes", "create_todo", "update_todo",
+}
+
+# 类别 → 追加工具（MCP 按前缀动态展开）
+ROUTER_CATEGORY_PREFIXES = {
+    "music": ("mcp_spotify_",),
+    "search": ("mcp_tavily_",),
+    "map": ("mcp_amap_",),
+    "github": ("mcp_github_",),
+    "code": (),
+    "general": (),
+}
+ROUTER_CATEGORY_LOCAL = {  # 类别额外注入的本地工具
+    "code": {"create_folder", "create_file", "replace_text", "undo",
+             "run_code", "run_shell", "start_process", "stop_process", "git_commit"},
+}
+
+# 规则前置：关键词 → 类别（覆盖高频场景，零延迟零成本）
+ROUTER_RULES = [
+    (("music",), ("播放", "歌单", "歌曲", "音乐", "歌手", "专辑", "听歌", "spotify", "周杰伦")),
+    (("map",), ("地图", "导航", "路线", "附近", "怎么走", "定位", "位置", "地址")),
+    (("github",), ("github", "issue", "pull request", "pr", "仓库", "ci", "提交记录")),
+    (("code",), ("代码", "文件", "脚本", "修改", "编辑", "创建", "删除", "git ",
+                 "终端", "命令", "运行", "测试", "报错", "函数", "目录", "配置")),
+    (("search",), ("搜索", "搜一下", "查一下", "新闻", "资讯", "了解一下", "天气")),
+]
+
+_router_cache: dict[str, tuple[float, str | None]] = {}   # key -> (时间戳, 类别/None=全量)
+_router_lock = threading.Lock()
+
+
+def _route_rules(query: str) -> str | None:
+    """关键词规则路由：命中返回类别，未命中返回 None（交给模型路由）。"""
+    q = (query or "").lower()
+    for cats, kws in ROUTER_RULES:
+        for kw in kws:
+            if kw.lower() in q:
+                return cats[0]
+    return None
+
+
+def _parse_route_output(text: str) -> str | None:
+    """宽松解析路由模型输出：JSON → 裸词 → 关键词（含中文类别）。失败返回 None。"""
+    if not text:
+        return None
+    t = text.strip()
+    candidates = []
+    # 1) 完整 JSON（英文或中文类别值）
+    try:
+        cat = json.loads(t).get("category")
+        if cat:
+            candidates.append(cat)
+    except Exception:
+        pass
+    # 2) 提取 JSON 片段中的 category 字段：先反转义（\" → "）再匹配，
+    #    兼容模型输出的转义 JSON（\"category\": \"其他\" 形态）
+    import re
+    unescaped = t.replace('\\"', '"')
+    for m in re.finditer(r'"category"\s*:\s*"([^"]+)"', unescaped):
+        candidates.append(m.group(1))
+    # 3) 裸词/文本中的类别词
+    for cat in ROUTER_CATEGORY_PREFIXES:
+        if re.search(rf"\b{cat}\b", t.lower()):
+            candidates.append(cat)
+    for cat in ROUTER_CN_CATEGORY:
+        if cat in t:
+            candidates.append(ROUTER_CN_CATEGORY[cat])
+    for cand in candidates:
+        norm = ROUTER_CN_CATEGORY.get(str(cand).strip().lower(), str(cand).strip().lower())
+        if norm in ROUTER_CATEGORY_PREFIXES:
+            return norm
+    return None
+
+
+def _call_router(query: str, cfg: dict) -> str | None:
+    """调用本地路由模型（Ollama）。强制直连（防代理劫持 127.0.0.1）；失败返回 None。
+
+    keep_alive 保活：模型常驻内存，避免每次冷加载导致路由超时。
+    """
+    url = (cfg.get("tool_router_url") or "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+    model = cfg.get("tool_router_model") or "gemma3:1b"
+    payload = {"model": model, "stream": False,
+               "keep_alive": "10m",   # 保活：路由请求频繁，防冷加载超时
+               "options": {"temperature": 0, "num_ctx": 512},   # 路由 prompt 短，小上下文提速
+               "messages": [{"role": "user",
+                             "content": ROUTER_PROMPT.format(query=query[:500])}]}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 直连
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    with opener.open(req, timeout=ROUTER_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get("message", {}).get("content") or ""
+
+
+def _route_tools(messages: list[dict]) -> list[dict] | None:
+    """路由入口：返回应注入的工具子集；返回 None = 降级（全量工具）。
+
+    调用链：开关检查 → 缓存 → 规则 → 模型 → 宽松解析；任一步失败回退全量。
+    """
+    cfg = load_config()
+    if not cfg.get("tool_router"):
+        return None
+    # 取最后一条用户消息作路由依据
+    query = next((m.get("content", "") for m in reversed(messages)
+                  if m.get("role") == "user"), "")
+    if not query:
+        return None
+    cache_key = query[:80]
+    now = time.monotonic()
+    with _router_lock:
+        hit = _router_cache.get(cache_key)
+        if hit and now - hit[0] < ROUTER_CACHE_TTL:
+            cat = hit[1]
+            if cat is not None:
+                tools = _tools_for_category(cat)
+                log.info("router 缓存命中: %s（%d 工具）", cat, len(tools))
+                return tools
+            return None
+    # 规则前置
+    cat = _route_rules(query)
+    src = "规则"
+    if cat is None:
+        # 模型路由
+        try:
+            out = _call_router(query, cfg)
+            cat = _parse_route_output(out)
+            src = "模型"
+        except Exception as exc:
+            log.warning("router 模型调用失败（降级全量）: %s", exc)
+            cat = None
+    with _router_lock:
+        _router_cache[cache_key] = (time.monotonic(), cat)
+    if cat is None:
+        log.info("router 未命中（降级全量）: %.60s", query)
+        return None
+    tools = _tools_for_category(cat)
+    log.info("router %s命中 %s: %d 工具（%.60s）", src, cat, len(tools), query)
+    return tools
+
+
+def _tools_for_category(cat: str) -> list[dict]:
+    """类别 → 工具定义列表（核心集 ∪ 类别工具，过滤不存在的）。"""
+    known = {t["function"]["name"] for t in _agent_tools()}
+    names = set(ROUTER_CORE_TOOLS) | ROUTER_CATEGORY_LOCAL.get(cat, set())
+    for prefix in ROUTER_CATEGORY_PREFIXES.get(cat, ()):
+        names |= {n for n in known if n.startswith(prefix)}
+    names &= known
+    return [t for t in _agent_tools() if t["function"]["name"] in names]
+
+
 class ChatRequest(BaseModel):
     messages: list[dict] = Field(..., description="OpenAI 格式的消息列表")
     model: str | None = Field(default=None, description="覆盖配置中的模型名")
@@ -409,6 +591,15 @@ async def _warmup_mcp() -> None:
     if os.environ.get("PCAGENT_DISABLE_MCP"):
         return
     threading.Thread(target=_ensure_mcp, daemon=True, name="mcp-warmup").start()
+    # 工具路由预热：把本地路由模型加载进内存（防首个路由请求冷加载超时）
+    if load_config().get("tool_router"):
+        def _warm_router():
+            try:
+                _call_router("ping", load_config())
+                log.info("工具路由模型已预热")
+            except Exception:
+                pass
+        threading.Thread(target=_warm_router, daemon=True, name="router-warmup").start()
 
 
 @app.get("/api/v1/confirm-mode", summary="查看当前问询模式")
@@ -2577,9 +2768,14 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
         payload = {"model": model, "messages": messages, "temperature": temperature,
                    "tools": _agent_tools()}
         if tools_filter is not None:
-            # 子 agent：工具白名单（只保留声明的工具）
+            # 子 agent：工具白名单（只保留声明的工具），优先于路由
             payload["tools"] = [t for t in payload["tools"]
                                 if t["function"]["name"] in tools_filter]
+        elif depth == 0 and tools_filter is None:
+            # 主循环：工具路由过滤（开关关/降级时 _route_tools 返回 None = 全量）
+            routed = _route_tools(messages)
+            if routed is not None:
+                payload["tools"] = routed
         _apply_reasoning(payload)
         try:
             data = _call_upstream_raw(api_url, payload, headers)
@@ -2931,4 +3127,11 @@ if __name__ == "__main__":
         log.warning("隔离模式：屏幕操作工具已禁用，仅保留 %s", sorted(_FILE_TOOLS))
     if args.token:
         log.warning("token 鉴权已启用，客户端需携带 X-Api-Token 头")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # Windows（含 Mirrored 共享网络栈的 WSL）上 TIME_WAIT 连接会阻止 bind：
+    # 预绑定 socket 并设 SO_REUSEADDR，避免旧进程退出后端口短暂不可用
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((args.host, args.port))
+    sock.listen(2048)
+    uvicorn.Server(uvicorn.Config(app, log_level="info")).run(sockets=[sock])

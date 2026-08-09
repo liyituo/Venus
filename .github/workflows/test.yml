@@ -52,3 +52,6 @@ jobs:
             tail -60 /tmp/subagent_out.txt
             exit $EXIT
           fi
+
+      - name: 工具路由测试（规则/解析/映射/缓存/降级/集成）
+        run: python tests/tool_router_test.py
