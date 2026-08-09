@@ -62,7 +62,7 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 ## 用法：对话就是操作
 
-模型在对话里按需调用 29 个工具，不用配置：
+模型在对话里按需调用工具（本地 30+ 个 + MCP 生态，当前共 100+），不用配置：
 
 - **屏幕**：看分辨率、点击、输入文字、按按键、截图
 - **文件**：建文件夹、浏览目录、读写文件、`search_text` 代码检索、`list_symbols` 看函数结构
@@ -104,8 +104,21 @@ description: 每日简报：搜科技新闻 + 查系统状态，汇总成简报
 }
 ```
 
-- 安全护栏：子 agent **不能再委派**（深度 ≤ 2 层）、轮数上限 6、写操作仍走确认、plan 模式仅主循环生效
-- `/agents`（cli/Telegram）查看列表；任务适合子 agent 时模型自动 `delegate`，也可显式说「委派给 vision」
+- 安全护栏：子 agent **不能再委派**（深度 ≤ 2 层）、轮数上限 10、写操作仍走确认、plan 模式仅主循环生效
+- `/agents`（cli/Telegram）查看列表；任务适合子 agent 时模型自动 `delegate`，也可显式说「委派给 code-review 审查代码」
+
+**内置子 agent 团队**（`agents/` 目录，零代码扩展——放一个 JSON 即启用）：
+
+| 子 agent | 用途 |
+| --- | --- |
+| `vision` | 视觉分析：查看图片/截图并描述（需配置视觉模型） |
+| `code-review` | 代码审查：git 改动 → 问题清单分级 + 建议 |
+| `code-architect` | 架构分析：项目结构、模块职责、重构建议 |
+| `test-runner` | 测试执行与诊断：跑测试、分析失败、定位原因 |
+| `web-researcher` | 网络研究：多轮搜索、交叉验证、结构化报告 |
+| `news-brief` | 新闻简报：最新资讯汇总（适合配合 `/schedule`） |
+| `trip-planner` | 出行规划：路线方案对比 + 周边 POI 推荐 |
+| `playlist-curator` | 歌单策展：按主题搜歌、建歌单、加歌 |
 
 **视觉操作（view_image）**：把图片（工作区路径，如 Telegram 上传的截图）发给配置的视觉模型分析。DeepSeek 无视觉能力，需在 `chat_config.json` 配一个 OpenAI 兼容视觉模型，如通义千问 qwen-vl：
 
@@ -222,8 +235,8 @@ src/                源代码（app / llm_server / 五个前端 / mock_llm 测�
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
-tests/              九套测试（共 232 断言）
-.github/workflows/  CI（push 自动跑九套测试）
+tests/              十一套测试（共 324 断言）
+.github/workflows/  CI（push 自动跑十一套测试）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
@@ -239,13 +252,16 @@ mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
 .venv\Scripts\python tests\llm_tools_test.py    # 编程工具（69 断言：检索/编辑/undo/git/进程/todo/repo）
 .venv\Scripts\python tests\agent_loop_test.py   # agent 循环端到端（33 断言：ask+diff/todo/上下文上界/plan）
 .venv\Scripts\python tests\session_test.py      # 会话持久化（30 断言：CRUD/重启恢复/上限）
-.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（21 断言：echo server 全链路/命名解析/白名单）
+.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（33 断言：echo server 全链路/命名解析/白名单/amap/重连）
 .venv\Scripts\python tests\cli_session_test.py  # CLI 会话（13 断言：摘要/懒加载/降级）
 .venv\Scripts\python tests\reasoning_test.py    # 推理强度（14 断言：档位映射/持久化/校验）
 .venv\Scripts\python tests\skill_system_test.py # 技能包与系统监控（14 断言：扫描/加载/免确认/降级）
+.venv\Scripts\python tests\subagent_test.py     # 子 agent 委派（13 断言：delegate 链路/透传/深度/白名单）
+.venv\Scripts\python tests\tool_router_test.py  # 工具路由（34 断言：规则/解析/映射/缓存/降级）
+.venv\Scripts\python tests\agent_defs_test.py   # 子 agent 定义结构（50 断言：JSON/name 唯一/tools 合法）
 .venv\Scripts\python src\mock_llm.py            # 无 Key 时本地假 API 验证全链路
 ```
 
-推送后 GitHub Actions 自动跑八套测试（共 215 断言），回归结果在 Actions 页面一眼可见。
+推送后 GitHub Actions 自动跑十一套测试（共 324 断言），回归结果在 Actions 页面一眼可见。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。
