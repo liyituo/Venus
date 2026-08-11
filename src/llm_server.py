@@ -71,15 +71,15 @@ DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 # ---- R3：全局工具结果存储（LRU）与提示词缓存管理器 ----
 _result_store = ResultStore()
 _prompt_cache = PromptCacheManager()
-# 结果压缩上限：工具结果回传模型的最大长度（head/tail/error 分区保留）
-MAX_TOOL_RESULT_CHARS = 1500
+# 结果压缩上限：工具结果回传模型的最大长度（head/tail/error 分区保留，错误不丢）
+MAX_TOOL_RESULT_CHARS = 800
 
 # ---- Agent 安全锁（防循环调用导致系统崩溃）----
-MAX_TOOL_STEPS = 10             # 单次请求最多工具轮数
-MAX_TOOL_CALLS_TOTAL = 30       # 单次请求工具调用总数上限（一轮可含多个调用）
+MAX_TOOL_STEPS = 20             # 单次请求最多工具轮数
+MAX_TOOL_CALLS_TOTAL = 50       # 单次请求工具调用总数上限（一轮可含多个调用）
 MAX_TOOL_CALLS_PER_ROUND = 8    # 单轮 tool_calls 硬上限：模型一次返回过多调用直接整批拒绝
 MAX_CONSECUTIVE_FAILURES = 4    # 连续失败熔断阈值：达到即停止整个任务
-MAX_AGENT_SECONDS = 420         # 单次 agent 请求总耗时上限（含上游生成时间；max 推理思考较久，放宽至 7 分钟）
+MAX_AGENT_SECONDS = 900         # 单次 agent 请求总耗时上限（含上游生成时间；50 次工具调用任务约需 15 分钟）
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
 _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 agent 循环
 
@@ -372,7 +372,7 @@ def normalize_url(raw: str) -> str:
 #       结果 ∪ 核心工具集（永远注入）；Ollama 不可达/超时 → 全量工具（降级）。
 # 只影响「主模型可见的工具」，不影响权限/确认机制；子 agent 白名单优先于路由。
 # ==========================================================================
-ROUTER_TIMEOUT = 5.0        # 路由调用超时（秒）：gemma3:1b 热推理 ~2.2s，留余量
+ROUTER_TIMEOUT = 30.0       # 路由调用超时（秒）：1b 热推理 ~2s；8B 模型冷加载需 20s+
 ROUTER_CACHE_TTL = 300      # 路由结果缓存（秒）：同类请求只路由一次
 # 模型可能输出中文类别：映射回英文
 ROUTER_CN_CATEGORY = {"音乐": "music", "搜索": "search", "地图": "map",
@@ -4184,6 +4184,77 @@ def _execute_tool(name: str, arguments: str,
 _READ_CACHE_TTL = 30.0            # 缓存有效期（秒）
 _READ_CACHE_PATH_ARGS = ("path", "file", "src", "dst", "folder", "directory")
 
+# ---- R3：agent 循环历史窗口（防上下文线性膨胀）----
+_HISTORY_WINDOW_ROUNDS = 8        # 发送给上游保留的最近轮数；更早轮次压缩为摘要
+_HISTORY_SUMMARY_CHARS = 700      # 早期轮次摘要长度上限
+
+
+def _compact_early_rounds(early: list[dict]) -> str:
+    """把早期已完成轮次压缩为紧凑摘要（工具名 + 结果首行）。
+
+    只记录外部可验证的事实（做了什么/结果如何），不保留原始大输出——
+    模型在后续轮次通常只需知道「已完成 X，结果 Y」，细节可通过 fetch_result 取回。
+    """
+    parts: list[str] = []
+    for m in early:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                name = fn.get("name") or "?"
+                args_txt = ""
+                try:
+                    a = json.loads(fn.get("arguments") or "{}")
+                    if isinstance(a, dict):
+                        p = a.get("path") or a.get("file")
+                        if isinstance(p, str) and p:
+                            args_txt = f" {p}"
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                parts.append(f"{name}{args_txt}")
+        elif m.get("role") == "tool":
+            content = str(m.get("content") or "")
+            first = content.splitlines()[0][:50] if content else ""
+            if first:
+                parts.append(f"→{first}")
+    text = "；".join(parts)
+    return text[:_HISTORY_SUMMARY_CHARS]
+
+
+def _window_messages(messages: list[dict]) -> list[dict]:
+    """发送给上游的消息窗口：system + 用户目标 + 最近 N 轮完整消息；
+    更早的已完成轮次压缩为一条紧凑摘要（assistant/tool 配对保持完整）。
+
+    只读操作，不修改传入列表；轮数未超限时原样返回（零开销）。
+    """
+    sys_end = 0
+    while sys_end < len(messages) and messages[sys_end].get("role") == "system":
+        sys_end += 1
+    rest = messages[sys_end:]
+    # 用户目标消息（首个非 system 段，通常 1-2 条）必须保留
+    user_end = 0
+    while user_end < len(rest) and rest[user_end].get("role") == "user":
+        user_end += 1
+    body = rest[user_end:]
+    # 按 assistant 消息分轮（每轮: assistant(tool_calls) + 其后的 tool 结果）
+    round_starts: list[int] = []
+    for i, m in enumerate(body):
+        if m.get("role") == "assistant":
+            round_starts.append(i)
+    if len(round_starts) <= _HISTORY_WINDOW_ROUNDS:
+        return messages
+    keep_start = round_starts[-_HISTORY_WINDOW_ROUNDS]
+    early = body[:keep_start]
+    keep = body[keep_start:]
+    summary = _compact_early_rounds(early)
+    if not summary:
+        return messages
+    log.debug("history window: %d 轮 → 摘要（保留最近 %d 轮）",
+              len(round_starts), _HISTORY_WINDOW_ROUNDS)
+    return messages[:sys_end] + rest[:user_end] + [
+        {"role": "system",
+         "content": f"（早期执行记录，用于替代已完成轮次的原始消息）{summary}"},
+    ] + keep
+
 
 def _read_cache_key(name: str, args: dict) -> tuple[str, str]:
     return (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
@@ -4295,7 +4366,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
             return f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"
 
-        payload = {"model": model, "messages": messages, "temperature": temperature,
+        payload = {"model": model, "messages": _window_messages(messages),
+                   "temperature": temperature,
                    "tools": _agent_tools()}
         if tools_filter is not None:
             # 子 agent：工具白名单（只保留声明的工具），优先于路由

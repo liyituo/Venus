@@ -456,28 +456,39 @@ def _summarize_result(result: str, ok: bool) -> str:
     try:
         d = json.loads(result)
     except Exception:
-        return (result or "").strip()[:100]
+        return (result or "").strip()[:60]
     if isinstance(d, dict):
         if ok:
             out = (d.get("stdout") or "").strip()
             if out:
                 lines = out.splitlines()
-                return lines[0][:100] + (" …" if len(lines) > 1 else "")
+                return lines[0][:60] + (" …" if len(lines) > 1 else "")
             return "完成"
         if d.get("error"):
-            return str(d["error"])[:100]
+            return str(d["error"])[:60]
         rc = d.get("exit_code")
         return f"失败（exit {rc}）" if rc is not None else "失败"
-    return (result or "").strip()[:100]
+    return (result or "").strip()[:60]
 
 
-def _fmt_args(arguments: str, limit: int = 120) -> str:
-    """工具调用参数显示：JSON 解析后截断（replace_text 的 old/new 等长文本不刷屏）。"""
+def _fmt_args(arguments: str, limit: int = 70) -> str:
+    """工具调用参数显示（紧凑版）：长文本参数只显示长度，其余截断。
+    create_file/run_code 等的大段 content/code 不再刷屏。"""
     try:
         args = json.loads(arguments or "{}")
-        text = ", ".join(f"{k}={v}" for k, v in args.items()) or "—"
     except Exception:
-        text = str(arguments or "—")
+        return str(arguments or "—")[:limit]
+    if not isinstance(args, dict) or not args:
+        return "—"
+    parts = []
+    for k, v in args.items():
+        s = str(v)
+        if k in ("text", "content", "code", "old", "new", "command", "prompt",
+                 "task", "message", "steps"):
+            parts.append(f"{k}=<{len(s)}字>")
+        else:
+            parts.append(f"{k}={s[:40]}")
+    text = ", ".join(parts)
     return text[:limit] + (" …" if len(text) > limit else "")
 
 
@@ -553,12 +564,12 @@ class Cli:
         self.client.api("DELETE", f"/api/v1/sessions/{self.current}/messages", timeout=5)
         print(color("已清空当前会话历史", "cyan"))
 
-    # ---- 事件渲染 ----
+    # ---- 事件渲染（紧凑模式：工具行单行显示，不刷长参数/长结果）----
     def on_event(self, kind: str, payload) -> Optional[str]:
         if kind == "tool_call":
             arg_str = _fmt_args(payload.get("arguments") or "")
             step = payload.get("step")
-            step_str = f"（轮次 {step}/{payload.get('max_steps')}）" if step else ""
+            step_str = f"({step}/{payload.get('max_steps')})" if step else ""
             print(color(f"  ⚙ [{payload.get('name')}] {arg_str} {step_str}", "blue"), flush=True)
         elif kind == "tool_result":
             ok = payload.get("ok")

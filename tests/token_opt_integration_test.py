@@ -184,5 +184,49 @@ check("prefix 缓存指标存在", "prefix_cache" in data)
 r2 = c.get("/api/v1/health")
 check("health 含 usage 摘要", "usage" in r2.json(), str(r2.json().keys())[:120])
 
+# ============ 7. agent 循环历史窗口（防上下文线性膨胀）============
+print("== 7. 历史窗口裁剪 ==")
+
+
+def _make_history(rounds: int) -> list:
+    msgs = [{"role": "system", "content": "安全规则"}]
+    msgs.append({"role": "user", "content": "写一个 todo 项目"})
+    for i in range(1, rounds + 1):
+        msgs.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"t{i}", "type": "function",
+             "function": {"name": "create_file",
+                          "arguments": json.dumps({"path": f"f{i}.py"})}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"t{i}",
+                     "content": f"文件已创建 f{i}.py"})
+    return msgs
+
+
+big = _make_history(12)
+out = L._window_messages(big)
+check("超限后消息数下降", len(out) < len(big), f"{len(big)}→{len(out)}")
+roles = [m["role"] for m in out]
+check("system 全部保留", roles.count("system") >= 2)
+check("用户目标保留", "user" in roles)
+check("早期摘要注入", any("早期执行记录" in (m.get("content") or "") for m in out))
+check("摘要含工具名", any("create_file" in (m.get("content") or "") for m in out))
+# assistant/tool 配对完整（OpenAI API 硬性要求）
+pair_ok = True
+for i, m in enumerate(out):
+    if m.get("role") == "assistant" and m.get("tool_calls"):
+        n = len(m["tool_calls"])
+        for j in range(1, n + 1):
+            if i + j >= len(out) or out[i + j].get("role") != "tool":
+                pair_ok = False
+check("assistant/tool 配对完整", pair_ok)
+check("最近 8 轮工具结果保留", len([m for m in out if m["role"] == "tool"]) == 8)
+small = _make_history(5)
+check("轮数未超限原样返回", L._window_messages(small) is small)
+# 当前轮（最后一轮 assistant+tool）绝不被压缩
+last_round = [m for m in out if m.get("tool_call_id") == "t12"]
+check("最新轮消息完整保留", len(last_round) == 1 and last_round[0]["tool_call_id"] == "t12"
+      and "f12" in last_round[0]["content"])
+# MAX_TOOL_RESULT_CHARS 已收紧到 800
+check("工具结果上限收紧到 800", L.MAX_TOOL_RESULT_CHARS <= 800)
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
