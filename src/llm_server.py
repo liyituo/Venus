@@ -1955,8 +1955,13 @@ def _safe_join(workspace: Path, rel: str) -> Path | None:
 
 def _iter_workspace_files(workspace: Path, root: Path | None = None, max_files: int = 5000):
     """惰性遍历工作区文件（os.walk 逐目录，不整树载入内存）：跳过 SKIP_DIRS 与隐藏目录。
-    yield (绝对路径, 相对工作区的 posix 路径)。"""
-    root = root or workspace
+    yield (绝对路径, 相对工作区的 posix 路径)。
+
+    root 先 resolve 再遍历：Windows 8.3 短路径（RUNNER~1 等）/ junction 场景下
+    os.walk 返回的 dirpath 可能与 workspace.resolve() 前缀不一致，直接 relative_to
+    会抛 ValueError（CI runner 用户名 >8 字符时触发）。resolve 后重试，仍失败则跳过。
+    """
+    root = (root or workspace).resolve()
     ws_res = workspace.resolve()
     count = 0
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1965,7 +1970,14 @@ def _iter_workspace_files(workspace: Path, root: Path | None = None, max_files: 
                              if d not in SKIP_DIRS and not d.startswith("."))
         for fn in sorted(filenames):
             abs_p = Path(dirpath) / fn
-            yield abs_p, abs_p.relative_to(ws_res).as_posix()
+            try:
+                rel = abs_p.relative_to(ws_res).as_posix()
+            except ValueError:
+                try:
+                    rel = abs_p.resolve().relative_to(ws_res).as_posix()
+                except ValueError:
+                    continue   # 路径无法映射到工作区：跳过（不崩溃）
+            yield abs_p, rel
             count += 1
             if count >= max_files:
                 return
