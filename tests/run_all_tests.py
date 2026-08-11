@@ -52,10 +52,11 @@ def main() -> int:
         else:
             failed.append(path.name)
             print(f"  FAILED ({path.name}) exit={proc.returncode}")
-            tail = "\n".join((proc.stdout or "").splitlines()[-15:])
+            # 打印更多行：完整栈帧（含调用行）与非 JSON 内容（ok_json 调试输出）
+            tail = "\n".join((proc.stdout or "").splitlines()[-80:])
             if tail:
                 print(tail)
-            err = "\n".join((proc.stderr or "").splitlines()[-10:])
+            err = "\n".join((proc.stderr or "").splitlines()[-80:])
             if err:
                 print(err)
     elapsed = time.perf_counter() - start

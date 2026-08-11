@@ -44,6 +44,9 @@ def run(name, arguments: str):
 
 
 def ok_json(result: str) -> dict:
+    if not result or not result.lstrip().startswith("{"):
+        print(f"  !! ok_json 收到非 JSON 内容: {result[:300]!r}")
+        raise SystemExit(1)
     return json.loads(result)
 
 
