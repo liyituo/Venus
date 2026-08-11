@@ -1,9 +1,10 @@
 """Skill 包与系统监控测试：扫描/frontmatter/load_skill 工具/system_status/免确认。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 SKILLS_DIR 重定向到临时目录，不触碰真实 skills/。
 """
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import json
 import sys
 import tempfile

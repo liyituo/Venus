@@ -35,6 +35,31 @@ from PIL import Image, ImageTk
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+# 统一日志目录（与 llm_server/chat 一致）：Daemon stderr 写入 .pcagent/daemon.err.log
+from data_paths import data_file
+
+DAEMON_ERR_LOG = data_file("daemon.err.log")
+DAEMON_ERR_LOG_MAX = 1_000_000   # 轮转阈值（1MB → 重命名为 .log.1）
+
+
+def _open_daemon_err_log():
+    """打开统一 Daemon 错误日志（读写同一绝对路径）；超过 1MB 轮转为 .log.1。"""
+    try:
+        DAEMON_ERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if DAEMON_ERR_LOG.exists() and DAEMON_ERR_LOG.stat().st_size > DAEMON_ERR_LOG_MAX:
+            DAEMON_ERR_LOG.replace(DAEMON_ERR_LOG.with_suffix(".log.1"))
+    except OSError:
+        pass
+    return open(DAEMON_ERR_LOG, "a", encoding="utf-8")
+
+
+def _read_daemon_err_log() -> str:
+    """读取统一 Daemon 错误日志尾部（用于诊断启动失败）。"""
+    try:
+        lines = DAEMON_ERR_LOG.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        return " | ".join(lines[-3:])[-400:] if lines else "无错误输出"
+    except Exception:
+        return "无法读取错误日志"
 
 # Windows 显示缩放下让窗口清晰（物理像素）
 if sys.platform == "win32":
@@ -58,10 +83,27 @@ MODE_TEXT = {
 def api_request(base_url: str, method: str, path: str, payload=None,
                 timeout: float = 15, raw: bool = False):
     """同步 HTTP 请求（在后台线程调用）。raw=True 返回 (code, bytes, headers)。"""
+    headers = {"Content-Type": "application/json"}
+    # daemon token 鉴权（chat_config.json 的 daemon_token，可选）
+    try:
+        cfg = json.loads((BASE_DIR.parent / "chat_config.json").read_text(encoding="utf-8"))
+        t = str(cfg.get("daemon_token") or "").strip()
+        if t == "__secure__":
+            # 占位符：从 secure store 读取真实 Token（绝不把占位符当 Token 发送）
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(BASE_DIR))
+                from secure_store import load as ss_load
+                t = ss_load("daemon_token")
+            except Exception:
+                t = ""
+        if t:
+            headers["X-Api-Token"] = t
+    except Exception:
+        pass
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
-        base_url + path, data=data, method=method,
-        headers={"Content-Type": "application/json"},
+        base_url + path, data=data, method=method, headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -91,10 +133,14 @@ class GuiApp:
         self.smoke_ok = False
         self.quit_flag = False
 
-        self._tasks: queue.Queue = queue.Queue()    # (kind, callable)
-        self._results: queue.Queue = queue.Queue()  # (kind, payload)
+        self._tasks: queue.Queue = queue.Queue()      # 普通任务（status/shot/start）
+        self._high_tasks: queue.Queue = queue.Queue() # 高优先级任务（stop/reset/execute，不被截图阻塞）
+        self._results: queue.Queue = queue.Queue()    # (kind, payload)
+        self._shot_pending = False                    # 截图防堆积标记（in-flight 时不重复提交）
         self._img: Image.Image | None = None        # 原始截图（坐标换算基准）
         self._photo: ImageTk.PhotoImage | None = None
+        self._img_offx = 0                          # 图片居中偏移（点击换算用）
+        self._img_offy = 0
         self._status: dict | None = None
         self._connecting = True
         self._daemon_err_fh = None
@@ -236,11 +282,15 @@ class GuiApp:
 
     # ----------------------------------------------------------- 后台线程
     def _bg_loop(self) -> None:
+        """后台线程：高优先级队列（止停/执行）优先于普通队列（状态/截图）。"""
         while not self.quit_flag:
             try:
-                kind, fn = self._tasks.get(timeout=0.2)
+                kind, fn = self._high_tasks.get(timeout=0.05)
             except queue.Empty:
-                continue
+                try:
+                    kind, fn = self._tasks.get(timeout=0.2)
+                except queue.Empty:
+                    continue
             try:
                 result = fn()
             except Exception as exc:  # 任务内异常兜底
@@ -279,7 +329,7 @@ class GuiApp:
         port = urllib.request.urlparse(self.base_url).port or 8000
         python = self._pick_daemon_python()
         self._ui_log(f"未检测到 Daemon，正在用 {Path(python).name} 自动启动 app.py --port {port} …", "info")
-        self._daemon_err_fh = open(BASE_DIR.parent / "daemon.err.log", "a", encoding="utf-8")
+        self._daemon_err_fh = _open_daemon_err_log()
         try:
             proc = subprocess.Popen(
                 [python, str(BASE_DIR / "app.py"), "--port", str(port)],
@@ -326,14 +376,7 @@ class GuiApp:
 
     def _read_daemon_err(self) -> str:
         """读取 Daemon 子进程的 stderr 尾部，用于诊断启动失败。"""
-        try:
-            if self._daemon_err_fh is not None:
-                self._daemon_err_fh.close()
-            lines = BASE_DIR.joinpath("daemon.err.log").read_text(encoding="utf-8",
-                                                                  errors="replace").strip().splitlines()
-            return " | ".join(lines[-3:])[-400:] if lines else "无错误输出"
-        except Exception:
-            return "无法读取错误日志"
+        return _read_daemon_err_log()
 
     def _on_start(self, payload) -> None:
         kind, msg = payload
@@ -367,22 +410,27 @@ class GuiApp:
         self._tasks.put(("status", lambda: api_request(self.base_url, "GET", "/api/v1/status")))
 
     def _submit_refresh(self) -> None:
+        """提交截图请求（in-flight 时不重复提交，防队列堆积）。"""
+        if self._shot_pending:
+            return
+        self._shot_pending = True
         self._tasks.put(("shot", lambda: api_request(
             self.base_url, "GET", f"/api/v1/screenshot?t={int(time.time() * 1000)}",
             timeout=20, raw=True)))
 
     def _submit_execute(self, payload, silent: bool = False) -> None:
-        self._tasks.put(("exec", lambda: (silent, payload,
+        self._high_tasks.put(("exec", lambda: (silent, payload,
             api_request(self.base_url, "POST", "/api/v1/execute", payload))))
 
     def _submit_stop(self) -> None:
         if not tk.messagebox.askyesno("紧急止停", "确认紧急止停？将拒绝所有后续指令，直到点击\"恢复\"。"):
             return
-        self._tasks.put(("exec", lambda: (False, None,
+        # 高优先级队列：紧急止停不被截图刷新阻塞
+        self._high_tasks.put(("exec", lambda: (False, None,
             api_request(self.base_url, "POST", "/api/v1/stop"))))
 
     def _submit_reset(self) -> None:
-        self._tasks.put(("exec", lambda: (False, None,
+        self._high_tasks.put(("exec", lambda: (False, None,
             api_request(self.base_url, "POST", "/api/v1/reset"))))
 
     def _submit_type(self) -> None:
@@ -435,6 +483,7 @@ class GuiApp:
         self.badge.config(text=text, fg=color)
 
     def _on_shot(self, result) -> None:
+        self._shot_pending = False   # 截图请求已完成（无论成败），允许下一次提交
         if result[0] == "err":
             self._ui_log(f"截图失败：{result[1]}", "err")
             return self._finish_smoke(False)
@@ -451,14 +500,19 @@ class GuiApp:
         self._finish_smoke(True)  # smoke 模式：状态 + 截图均成功后通过
 
     def _render_screenshot(self, img: Image.Image) -> None:
+        """渲染截图：等比缩放并居中显示，记录偏移供点击精确换算。"""
         cw = max(self.canvas.winfo_width(), 400)
         ch = max(self.canvas.winfo_height(), 240)
         scale = min(cw / img.width, ch / img.height)
         dw, dh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
         self._photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
         self._img = img
+        # 居中偏移：点击换算只在实际图片区域内有效
+        self._img_offx = max(0, (cw - dw) // 2)
+        self._img_offy = max(0, (ch - dh) // 2)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self.canvas.create_image(self._img_offx, self._img_offy, anchor="nw",
+                                 image=self._photo)
 
     def _on_exec(self, result) -> None:
         silent, payload, http = result
@@ -473,13 +527,23 @@ class GuiApp:
         self._submit_poll()
 
     def _on_canvas_click(self, event) -> None:
+        """点击预览画面 = 在对应屏幕位置点击。
+
+        - 图片居中显示：先减偏移，只在实际图片区域内换算坐标；
+        - 点击图片外空白区域：不执行点击。
+        """
         if self._img is None or self._photo is None:
             return
         dw, dh = self._photo.width(), self._photo.height()
         if dw <= 0 or dh <= 0:
             return
-        x = min(max(int(event.x * self._img.width / dw), 0), self._img.width - 1)
-        y = min(max(int(event.y * self._img.height / dh), 0), self._img.height - 1)
+        offx = getattr(self, "_img_offx", 0)
+        offy = getattr(self, "_img_offy", 0)
+        # 空白区域（图片外）：忽略，不换算不点击
+        if not (offx <= event.x < offx + dw and offy <= event.y < offy + dh):
+            return
+        x = min(max(int((event.x - offx) * self._img.width / dw), 0), self._img.width - 1)
+        y = min(max(int((event.y - offy) * self._img.height / dh), 0), self._img.height - 1)
         clicks = 2 if self.dbl_var.get() else 1
         self._toast(f"点击屏幕 ({x}, {y})" + (" 双击" if clicks == 2 else "") + "…", "#3b82f6")
         self._submit_execute({"action": "click", "x": x, "y": y, "clicks": clicks}, silent=True)
@@ -490,7 +554,6 @@ class GuiApp:
         self.root.after(3000, lambda: self.toast_lbl.config(text=""))
 
     def _ui_log(self, msg: str, kind: str = "info") -> None:
-        colors = {"ok": "#4ade80", "err": "#f87171", "info": "#94a3b8"}
         self.log_text.config(state="normal")
         stamp = time.strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{stamp}] {msg}\n", kind)

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 import pyautogui
 
@@ -91,7 +92,8 @@ with TestClient(daemon.app) as c:
 
 print("== 7. 中文输入分段逻辑（纯函数）==")
 runs = daemon._type_runs("你好 world！foo bar")
-check("ASCII/中文正确分段", runs == [("clip", "你"), ("clip", "好"), ("keys", " world"), ("clip", "！"), ("keys", "foo bar")], runs)
+check("ASCII/中文正确分段", runs == [("clip", "你好"), ("keys", " world"), ("clip", "！"), ("keys", "foo bar")], runs)
+check("连续中文合并为一次粘贴", runs[0] == ("clip", "你好"), str(runs))
 runs = daemon._type_runs("Hello, 世界 🌍!")
 check("emoji 走剪贴板", any(k == "clip" and v == "🌍" for k, v in runs), runs)
 runs = daemon._type_runs("plain ascii 123")

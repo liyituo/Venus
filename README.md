@@ -172,6 +172,28 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 - **兜底**：规则未命中且模型不可用/超时 → 自动回退全量工具（路由只是加速器）；同类请求结果缓存 5 分钟
 - Ollama 装 Windows 侧即可（Mirrored 网络下 WSL 直通 `127.0.0.1:11434`），服务启动时自动预热路由模型。**路由模型跑在你本机 Ollama（模型文件在 `~/.ollama`，不入库）**——仓库里只有调用接口，无任何模型文件
 
+### Token 深度优化（质量优先）
+
+在**不降低任务正确率、推理能力、工具能力与安全性**的前提下压缩上下文与调用开销，分层实现：
+
+| 层 | 机制 | 效果 |
+| --- | --- | --- |
+| Provider 能力层 | 按 api_url 识别服务（deepseek/openai/ollama/兼容），不支持的参数（如 Ollama 的 `reasoning_effort`）不发送；能力可配置覆盖 | 消除"参数被静默忽略"的浪费 |
+| 上下文预算 | 分层统计 system/工具 schema/对话/图片/输出/推理余量；压缩阈值按任务类型动态（简单 55% / 编码 75%），不再写死 60% | 复杂任务不丢上下文，简单任务更早压缩 |
+| 结构化压缩 | 摘要为固定 JSON schema（目标/约束/决定/未完成任务/检索键等 14 字段）+ 一致性校验（**摘要遗漏关键路径 → 拒绝替换**）+ 来源 hash；摘要生成关闭思考 | 长会话继续任务不丢约束与错误 |
+| 历史检索 | 压缩后本地索引旧消息（关键词/二元组倒排）；新消息命中检索键（端口/路径/函数名）自动插入原文片段，原文与摘要冲突以原文为准 | 不再整段重放历史 |
+| 工具结果压缩 | 超长结果按 head/error/tail **分区预算**保留（错误绝不丢），重复行去重，完整原文存本地按 `result_id` 引用 | 大输出（read_file/测试日志）省 80%+ |
+| 重复调用去重 | 同轮相同 (工具,参数) 直接复用；跨轮只读工具在**文件未变化**时复用结果；同一图片同一问题 60s 内复用分析 | 无效工具循环下降 |
+| 子 Agent 路由 | 默认单 Agent；路由器按成本模型决策（独立子任务/局部上下文小/高风险独立复核/用户要求才允许委派），子任务用裁剪后的信封（不含完整历史），结果走紧凑协议；只读专业子 agent（视觉/审查）独立上下文允许 | 不因"看起来复杂"滥用多 Agent |
+| 提示词缓存 | 稳定前缀分层（P0 系统规则/P1 工具/P2 Agent）+ 版本化失效 + 确定性序列化（工具排序、字段顺序固定）；观测 prefix churn 与供应商真实 cached_tokens | 隐式缓存命中率提升 |
+| 输出控制 | 「结论优先，简单问题简短回答」引导；输出预算参与上下文规划 | 简单问答输出下降 |
+
+配套能力：
+
+- 新工具 `fetch_result`：被压缩的工具结果可按 `result_id` 取回 head/tail/error/full 区段
+- 用量可观测：`GET /api/v1/usage`（聚合 + 最近 200 次请求明细 + 缓存命中率 + prefix 指标），Chat 侧栏底部实时显示「累计 tok · 缓存% · 压缩次数 · 调用数」
+- 评测入口：`python tests/token_eval.py`（12 类匿名案例的 prompt 层确定性对比）；`--live` 追加真实 API 前后对比（真实 usage，不伪造节省）
+
 ### 密钥管理：什么文件不能提交
 
 | 文件 | 内容 | 状态 |
@@ -231,18 +253,24 @@ systemctl --user enable --now pc-agent-llm pc-agent-bot
 ## 目录结构
 
 ```
-src/                源代码（app / llm_server / 五个前端 / mock_llm 测试 API）
+src/                源代码（app / llm_server / 权限策略 / MCP 接入 / 五个前端 / mock_llm）
+src/provider_capabilities.py   Provider 能力层（参数过滤、配置覆盖）
+src/token_budget.py            上下文预算管理（分层统计、动态阈值）
+src/tool_result_reducer.py     工具结果压缩（head/error/tail 分区 + result 引用）
+src/history_index.py           历史消息关键词索引（压缩后按需检索）
+src/prompt_cache.py            分层提示词缓存（稳定前缀、版本失效、观测）
+src/subagent_router.py         子 Agent 智能路由（成本模型、信封、工件注册表）
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
-tests/              十一套测试（共 324 断言）
-.github/workflows/  CI（push 自动跑十一套测试）
+tests/              二十六套测试（700+ 断言，含 Token 优化专项）
+.github/workflows/  CI（Windows + Ubuntu 双矩阵自动跑全部测试）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
 telegram_config.json  bot 配置（含 token，已 gitignore，别提交）
 mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
-.pcagent/           会话历史 / 修改备份 / 运行日志（gitignore，不入库）
+.pcagent/           会话历史 / 修改备份 / 运行日志 / 密钥库（gitignore，不入库）
 ```
 
 ## 开发与测试
@@ -250,18 +278,31 @@ mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
 ```
 .venv\Scripts\python tests\smoke_test.py        # daemon 冒烟（21 断言，不碰真实屏幕）
 .venv\Scripts\python tests\llm_tools_test.py    # 编程工具（69 断言：检索/编辑/undo/git/进程/todo/repo）
-.venv\Scripts\python tests\agent_loop_test.py   # agent 循环端到端（33 断言：ask+diff/todo/上下文上界/plan）
-.venv\Scripts\python tests\session_test.py      # 会话持久化（30 断言：CRUD/重启恢复/上限）
-.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（33 断言：echo server 全链路/命名解析/白名单/amap/重连）
+.venv\Scripts\python tests\agent_loop_test.py   # agent 循环端到端（40 断言：ask+diff/plan 越权/上限/隔离）
+.venv\Scripts\python tests\session_test.py      # 会话持久化（42 断言：上限/幂等/乐观锁/损坏恢复）
+.venv\Scripts\python tests\mcp_test.py          # MCP 客户端（41 断言：下划线/重连/只读声明/断线清空）
 .venv\Scripts\python tests\cli_session_test.py  # CLI 会话（13 断言：摘要/懒加载/降级）
 .venv\Scripts\python tests\reasoning_test.py    # 推理强度（14 断言：档位映射/持久化/校验）
 .venv\Scripts\python tests\skill_system_test.py # 技能包与系统监控（14 断言：扫描/加载/免确认/降级）
 .venv\Scripts\python tests\subagent_test.py     # 子 agent 委派（13 断言：delegate 链路/透传/深度/白名单）
 .venv\Scripts\python tests\tool_router_test.py  # 工具路由（34 断言：规则/解析/映射/缓存/降级）
 .venv\Scripts\python tests\agent_defs_test.py   # 子 agent 定义结构（50 断言：JSON/name 唯一/tools 合法）
+.venv\Scripts\python tests\chat_stream_test.py  # Chat 流式模型（27 断言：实时增量/task 隔离/Stop/确认线程）
+.venv\Scripts\python tests\cancel_confirm_test.py # 后端取消并发（15 断言：确认绑定/过期/锁释放）
+.venv\Scripts\python tests\process_stop_test.py # Windows 进程停止（19 断言：wait/poll 验证/stop_failed）
+.venv\Scripts\python tests\gui_click_test.py    # GUI 点击换算（9 断言：居中偏移/空白区不点击）
+.venv\Scripts\python tests\secure_store_test.py # 密钥安全（16 断言：DPAPI/占位符/损坏恢复/日志脱敏）
+.venv\Scripts\python tests\telegram_bot_test.py # Telegram 修复（21 断言：/new/定时/权限/并发/文件）
+.venv\Scripts\python tests\git_commit_test.py   # Git 提交范围（16 断言：显式文件/快照/预览）
+.venv\Scripts\python tests\workspace_files_test.py # 工作区与文件工具（30 断言：delete/move/undo/切换隔离）
+.venv\Scripts\python tests\auth_test.py         # 服务鉴权（22 断言：token/Host/Origin/回环强制）
+.venv\Scripts\python tests\token_opt_test.py    # Token 优化基础模块（68 断言：能力/预算/压缩/检索/缓存/路由）
+.venv\Scripts\python tests\token_opt_integration_test.py # Token 优化集成（26 断言：去重/缓存/fetch/校验/usage）
+.venv\Scripts\python tests\settings_save_test.py # 设置保存回归（20 断言：下拉收集/显示匹配/候选地址）
+.venv\Scripts\python tests\token_eval.py        # Token/质量评测（12 类匿名案例；--live 追加真实 API 对比）
 .venv\Scripts\python src\mock_llm.py            # 无 Key 时本地假 API 验证全链路
 ```
 
-推送后 GitHub Actions 自动跑十一套测试（共 324 断言），回归结果在 Actions 页面一眼可见。
+推送后 GitHub Actions 自动跑全部测试（Windows + Ubuntu 双矩阵），回归结果在 Actions 页面一眼可见。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。

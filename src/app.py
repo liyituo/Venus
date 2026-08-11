@@ -29,6 +29,8 @@ import asyncio
 import base64
 import io
 import logging
+import os
+import sys
 import threading
 import time
 from collections import deque
@@ -86,6 +88,21 @@ class ActionRequest(BaseModel):
 
 class FailsafeTriggered(Exception):
     """PyAutoGUI FAILSAFE 已触发（鼠标进入屏幕角落）。"""
+
+
+def _safe_action_log(req: ActionRequest) -> dict:
+    """动作日志脱敏：只记录动作类型与元数据，绝不记录 type_text 正文等敏感内容。"""
+    meta = {"action": req.action}
+    if req.action == "type_text":
+        meta["chars"] = len(req.text or "")          # 只记字符数，不记内容
+    elif req.action == "click":
+        if req.x is not None and req.y is not None:
+            meta["position"] = [req.x, req.y]
+        meta["clicks"] = req.clicks
+        meta["button"] = req.button
+    elif req.action == "press_key":
+        meta["key"] = req.key
+    return meta
 
 
 # --------------------------------------------------------------------------
@@ -183,9 +200,18 @@ class DaemonState:
 
     # ---------- 任务提交 / 止停 ----------
     def submit(self, req: ActionRequest) -> asyncio.Future:
-        """入队一个动作指令并返回其 Future（调用方 await 它拿结果）。"""
+        """入队一个动作指令并返回其 Future（调用方 await 它拿结果）。
+
+        止停检查与入队在同一临界区（_qlock）：stop 与 submit 并发时，
+        stop 后不可能再有新动作进入普通队列（fail closed）。
+        """
         fut: asyncio.Future = self._loop.create_future()
         with self._qlock:
+            if self._stop_requested:
+                fut.set_exception(HTTPException(
+                    status_code=423,
+                    detail="Daemon 处于止停状态，拒绝新指令；请先调用 POST /api/v1/reset"))
+                return fut
             self._queue.append((req, fut))
         self._wakeup.set()
         return fut
@@ -244,7 +270,8 @@ class DaemonState:
     def _dispatch(self, req: ActionRequest) -> dict:
         """在 GUI 工作线程内执行阻塞操作（本方法全程不碰事件循环）。"""
         t0 = time.monotonic()
-        log.info("执行动作: %s", req.model_dump(exclude_none=True))
+        # 日志脱敏：只记录动作类型与元数据，绝不记录 type_text 正文等敏感内容
+        log.info("执行动作: %s", _safe_action_log(req))
         try:
             try:
                 return HANDLERS[req.action](req)
@@ -288,35 +315,179 @@ def _type_runs(text: str) -> list[tuple[str, str]]:
     """把文本切分为 ('keys', ...) / ('clip', ...) 两种执行段。
 
     pyautogui.write() 无法输入中文 / emoji 等非 ASCII 字符，
-    这些内容改走剪贴板粘贴；按段合并同类输入，减少剪贴板切换次数。
+    这些内容改走剪贴板粘贴；**连续的非 ASCII 段合并为一次粘贴**
+    （避免每个汉字覆盖一次剪贴板），ASCII 段也合并减少按键切换。
     """
     runs: list[tuple[str, str]] = []
     buf: list[str] = []
+    clip_buf: list[str] = []
     for ch in text:
         if _is_typeable(ch):
+            if clip_buf:
+                runs.append(("clip", "".join(clip_buf)))
+                clip_buf = []
             buf.append(ch)
         else:
             if buf:
                 runs.append(("keys", "".join(buf)))
                 buf = []
-            runs.append(("clip", ch))
+            clip_buf.append(ch)
     if buf:
         runs.append(("keys", "".join(buf)))
+    if clip_buf:
+        runs.append(("clip", "".join(clip_buf)))
     return runs
 
 
-def _paste_via_clipboard(text: str) -> None:
-    """非 ASCII 文本经剪贴板粘贴（ctrl+v），完成后还原用户原剪贴板。"""
-    try:
-        import pyperclip  # pyautogui 的固有依赖
+def _snapshot_clipboard() -> dict[int, object] | None:
+    """拍摄剪贴板全格式快照（在第一次写入之前调用）。
 
-        previous = pyperclip.paste()
+    枚举全部已注册格式并复制数据；win32clipboard 不可用时返回 None
+    （调用方退回纯文本快照）。失败不抛异常——宁可走保守路径。
+    """
+    try:
+        import win32clipboard
+    except ImportError:
+        return None
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            saved: dict[int, object] = {}
+            fmt = 0
+            while True:
+                fmt = win32clipboard.EnumClipboardFormats(fmt)
+                if fmt == 0:
+                    break
+                try:
+                    saved[fmt] = win32clipboard.GetClipboardData(fmt)
+                except Exception:
+                    continue
+            return saved
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+
+def _restore_clipboard_snapshot(saved: dict[int, object] | None, fallback_text: str) -> None:
+    """恢复剪贴板快照：EmptyClipboard 后按原格式回写。
+
+    - 快照有效：整体恢复（图片/DIB、HDROP、HTML、文本等全部格式）；
+    - 快照无效：退回纯文本恢复；
+    - 单格式回写失败只跳过该格式；**全部格式都失败时抛异常**，
+      由调用方返回可见错误（不默默销毁用户剪贴板内容）。
+    """
+    if not saved:
+        import pyperclip
+        pyperclip.copy(fallback_text or "")
+        return
+    try:
+        import win32clipboard
+    except ImportError:
+        import pyperclip
+        pyperclip.copy(fallback_text or "")
+        return
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            restored = 0
+            for fmt, data in saved.items():
+                try:
+                    win32clipboard.SetClipboardData(fmt, data)
+                    restored += 1
+                except Exception:
+                    continue
+            if restored == 0 and saved:
+                raise OSError("无法恢复任何剪贴板格式（原内容可能丢失）")
+        finally:
+            win32clipboard.CloseClipboard()
+    except OSError:
+        raise
+    except Exception:
+        import pyperclip
+        pyperclip.copy(fallback_text or "")
+
+
+def _type_unicode_sendinput(text: str) -> bool:
+    """Windows Unicode SendInput 逐字符输入（KEYEVENTF_UNICODE）。
+
+    优先于剪贴板路径（不覆盖/不依赖用户剪贴板）。失败返回 False，
+    调用方回退到剪贴板粘贴。非 Windows 或 ctypes 不可用时恒返回 False。
+    """
+    if sys.platform != "win32" or not text:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        KEYEVENTF_UNICODE = 0x0004
+        KEYEVENTF_KEYUP = 0x0002
+        INPUT_KEYBOARD = 1
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_ulong),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("ki", KEYBDINPUT)]
+
+        inputs: list[INPUT] = []
+        for ch in text:
+            code = ord(ch)
+            if code > 0xFFFF:
+                return False  # 代理对超 SendInputW 单字符范围，回退剪贴板
+            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+                inputs.append(INPUT(INPUT_KEYBOARD, KEYBDINPUT(0, code, flags, 0, 0)))
+        if not inputs:
+            return False
+        arr = (INPUT * len(inputs))(*inputs)
+        sent = ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        return sent == len(inputs)
+    except Exception:
+        return False
+
+
+def _paste_via_clipboard(text: str) -> None:
+    """非 ASCII 文本经剪贴板粘贴（ctrl+v），完成后还原用户原剪贴板。
+
+    - 第一次写入前拍摄全格式快照（含图片/HTML/文件列表），
+      输入结束（含失败/异常）在最外层 finally 中恢复一次；
+    - 快照不可用（win32clipboard 缺失）时退回文本快照；
+    - 恢复失败时给出明确错误，不静默吞掉。
+    """
+    import pyperclip  # pyautogui 的固有依赖
+
+    snapshot = _snapshot_clipboard()
+    previous_text = pyperclip.paste()
+    restore_error = None
+    try:
         pyperclip.copy(text)
         pyautogui.hotkey("ctrl", "v")
-        if previous:
-            pyperclip.copy(previous)
     except Exception as exc:
         raise HTTPException(500, f"非 ASCII 文本输入失败（剪贴板不可用）: {exc}") from exc
+    finally:
+        # 无条件恢复一次：优先全格式快照，其次文本
+        try:
+            if snapshot is not None:
+                _restore_clipboard_snapshot(snapshot, previous_text)
+            else:
+                pyperclip.copy(previous_text or "")
+        except Exception as exc:
+            restore_error = exc
+    if restore_error is not None:
+        raise HTTPException(500, f"剪贴板恢复失败（原内容可能丢失）: {restore_error}")
+
+
+def _restore_clipboard(text: str) -> None:
+    """兼容入口：恢复剪贴板为纯文本（保留旧 API）。"""
+    import pyperclip
+    pyperclip.copy(text or "")
 
 
 def _handle_type_text(req: ActionRequest) -> dict:
@@ -330,7 +501,9 @@ def _handle_type_text(req: ActionRequest) -> dict:
             if kind == "keys":
                 pyautogui.write(content, interval=0.02)
             else:
-                _paste_via_clipboard(content)
+                # SendInput 优先（不触碰用户剪贴板）；失败回退剪贴板粘贴
+                if not _type_unicode_sendinput(content):
+                    _paste_via_clipboard(content)
     return {"ok": True, "action": "type_text", "chars": len(req.text)}
 
 
@@ -404,6 +577,43 @@ SCREEN_WIDTH = 0
 SCREEN_HEIGHT = 0
 SCREEN_OK = False       # 启动自检：当前会话能否访问屏幕（截图）
 hotkey_listener = None
+AUTH_TOKEN = ""         # --token 启用：屏幕控制端点须带 X-Api-Token（常量时间比较）
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _parse_host_header(host: str) -> str | None:
+    """解析 Host 头为规范 hostname；非法格式（userinfo/多余冒号/坏端口）返回 None。
+
+    支持：127.0.0.1、localhost、[::1]、上述形式携带合法数字端口。
+    """
+    host = (host or "").strip()
+    if not host:
+        return None
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return None
+        inner = host[1:end]
+        rest = host[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return None
+        return inner.lower()
+    if "@" in host or host.count(":") > 1:
+        return None
+    if ":" in host:
+        hostname, _, port = host.partition(":")
+        if not port.isdigit():
+            return None
+        return hostname.lower()
+    return host.lower()
+
+
+def _token_ok(request) -> bool:
+    if not AUTH_TOKEN:
+        return True
+    import hmac
+    return hmac.compare_digest(request.headers.get("X-Api-Token", ""), AUTH_TOKEN)
 
 
 @asynccontextmanager
@@ -435,6 +645,42 @@ app = FastAPI(
     description="异步解耦的桌面自动化守护进程：网页控制电脑（点击 / 输入 / 按键 / 截图）",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def host_guard(request, call_next):
+    """Host/Origin 限制：防 DNS rebinding（恶意域名解析到本机）与跨站请求。"""
+    origin = request.headers.get("origin")
+    if origin:
+        # URL 解析后精确比较 hostname（拒绝 http://localhost.evil.example 等欺骗）
+        from urllib.parse import urlparse as _up
+        try:
+            o = _up(origin)
+            ohost = (o.hostname or "").lower()
+        except Exception:
+            ohost = ""
+        if ohost not in _LOOPBACK_HOSTS or o.scheme not in ("http", "https"):
+            return Response(status_code=403, content="非法 Origin（仅允许本机来源）")
+    host = request.headers.get("host", "")
+    hostname = _parse_host_header(host)
+    if hostname is None or hostname not in _LOOPBACK_HOSTS:
+        # 测试环境（TestClient 默认 testserver）白名单：不放开任意 Host
+        if os.environ.get("PCAGENT_ALLOW_TEST_HOST") == "1" \
+                and hostname in ("testserver", "testclient", "localhost"):
+            return await call_next(request)
+        return Response(status_code=403, content="非法 Host（仅允许本机回环访问）")
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    """屏幕控制端点（execute/stop/reset）必须鉴权；查询类（status/screenshot/静态页）免认证。"""
+    if request.url.path in ("/api/v1/execute", "/api/v1/stop", "/api/v1/reset"):
+        if not _token_ok(request):
+            return Response(status_code=401,
+                            content="未授权：需要正确的 X-Api-Token（daemon 已启用 token 鉴权）")
+    return await call_next(request)
+
 
 # 静态前端控制台
 app.mount("/static", StaticFiles(directory=BASE_DIR.parent / "static"), name="static")
@@ -547,6 +793,26 @@ async def screenshot() -> Response:
     )
 
 
+def _write_pid_metadata(pid_file: Path) -> None:
+    """写入 PID metadata JSON（原子替换）：pid/启动时间/可执行文件/nonce。
+
+    停止脚本据此校验进程身份（PID 复用/过期文件不误杀无关进程）。
+    """
+    import json
+    import time as _time
+    payload = {
+        "pid": os.getpid(),
+        "started": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        "executable": sys.executable,
+        "nonce": os.urandom(8).hex(),
+        "created": _time.time(),
+    }
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pid_file.with_suffix(".pid.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(pid_file)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -557,5 +823,30 @@ if __name__ == "__main__":
                         help="监听地址（保持 127.0.0.1 防止局域网内他人控制）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     parser.add_argument("--reload", action="store_true", help="开发模式热重载")
+    parser.add_argument("--token", default="",
+                        help="启用 token 鉴权（屏幕控制端点须带 X-Api-Token；绑定非回环地址时必填）")
+    parser.add_argument("--pid-file", default="",
+                        help="写入 PID metadata JSON 路径（停止脚本据此校验进程身份，不盲目杀端口占用者）")
     args = parser.parse_args()
-    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="info")
+    # 安全要求：绑定非回环地址时必须提供 token（否则拒绝启动）
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
+        print(f"错误：绑定非回环地址（{args.host}）时必须提供 --token 鉴权。\n"
+              f"请加 --token <随机字符串> 后重试，或改回 127.0.0.1。")
+        sys.exit(1)
+    AUTH_TOKEN = args.token
+    if args.token:
+        log.warning("token 鉴权已启用：屏幕控制端点需携带 X-Api-Token 头")
+    pid_file = Path(args.pid_file) if args.pid_file else None
+    if pid_file is not None:
+        try:
+            _write_pid_metadata(pid_file)
+        except OSError as exc:
+            print(f"警告：无法写入 PID 文件：{exc}")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, reload=args.reload, log_level="info")
+    finally:
+        if pid_file is not None:
+            try:
+                pid_file.unlink(missing_ok=True)
+            except OSError:
+                pass

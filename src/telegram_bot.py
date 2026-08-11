@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import queue
 import re
 import sys
 import threading
@@ -36,8 +35,10 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "telegram_config.json"
-CHATS_FILE = BASE_DIR.parent / ".pcagent" / "telegram_chats.json"
-SCHEDULES_FILE = BASE_DIR.parent / ".pcagent" / "schedules.json"
+from data_paths import data_file
+
+CHATS_FILE = data_file("telegram_chats.json")
+SCHEDULES_FILE = data_file("schedules.json")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -48,7 +49,8 @@ def _setup_file_logging() -> None:
     """统一运行日志：写入项目根 .pcagent/bot.log（1MB 轮转，保留 3 份）。"""
     try:
         from logging.handlers import RotatingFileHandler
-        log_dir = BASE_DIR.parent / ".pcagent"
+        from data_paths import data_dir
+        log_dir = data_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         fh = RotatingFileHandler(log_dir / "bot.log", maxBytes=1_000_000,
                                  backupCount=3, encoding="utf-8")
@@ -116,20 +118,82 @@ class Bot:
         self.stream_state: dict[int, dict] = {}            # 流式渲染状态
         self.context_window = 65536                        # 压缩阈值基准（run 时从 health 更新）
         self._offset = 0
+        # ---- 并发保护：每 chat 独立锁（busy/消息顺序）+ schedules 锁 ----
+        self._state_lock = threading.Lock()
+        self._chat_locks: dict[int, threading.Lock] = {}
+        self._schedules_lock = threading.Lock()
+
+    def _chat_lock(self, chat_id: int) -> threading.Lock:
+        with self._state_lock:
+            return self._chat_locks.setdefault(chat_id, threading.Lock())
 
     # ------------------------------------------------------------------ 配置
+    def _workspace_dir(self) -> Path:
+        """与桌面端一致的工作区：优先后端 GET /api/v1/workspace（缓存），
+        失败回退配置 workspace 字段，最后默认 home/agent_workspace。"""
+        cached = getattr(self, "_ws_cache", None)
+        if cached is not None:
+            return cached
+        ws = None
+        status, data = self.llm("GET", "/api/v1/workspace", timeout=8)
+        if status == 200 and data.get("workspace"):
+            ws = Path(str(data["workspace"]))
+        if ws is None and self.cfg.get("workspace"):
+            ws = Path(str(self.cfg["workspace"]))
+        if ws is None:
+            ws = Path.home() / "agent_workspace"
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._ws_cache = ws
+        return ws
+
     def _load_cfg(self) -> dict:
-        default = {"bot_token": "", "allowed_chat_ids": [], "proxy": "", "llm_url": ""}
+        default = {"bot_token": "", "allowed_chat_ids": [], "proxy": "", "llm_url": "",
+                   "llm_token": "", "allowed_user_ids": [], "owner_user_id": None}
         if self.cfg_path.exists():
             try:
-                return {**default, **json.loads(self.cfg_path.read_text(encoding="utf-8"))}
+                cfg = {**default, **json.loads(self.cfg_path.read_text(encoding="utf-8"))}
+                # 敏感值安全存储：占位符 → 读取真实值（bot_token / llm_token）；
+                # 明文 → 自动迁移到 secure store 并写回占位符（一次性迁移）
+                try:
+                    from secure_store import load as ss_load, migrate_from_plaintext
+                    migrated = migrate_from_plaintext(cfg, ("bot_token", "llm_token"))
+                    if migrated != cfg:
+                        cfg = migrated
+                        self._write_cfg(cfg)
+                    for k in ("bot_token", "llm_token"):
+                        if (cfg.get(k) or "") == "__secure__":
+                            cfg[k] = ss_load(k)
+                except Exception:
+                    pass
+                return cfg
             except Exception:
                 pass
         return default
 
+    def _write_cfg(self, cfg: dict) -> None:
+        """原子写配置（临时文件 + replace，防写一半损坏）。"""
+        p = self.cfg_path
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+
     def _save_cfg(self) -> None:
-        self.cfg_path.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False),
-                                 encoding="utf-8")
+        """保存当前配置（写入前保持密钥为占位符，不落明文）。"""
+        cfg = dict(self.cfg)
+        try:
+            from secure_store import PLACEHOLDER
+            for k in ("bot_token", "llm_token"):
+                if cfg.get(k) and cfg.get(k) != PLACEHOLDER:
+                    # 保存时若为明文：先入 secure store，配置仅保留占位符
+                    from secure_store import store as ss_store
+                    ss_store(k, str(cfg[k]))
+                    cfg[k] = PLACEHOLDER
+        except Exception:
+            pass
+        self._write_cfg(cfg)
 
     def _load_chats(self) -> dict:
         try:
@@ -141,10 +205,13 @@ class Bot:
         return {}
 
     def _save_chats(self) -> None:
+        """原子写：临时文件 + replace。"""
         try:
             CHATS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CHATS_FILE.write_text(json.dumps(self.chats, ensure_ascii=False, indent=1),
-                                  encoding="utf-8")
+            tmp = CHATS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.chats, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(CHATS_FILE)
         except OSError as exc:
             print(f"[bot] chats 持久化失败：{exc}", file=sys.stderr)
 
@@ -158,12 +225,25 @@ class Bot:
         return []
 
     def _save_schedules(self) -> None:
+        """原子写：临时文件 + replace（须持有 _schedules_lock 或在调用前加锁）。"""
         try:
             SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SCHEDULES_FILE.write_text(
-                json.dumps(self.schedules, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp = SCHEDULES_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.schedules, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(SCHEDULES_FILE)
         except OSError as exc:
             log.warning("定时任务保存失败：%s", exc)
+
+    def _next_schedule_id(self) -> str:
+        """持久化单调 ID：取现有最大数字后缀 +1（删除任务后新建不产生重复 ID）。"""
+        mx = 0
+        for s in self.schedules:
+            try:
+                mx = max(mx, int(str(s.get("id", "s0"))[1:]))
+            except (ValueError, TypeError):
+                pass
+        return f"s{mx + 1}"
 
     # ------------------------------------------------------------------ Telegram API
     def api(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
@@ -211,9 +291,12 @@ class Bot:
 
     # ------------------------------------------------------------------ LLM 后端 API
     def llm(self, method: str, path: str, payload=None, timeout: float = 30):
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.get("llm_token"):
+            headers["X-Api-Token"] = str(self.cfg["llm_token"])
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(self.llm_url + path, data=body, method=method,
-                                     headers={"Content-Type": "application/json"})
+                                     headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -230,9 +313,18 @@ class Bot:
         entry = self.chats.get(chat_id) or {}
         if entry.get("session_id"):
             return entry["session_id"]
+        return self._create_new_session(chat_id)
+
+    def _create_new_session(self, chat_id: int) -> int:
+        """强制创建全新会话：POST /api/v1/sessions → 新 ID → 更新 chat 映射 → 清空内存历史。
+
+        /new 专用：不复用旧 session_id（与 get_or_create_session 语义不同）。
+        """
         status, data = self.llm("POST", "/api/v1/sessions")
         if status == 200 and isinstance(data.get("id"), int):
-            self.chats[chat_id] = {"session_id": data["id"]}
+            with self._state_lock:
+                self.chats[chat_id] = {"session_id": data["id"]}
+                self.messages.pop(chat_id, None)
             self._save_chats()
             return data["id"]
         return 0
@@ -273,20 +365,52 @@ class Bot:
         ids = self.cfg.get("allowed_chat_ids") or []
         return chat_id in ids
 
+    def user_allowed(self, user_id: int | None, chat_id: int) -> bool:
+        """用户级授权：owner / allowed_user_ids 命中才授权。
+
+        不因聊天白名单放行（群聊中未授权成员即使在该群也不能操作）。
+        """
+        if user_id is None:
+            return False
+        owner = self.cfg.get("owner_user_id")
+        uids = self.cfg.get("allowed_user_ids") or []
+        if owner and user_id == owner:
+            return True
+        if uids and user_id in uids:
+            return True
+        return False
+
+    def authorized(self, user_id: int | None, chat_id: int) -> bool:
+        """统一授权策略（所有入口共用：消息/命令/文件/图片/回调/计划/切换）。
+
+        - 未配置管理员（configured()=False）：一律拒绝，bot 只回安全 /start 提示；
+        - 私聊（chat_id > 0）：发送者必须是 owner / allowed_user_ids；
+        - 群聊（chat_id < 0）：群聊 ID 被允许 **且** 用户命中 owner / allowed_user_ids。
+        """
+        if not self.configured():
+            return False
+        if chat_id < 0:
+            return self.allowed(chat_id) and self.user_allowed(user_id, chat_id)
+        return self.user_allowed(user_id, chat_id)
+
     def _is_greeting(self, text: str) -> bool:
         """纯寒暄/状态询问：直接回复，不走 agent、不调工具、不占历史。"""
         t = text.strip().rstrip("！!？?。.～~")
         return t in ("你还在吗", "还在吗", "在吗", "在不在", "在么", "你好", "您好",
                      "hello", "hi", "hey", "哈喽", "嗨")
 
-    def register_owner(self, chat_id: int) -> bool:
-        """白名单为空时，第一个 /start 的人成为 owner。"""
-        ids = self.cfg.get("allowed_chat_ids") or []
-        if not ids:
-            self.cfg["allowed_chat_ids"] = [chat_id]
-            self._save_cfg()
-            return True
+    def register_owner(self, chat_id: int, user_id: int | None = None) -> bool:
+        """不再允许「第一个陌生人 /start 自动成为 owner」。
+
+        安全要求：owner 必须由配置文件预先指定（allowed_chat_ids / owner_user_id /
+        allowed_user_ids）。返回 False 表示未配置（bot 只读提示，不执行任何操作）。
+        """
         return False
+
+    def configured(self) -> bool:
+        """是否已配置管理员（白名单/owner 任一非空）；未配置时禁止工具/文件/系统操作。"""
+        return bool(self.cfg.get("allowed_chat_ids") or self.cfg.get("owner_user_id")
+                    or self.cfg.get("allowed_user_ids"))
 
     # ------------------------------------------------------------------ 主循环
     def run(self) -> None:
@@ -332,19 +456,29 @@ class Bot:
     # ------------------------------------------------------------------ 命令
     def handle_message(self, msg: dict) -> None:
         chat_id = msg["chat"]["id"]
+        user_id = (msg.get("from") or {}).get("id")
         text = (msg.get("text") or "").strip()
-        if not self.allowed(chat_id):
-            if text == "/start" and self.register_owner(chat_id):
-                self.send_message(chat_id, "已登记你为管理员（白名单为空时的首个 /start）。")
-            else:
-                return   # 非白名单：静默忽略
+        # 未配置管理员：只允许返回安全的 /start 配置提示，绝不执行工具/读文件/写计划
+        if not self.configured():
+            if text == "/start":
+                self.send_message(
+                    chat_id, "本 bot 未配置管理员。请在 telegram_config.json 中设置 "
+                             "allowed_chat_ids / owner_user_id / allowed_user_ids"
+                             "（不会自动登记陌生人）。")
+            return
+        # 统一授权：消息/命令/文件/图片全部走同一策略；拒绝时静默忽略（不泄露配置）
+        if not self.authorized(user_id, chat_id):
+            return
         if text:
             if text == "/start" or text == "/help":
                 self.cmd_help(chat_id)
             elif text == "/new":
-                sid = self.get_or_create_session(chat_id)
-                self.messages.pop(chat_id, None)
-                self.send_message(chat_id, f"已创建 会话 #{sid}，开始新任务。")
+                # 强制创建全新会话（不复用旧 ID）
+                sid = self._create_new_session(chat_id)
+                if sid:
+                    self.send_message(chat_id, f"已创建 会话 #{sid}，开始新任务。")
+                else:
+                    self.send_message(chat_id, "创建会话失败（llm_server 未运行？）")
             elif text == "/sessions":
                 self.cmd_sessions(chat_id)
             elif text.startswith("/switch"):
@@ -365,10 +499,15 @@ class Bot:
                 threading.Thread(target=self.agent_flow, args=(chat_id, text), daemon=True).start()
         elif msg.get("document") or msg.get("photo"):
             # 文件消息：下载到工作区 telegram_uploads/，供 agent 处理
-            threading.Thread(target=self.handle_file, args=(chat_id, msg), daemon=True).start()
+            threading.Thread(target=self.handle_file, args=(chat_id, msg, user_id), daemon=True).start()
 
-    def handle_file(self, chat_id: int, msg: dict) -> None:
+    def handle_file(self, chat_id: int, msg: dict, user_id: int | None = None) -> None:
         """接收手机上传的文件/图片，保存到工作区 telegram_uploads/ 并告知位置。"""
+        if not self.configured():
+            self.send_message(chat_id, "未配置管理员，bot 不接收文件。")
+            return
+        if not self.authorized(user_id, chat_id):
+            return   # 未授权成员：静默拒绝（不泄露工作区/配置信息）
         try:
             if "document" in msg:
                 doc = msg["document"]
@@ -394,11 +533,20 @@ class Bot:
                 return
             url = f"https://api.telegram.org/file/bot{self.cfg.get('bot_token', '')}/{file_path}"
             data = self.opener.open(url, timeout=60).read()
-            # 安全落盘：文件名清洗（防路径穿越），统一放 telegram_uploads/
+            # 下载后验证实际字节数：超限立即停止，不落盘
+            if len(data) > MAX_UPLOAD_BYTES:
+                self.send_message(chat_id, f"文件下载后超限（{len(data) // 1024} KB > 20MB 上限），已放弃")
+                return
+            # 安全落盘：文件名清洗（防路径穿越）+ 唯一文件名（重名不静默覆盖）
             safe_name = Path(fname).name.strip()[:120] or f"file_{int(time.time())}"
-            up_dir = Path.home() / "agent_workspace" / UPLOAD_DIR
+            up_dir = self._workspace_dir() / UPLOAD_DIR
             up_dir.mkdir(parents=True, exist_ok=True)
+            stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
             target = up_dir / safe_name
+            n = 1
+            while target.exists():
+                target = up_dir / f"{stem}_{n}{suffix}"
+                n += 1
             target.write_bytes(data)
             log.info("收到文件 %s（%d KB）→ %s", safe_name, len(data) // 1024, target)
             self.send_message(
@@ -440,7 +588,7 @@ class Bot:
         if len(parts) < 2:
             self.send_message(chat_id, "用法：/send <路径>（相对工作区或绝对路径，限工作区内）")
             return
-        ws = Path.home() / "agent_workspace"
+        ws = self._workspace_dir()
         raw = parts[1].strip()
         full = (ws / raw) if not Path(raw).is_absolute() else Path(raw)
         try:
@@ -507,30 +655,37 @@ class Bot:
                 self.send_message(chat_id, "用法：/schedule add HH:MM <任务描述>")
                 return
             hhmm = parts[2]
-            if not re.fullmatch(r"\d{2}:\d{2}", hhmm):
+            m = re.fullmatch(r"(\d{2}):(\d{2})", hhmm)
+            if not m:
                 self.send_message(chat_id, "时间格式应为 HH:MM（24 小时制）")
                 return
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                self.send_message(chat_id, f"时间无效：{hhmm}（小时 0-23，分钟 0-59）")
+                return
             prompt = " ".join(parts[3:])
-            sid = f"s{len(self.schedules) + 1}"
-            self.schedules.append({"id": sid, "time": hhmm, "prompt": prompt,
-                                   "chat_id": chat_id, "last_run": "", "enabled": True})
-            self._save_schedules()
+            with self._schedules_lock:
+                sid = self._next_schedule_id()
+                self.schedules.append({"id": sid, "time": hhmm, "prompt": prompt,
+                                       "chat_id": chat_id, "last_run": "", "enabled": True})
+                self._save_schedules()
             self.send_message(chat_id, f"✓ 已添加定时任务 #{sid}：每天 {hhmm} 执行「{prompt[:40]}」")
         elif sub in ("del", "off", "on"):
             if len(parts) < 3:
                 self.send_message(chat_id, f"用法：/schedule {sub} <id>")
                 return
-            target = next((s for s in self.schedules if s["id"] == parts[2]), None)
-            if target is None:
-                self.send_message(chat_id, f"定时任务不存在：{parts[2]}（/schedule 查看）")
-                return
-            if sub == "del":
-                self.schedules.remove(target)
-                self.send_message(chat_id, f"已删除定时任务 #{target['id']}")
-            else:
-                target["enabled"] = (sub == "on")
-                self.send_message(chat_id, f"定时任务 #{target['id']} 已{'开启' if sub == 'on' else '暂停'}")
-            self._save_schedules()
+            with self._schedules_lock:
+                target = next((s for s in self.schedules if s["id"] == parts[2]), None)
+                if target is None:
+                    self.send_message(chat_id, f"定时任务不存在：{parts[2]}（/schedule 查看）")
+                    return
+                if sub == "del":
+                    self.schedules.remove(target)
+                    self.send_message(chat_id, f"已删除定时任务 #{target['id']}")
+                else:
+                    target["enabled"] = (sub == "on")
+                    self.send_message(chat_id, f"定时任务 #{target['id']} 已{'开启' if sub == 'on' else '暂停'}")
+                self._save_schedules()
         else:
             self.send_message(chat_id, "未知子命令（add / del / on / off），/schedule 查看用法")
 
@@ -539,13 +694,15 @@ class Bot:
         while not self._stop.is_set():
             now = time.strftime("%H:%M")
             today = time.strftime("%Y-%m-%d")
-            for s in list(self.schedules):
-                if not s.get("enabled", True) or s.get("time") != now:
-                    continue
-                if (s.get("last_run") or "").startswith(today):
-                    continue    # 今天已触发
-                s["last_run"] = f"{today} {now}"
-                self._save_schedules()
+            with self._schedules_lock:
+                due = [s for s in self.schedules
+                       if s.get("enabled", True) and s.get("time") == now
+                       and not (s.get("last_run") or "").startswith(today)]
+                for s in due:
+                    s["last_run"] = f"{today} {now}"
+                if due:
+                    self._save_schedules()
+            for s in due:
                 log.info("定时任务 %s 触发: %s", s["id"], s.get("prompt", "")[:50])
                 threading.Thread(target=self.agent_flow,
                                  args=(s.get("chat_id"), s.get("prompt", "")),
@@ -614,11 +771,25 @@ class Bot:
     # ------------------------------------------------------------------ 确认回调
     def handle_callback(self, cq: dict) -> None:
         chat_id = cq["message"]["chat"]["id"]
+        user_id = (cq.get("from") or {}).get("id")
         data = (cq.get("data") or "").split(":", 1)
         choice, request_id = (data + [""])[:2]
+        # 身份验证：统一授权策略（私聊要求 owner/allowed user；群聊要求
+        # 聊天白名单 + 用户命中）——未授权成员不能批准敏感操作
         if choice in ("yes", "no") and request_id:
-            self.llm("POST", "/api/v1/agent/respond",
-                     {"request_id": request_id, "choice": choice}, timeout=10)
+            if not self.authorized(user_id, chat_id):
+                self.answer_callback(cq["id"], "未授权：你不是本 bot 的管理员")
+                return
+            status, rdata = self.llm("POST", "/api/v1/agent/respond",
+                                     {"request_id": request_id, "choice": choice}, timeout=10)
+            if status != 200:
+                # 回传失败：明确提示（不假装已确认），保留渲染状态供重试
+                detail = (rdata or {}).get("detail", f"HTTP {status}")
+                self.answer_callback(cq["id"], f"确认回传失败：{detail}")
+                st = self.stream_state.get(chat_id)
+                if st:
+                    st["frozen"] = False   # 解除冻结：用户可重新操作
+                return
         # 解冻渲染：确认已应答，恢复流式刷新
         st = self.stream_state.get(chat_id)
         if st:
@@ -627,10 +798,16 @@ class Bot:
 
     # ------------------------------------------------------------------ Agent 流程
     def agent_flow(self, chat_id: int, text: str) -> None:
-        if chat_id in self.busy:
-            self.send_message(chat_id, "正在执行上一个任务，请稍候…")
+        """每个 chat_id 串行执行：busy 检查与写入原子（独立锁），消息保持顺序。"""
+        if not self.configured():
+            self.send_message(chat_id, "未配置管理员，bot 不执行任何工具/文件/系统操作。")
             return
-        self.busy.add(chat_id)
+        lock = self._chat_lock(chat_id)
+        with lock:
+            if chat_id in self.busy:
+                self.send_message(chat_id, "正在执行上一个任务，请稍候…")
+                return
+            self.busy.add(chat_id)
         try:
             self._agent_flow(chat_id, text)
         except Exception as exc:
@@ -639,7 +816,8 @@ class Bot:
             except Exception:
                 pass
         finally:
-            self.busy.discard(chat_id)
+            with lock:
+                self.busy.discard(chat_id)
 
     def _agent_flow(self, chat_id: int, text: str) -> None:
         sid = self.get_or_create_session(chat_id)
@@ -708,9 +886,11 @@ class Bot:
     def _consume_stream(self, chat_id: int, msgs: list[dict], state: dict) -> str | None:
         """POST /chat/stream 消费 SSE；返回 None=正常结束，str=错误信息。"""
         body = json.dumps({"messages": msgs, "agent": True}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.get("llm_token"):
+            headers["X-Api-Token"] = str(self.cfg["llm_token"])
         req = urllib.request.Request(self.llm_url + "/api/v1/chat/stream", data=body,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
+                                     headers=headers, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=STREAM_TIMEOUT)
         except Exception as exc:

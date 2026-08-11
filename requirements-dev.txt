@@ -1,0 +1,4 @@
+# 测试与开发依赖（CI 与本地测试用；运行依赖见 requirements.txt）
+-r requirements.txt
+httpx>=0.27          # fastapi TestClient 依赖
+python-xlib>=0.33    # Linux 测试环境（Xvfb 下的 pyautogui）

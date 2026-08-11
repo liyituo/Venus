@@ -1,10 +1,11 @@
 """推理强度档位测试：_apply_reasoning 映射 + config 端点读写 + health 展示。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 直接调用 _apply_reasoning（纯函数）；config 端点走 TestClient，
 CONFIG_PATH 重定向到临时文件，绝不触碰真实 chat_config.json。
 """
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import json
 import sys
 import tempfile

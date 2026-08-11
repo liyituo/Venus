@@ -1,10 +1,11 @@
 """子 agent 模块测试：delegate 委派链路 / 事件透传 / 深度限制 / 工具白名单 / view_image。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 AGENTS_DIR 重定向到临时目录；上游响应打桩（TestClient 单事件循环，
 确认请求通过直接操作 _confirm_table 自动应答）。
 """
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import json
 import sys
 import tempfile

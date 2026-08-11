@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import llm_server as L  # noqa: E402
@@ -220,7 +221,8 @@ def fake_plan_upstream(api_url, payload, headers):
              "function": {"name": "create_plan", "arguments": json.dumps({
                  "steps": [
                      {"step": "查看工作区", "tools": ["list_folder"], "reason": "了解现状"},
-                     {"step": "执行命令", "tools": ["run_shell"], "reason": "需要运行命令"},
+                     {"step": "执行命令", "tools": ["run_shell"],
+                      "commands": ["echo planned-ok"], "reason": "需要运行命令"},
                  ]})}}]}}], "usage": {}}
     if n == 2:
         # 计划批准后：调计划内声明的 run_shell（应免确认直接执行）
@@ -310,7 +312,8 @@ tr_dup = next((p for k, p in events if k == "tool_result"
                and "重复规划" in p.get("result", "")), None)
 check("批准后重复规划被提示", tr_dup is not None, str(events)[:200])
 
-# 4.5 只读 MCP 工具（tavily 搜索）免规划：未规划直接调用 → 走执行分支而非拒绝
+# 4.5 未声明 MCP 工具（tavily 无显式只读声明）按写处理：plan 模式下
+#     未规划直接调用 → 要求先 create_plan（拒绝执行），不再有 server 前缀后门
 plan_seen5 = {"called": 0}
 
 def fake_mcp_readonly_upstream(api_url, payload, headers):
@@ -324,10 +327,140 @@ L._confirm_table.clear()
 events = collect_events(client, {"agent": True, "messages": [
     {"role": "user", "content": "搜一下"}]})
 tr = next((p for k, p in events if k == "tool_result"), None)
-# 测试环境 MCP 未配置：应走执行分支（报未配置），而非被拒绝（提示 create_plan）
-check("plan 模式只读 MCP 免规划（走执行分支）",
-      tr is not None and "create_plan" not in tr.get("result", ""), str(tr)[:150])
-check("plan 模式只读 MCP 无 ask", not any(k == "ask" for k, _ in events), "")
+# 测试环境 MCP 未配置且无显式只读声明：plan 模式要求先提交计划（拒绝直接执行）
+check("plan 模式未声明 MCP 需先规划（无前缀后门）",
+      tr is not None and "create_plan" in tr.get("result", ""), str(tr)[:150])
+check("plan 模式未声明 MCP 无 ask", not any(k == "ask" for k, _ in events), "")
+
+# 4.6 计划参数越权：范围外命令 → 重新确认（ask），拒绝后工具不执行
+plan_seen6 = {"called": 0}
+plan_rejects = {"n": 0}
+
+def fake_outofscope_upstream(api_url, payload, headers):
+    n = plan_seen6.get("called", 0) + 1
+    plan_seen6["called"] = n
+    if n == 1:
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p8", "type": "function",
+             "function": {"name": "create_plan", "arguments": json.dumps({
+                 "steps": [
+                     {"step": "执行命令", "tools": ["run_shell"],
+                      "commands": ["echo allowed"], "reason": "运行允许的命令"},
+                 ]})}}]}}], "usage": {}}
+    if n == 2:
+        # 批准后调用范围外命令：必须重新确认而不是免确认执行
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p9", "type": "function",
+             "function": {"name": "run_shell",
+                          "arguments": json.dumps({"command": "echo OUT_OF_SCOPE"})}}]}}], "usage": {}}
+    return {"choices": [{"message": {"role": "assistant", "content": "越权用例结束"}}], "usage": {}}
+
+def auto_respond_no():
+    while True:
+        with L._confirm_lock:
+            ids = list(L._confirm_table.keys())
+        if ids:
+            with L._confirm_lock:
+                L._confirm_table[ids[0]]["choice"] = "no"
+                L._confirm_table[ids[0]]["event"].set()
+            return
+        time.sleep(0.02)
+
+L._call_upstream_raw = fake_outofscope_upstream
+L._confirm_table.clear()
+out = []
+done6 = threading.Event()
+
+def consume6():
+    try:
+        with client.stream("POST", "/api/v1/chat/stream",
+                           json={"agent": True, "messages": [{"role": "user", "content": "执行"}]}) as r:
+            ev = ""
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    ev = line[6:].strip()
+                    continue
+                if line.startswith("data:"):
+                    payload = line[5:].strip()
+                    if ev:
+                        try:
+                            out.append((ev, json.loads(payload)))
+                        except Exception:
+                            out.append((ev, payload))
+                        ev = ""
+                    elif payload == "[DONE]":
+                        out.append(("done", None))
+    except Exception as exc:
+        out.append(("error", str(exc)))
+    finally:
+        done6.set()
+
+t6 = threading.Thread(target=consume6, daemon=True)
+t6.start()
+answered = 0
+while not done6.is_set():
+    with L._confirm_lock:
+        ids = list(L._confirm_table.keys())
+    if ids:
+        answered += 1
+        with L._confirm_lock:
+            L._confirm_table[ids[0]]["choice"] = "yes" if answered == 1 else "no"
+            L._confirm_table[ids[0]]["event"].set()
+    time.sleep(0.02)
+t6.join(timeout=30)
+
+kinds6 = [k for k, _ in out]
+trs6 = [p for k, p in out if k == "tool_result"]
+tr_scope = trs6[-1] if trs6 else None
+check("范围外命令触发重新确认（第二次 ask）", sum(1 for k, _ in out if k == "ask") >= 2,
+      str([k for k, _ in out]))
+check("范围外命令被用户拒绝后未执行",
+      tr_scope is not None and "OUT_OF_SCOPE" not in tr_scope.get("result", ""),
+      str(tr_scope)[:150])
+check("拒绝信息回传模型", tr_scope is not None and "拒绝" in tr_scope.get("result", ""),
+      str(tr_scope)[:150])
+# 计划批准 ask 带实际参数（arguments 完整 JSON 供前端展示）
+ask_plan = next((p for k, p in out if k == "ask" and p.get("name") == "create_plan"), None)
+check("计划 ask 含完整参数", ask_plan is not None and "echo allowed" in ask_plan.get("arguments", ""),
+      str(ask_plan)[:200])
+
+# 4.7 声明范围后文件类工具：范围外路径 → 重新确认
+plan_seen7 = {"called": 0}
+
+def fake_file_scope_upstream(api_url, payload, headers):
+    n = plan_seen7.get("called", 0) + 1
+    plan_seen7["called"] = n
+    if n == 1:
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p10", "type": "function",
+             "function": {"name": "create_plan", "arguments": json.dumps({
+                 "steps": [
+                     {"step": "改代码", "tools": ["replace_text"],
+                      "files": ["src/"], "reason": "修改 src 目录下代码"},
+                 ]})}}]}}], "usage": {}}
+    if n == 2:
+        # 批准后修改声明范围内文件 → 免确认
+        return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "p11", "type": "function",
+             "function": {"name": "replace_text",
+                          "arguments": json.dumps({"file": "src/a.py", "old": "old",
+                                                   "new": "new"})}}]}}], "usage": {}}
+    return {"choices": [{"message": {"role": "assistant", "content": "文件范围用例结束"}}], "usage": {}}
+
+(WS / "src").mkdir(exist_ok=True)
+(WS / "src" / "a.py").write_text("old\n", encoding="utf-8")
+L._call_upstream_raw = fake_file_scope_upstream
+L._confirm_table.clear()
+events = collect_events(client, {"agent": True, "messages": [
+    {"role": "user", "content": "改代码"}]})
+kinds7 = [k for k, _ in events]
+ask7_count = sum(1 for k, _ in events if k == "ask")
+tr7 = next((p for k, p in events if k == "tool_result" and "new" in p.get("result", "")), None)
+check("范围内文件免确认执行（仅计划批准一次 ask）", ask7_count == 1, str(ask7_count))
+check("范围内 replace_text 成功", tr7 is not None and tr7.get("ok"), str(tr7)[:150])
+check("文件已修改", (WS / "src" / "a.py").read_text(encoding="utf-8") == "new\n", "")
 
 L._current_confirm_mode = _orig_confirm_mode
 

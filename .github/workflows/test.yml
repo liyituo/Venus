@@ -6,8 +6,11 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # Windows 是主要平台：完整测试套件（统一入口自动发现全部 tests/*_test.py）
+  test-windows:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -15,46 +18,41 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: 安装依赖
-        run: |
-          pip install --quiet -r requirements.txt httpx python-xlib
+      - name: 安装依赖（requirements-dev.txt 统一管理测试依赖）
+        run: pip install --quiet -r requirements-dev.txt
 
-      - name: 冒烟测试（daemon）
-        run: xvfb-run -a python tests/smoke_test.py
+      - name: 编译检查
+        run: python -m compileall -q src tests
 
-      - name: 编程工具测试（检索/编辑/undo/git/进程/todo/超时）
-        run: python tests/llm_tools_test.py
+      - name: 依赖一致性检查
+        run: python -m pip check
 
-      - name: agent 循环端到端（ask+diff/todo/上下文上界）
-        run: python tests/agent_loop_test.py
+      - name: Ruff F/E9（未使用导入/语法级问题）
+        run: python -m ruff check --select F,E9 src tests
 
-      - name: 会话持久化测试
-        run: python tests/session_test.py
+      - name: 统一测试入口（自动发现全部 tests/*_test.py）
+        run: python tests/run_all_tests.py
 
-      - name: MCP 客户端测试（echo server 全链路）
-        run: python tests/mcp_test.py
+  # Ubuntu：隔离模式与跨平台模块（GUI 通过 mock，不操作真实鼠标键盘）
+  test-ubuntu:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: CLI 会话测试（摘要/懒加载/降级）
-        run: python tests/cli_session_test.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-      - name: 推理强度测试（max/high/off 映射与持久化）
-        run: python tests/reasoning_test.py
+      - name: 安装依赖（requirements-dev.txt 统一管理测试依赖）
+        run: pip install --quiet -r requirements-dev.txt
 
-      - name: Skill 包与系统监控测试（扫描/加载/免确认/降级）
-        run: python tests/skill_system_test.py
+      - name: 编译检查
+        run: python -m compileall -q src tests
 
-      - name: 子 agent 测试（delegate 委派/事件透传/深度限制/白名单/view_image）
-        run: |
-          python -X faulthandler -u tests/subagent_test.py 2>&1 | tee /tmp/subagent_out.txt
-          EXIT=${PIPESTATUS[0]}
-          if [ $EXIT -ne 0 ]; then
-            echo "::error::subagent_test 失败，输出尾部："
-            tail -60 /tmp/subagent_out.txt
-            exit $EXIT
-          fi
+      - name: Ruff F/E9
+        run: python -m ruff check --select F,E9 src tests
 
-      - name: 工具路由测试（规则/解析/映射/缓存/降级/集成）
-        run: python tests/tool_router_test.py
-
-      - name: 子 agent 定义结构测试（JSON/name 唯一/tools 合法）
-        run: python tests/agent_defs_test.py
+      - name: 统一测试入口（Xvfb 虚拟显示，GUI 测试走 mock）
+        run: xvfb-run -a python tests/run_all_tests.py

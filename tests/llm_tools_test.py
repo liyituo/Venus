@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import llm_server as L  # noqa: E402
@@ -164,7 +165,8 @@ check("git_status 显示变更", ok and "??" in res and "a.txt" in res, res)
 ok, res = run("git_diff", json.dumps({"path": "repo1"}))
 check("git_diff 无改动（未跟踪）", ok and "无改动" in res, res)
 
-ok, res = run("git_commit", json.dumps({"path": "repo1", "message": "first commit"}))
+ok, res = run("git_commit", json.dumps({"path": "repo1", "message": "first commit",
+                                        "files": ["repo1/a.txt"]}))
 check("git_commit 成功", ok and "committed" in ok_json(res), res)
 
 ok, res = run("git_log", json.dumps({"path": "repo1", "n": 5}))

@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import difflib
 import fnmatch
+import hashlib
 import itertools
 import json
 import logging
@@ -41,6 +42,23 @@ from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+# 工具权限元数据与判定 / MCP 接入层（显式导入：import * 不会带入下划线符号；
+# 以下名字是模块级 re-export，测试通过模块属性访问，必须保留）
+from security_policy import (  # noqa: E402,F401
+    QUERY_TOOLS, RUN_SHELL_MAX_CMD,
+    _SCREEN_TOOLS, _FILE_TOOLS, _current_confirm_mode,
+    _is_query_tool, _confirm_policy, _is_readonly_shell, _is_readonly_mcp,
+    _needs_confirm,
+)
+from mcp_manager import (  # noqa: E402,F401
+    _load_mcp_config,
+)
+# R3：Token 优化基础模块（工具结果压缩 / Provider 能力 / 提示词缓存）
+from tool_result_reducer import ResultStore, reduce_tool_result  # noqa: E402
+from provider_capabilities import build_payload as _build_payload_caps  # noqa: E402
+from provider_capabilities import load_overrides_from_config as _load_provider_overrides  # noqa: E402
+from prompt_cache import PromptCacheManager  # noqa: E402
+from subagent_router import should_delegate, RISK_LOW, RISK_MEDIUM  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -50,9 +68,16 @@ APP_VERSION = "0.7.1"       # 系统版本（health 端点返回，前端可展�
 UPSTREAM_TIMEOUT = 180  # 模型生成可能较慢（reasoner 更慢）
 DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 
+# ---- R3：全局工具结果存储（LRU）与提示词缓存管理器 ----
+_result_store = ResultStore()
+_prompt_cache = PromptCacheManager()
+# 结果压缩上限：工具结果回传模型的最大长度（head/tail/error 分区保留）
+MAX_TOOL_RESULT_CHARS = 1500
+
 # ---- Agent 安全锁（防循环调用导致系统崩溃）----
 MAX_TOOL_STEPS = 10             # 单次请求最多工具轮数
 MAX_TOOL_CALLS_TOTAL = 30       # 单次请求工具调用总数上限（一轮可含多个调用）
+MAX_TOOL_CALLS_PER_ROUND = 8    # 单轮 tool_calls 硬上限：模型一次返回过多调用直接整批拒绝
 MAX_CONSECUTIVE_FAILURES = 4    # 连续失败熔断阈值：达到即停止整个任务
 MAX_AGENT_SECONDS = 420         # 单次 agent 请求总耗时上限（含上游生成时间；max 推理思考较久，放宽至 7 分钟）
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
@@ -60,103 +85,36 @@ _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 age
 
 # ---- 敏感操作确认机制 ----
 CONFIRM_TIMEOUT = 120          # 等待用户确认超时（秒），超时默认拒绝（安全方向）
-_confirm_table: dict = {}      # request_id -> {"event": Event, "choice": str|None}
+_confirm_table: dict = {}      # request_id -> {"event", "choice", "task_id", "source", "expires"}
 _confirm_lock = threading.Lock()
-_confirm_counter = itertools.count(1)
 
-# run_shell 只读命令白名单：命中则无需确认（其余命令默认需要确认）
-READONLY_SHELL = re.compile(
-    r"^\s*(ls|cat|head|tail|grep|find|echo|pwd|whoami|date|df|du|uname|ps|env|"
-    r"which|type|file|stat|wc|sort|cut|awk|sed -n|history|printenv|id|hostname|"
-    r"uptime|free|getconf|locale)\b"
-)
-# Windows（cmd）只读命令白名单：Linux 白名单 + cmd 原生只读命令
-READONLY_SHELL_WIN = re.compile(
-    r"^\s*(ls|cat|head|tail|grep|find|echo|pwd|whoami|date|df|du|uname|ps|env|"
-    r"which|type|file|stat|wc|sort|cut|awk|sed -n|history|printenv|id|hostname|"
-    r"uptime|free|getconf|locale|dir|more|findstr|where|tasklist|systeminfo|"
-    r"ver|set|path|cd|cls|help|netstat|ipconfig|reg query)\b"
-)
+# 当前 agent 任务 ID（确认请求绑定用：已取消/已完成/过期任务的确认一律拒绝）
+_current_agent_task_id = ""
+_agent_task_lock = threading.Lock()
 
-# 确认请求需要发 ask 事件的敏感工具
-CONFIRM_TOOLS = {"create_file", "run_shell", "replace_text", "git_commit", "start_process", "undo"}
+
+def _new_confirm_id(task_id: str) -> str:
+    """随机不可预测确认 ID（防猜测/防跨任务应答）。"""
+    import uuid
+    return f"ask-{uuid.uuid4().hex[:16]}-{task_id}"
+
+
 
 # ---- 问询模式（五种）----
 CONFIRM_MODES = ("auto", "strict", "trusted", "query", "plan")
 CONFIRM_MODE_DESC = {
     "auto":    "智能：敏感写操作确认，只读命令免确认（默认）",
     "strict":  "严格：所有修改/执行类操作都需确认",
-    "trusted": "信任：全部自动执行（危险命令黑名单仍拦截）",
+    "trusted": "信任：全部自动执行（危险命令黑名单仍拦截，工作区路径限制与调用上限仍生效）",
     "query":   "只读：仅允许查询操作，一切修改直接拒绝",
     "plan":    "计划：任务先列计划表格（步骤+所需工具），统一批准后按计划执行，计划内免确认",
 }
-QUERY_TOOLS = {  # 查询类工具（任何模式都放行）
-    "list_folder", "read_file", "get_screen_size",
-    "search_text", "glob_files", "list_symbols",
-    "git_status", "git_diff", "git_log",
-    "process_output", "list_processes", "list_todos", "repo_map",
-    "load_skill", "system_status", "view_image",
-}
-
-
-def _current_confirm_mode() -> str:
-    return str(load_config().get("confirm_mode", "auto"))
-
-
-# 只读 MCP server 前缀：其全部工具视为查询操作（auto 免确认 / plan 免规划）
-# 当前：tavily（网络搜索/提取）、amap（地图查询，脚本 scripts/mcp_servers/amap_server.py）
-MCP_READONLY_PREFIXES = ("mcp_tavily_", "mcp_amap_")
-
-# 混合型 server（如 spotify：搜索只读、播放写）按工具名精确标记只读
-MCP_READONLY_TOOLS = {
-    "mcp_spotify_search_tracks", "mcp_spotify_search_artists", "mcp_spotify_search_albums",
-    "mcp_spotify_get_album_tracks", "mcp_spotify_get_my_playlists",
-    "mcp_spotify_get_my_top_artists", "mcp_spotify_get_my_top_tracks",
-    "mcp_spotify_get_now_playing", "mcp_spotify_get_playlist_tracks",
-    "mcp_spotify_get_saved_tracks", "mcp_spotify_get_server_version",
-}
-
-
-def _is_readonly_mcp(name: str) -> bool:
-    return any(name.startswith(p) for p in MCP_READONLY_PREFIXES) or name in MCP_READONLY_TOOLS
-
-
-def _confirm_policy(name: str, args: dict) -> str:
-    """按当前问询模式决定工具处理方式。
-    返回：allow（直接执行）/ ask（需用户确认）/ deny（直接拒绝）
-    """
-    mode = _current_confirm_mode()
-    if mode == "trusted":
-        return "allow"
-    is_query = name in QUERY_TOOLS or _is_readonly_mcp(name) or (
-        name == "run_shell" and _is_readonly_shell((args.get("command") or "").strip()))
-    if mode == "query":
-        return "allow" if is_query else "deny"
-    if mode == "strict":
-        return "allow" if is_query else "ask"
-    # auto
-    if name.startswith("mcp_"):
-        if _is_readonly_mcp(name):
-            return "allow"    # 只读 MCP（如 tavily 搜索）：免确认
-        return "ask"    # MCP 外部工具保守处理：一律确认（trusted 模式已放行）
-    return "ask" if _needs_confirm(name, args) else "allow"
 
 
 class ConfirmModeRequest(BaseModel):
     mode: str = Field(..., description="auto / strict / trusted / query")
 
 
-# 隔离模式（--isolated）：禁用屏幕操作工具，只保留文件/系统类工具。
-# WSL 隔离测试环境使用，代码层面保证 agent 无法操作任何屏幕。
-_SCREEN_TOOLS = {"get_screen_size", "click", "type_text", "press_key"}
-_FILE_TOOLS = {
-    "create_folder", "list_folder", "create_file", "read_file", "run_code", "run_shell",
-    "search_text", "glob_files", "list_symbols", "replace_text", "undo",
-    "git_status", "git_diff", "git_log", "git_commit",
-    "start_process", "process_output", "stop_process", "list_processes",
-    "create_todo", "update_todo", "list_todos", "repo_map",
-    "load_skill", "system_status", "view_image", "delegate",
-}
 ISOLATED = False
 
 # ---- 文件/系统工具安全限制 ----
@@ -168,7 +126,6 @@ RUN_CODE_TIMEOUT = 30        # run_code 执行超时（秒），超时即 kill
 RUN_CODE_OUTPUT_LIMIT = 2000 # run_code 输出截断（字符）
 RUN_SHELL_TIMEOUT = 30       # run_shell 执行超时（秒），超时即 kill
 RUN_SHELL_OUTPUT_LIMIT = 3000
-RUN_SHELL_MAX_CMD = 2000     # 命令长度上限
 
 # run_shell 危险命令黑名单（破坏性操作，正则匹配即拦截）
 DANGEROUS_PATTERNS = [
@@ -220,9 +177,8 @@ SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
 # ---- Token 用量优化 ----
 MAX_HISTORY_MESSAGES = 20    # 发送给上游的消息数上限（保留 system + 最近 N 条）
 MAX_HISTORY_CHARS = 120_000  # 发送给上游的总字符硬上限（约 96K tokens，防长消息累积激增）
-MAX_TOOL_RESULT_CHARS = 1500 # 工具结果回传模型的最大长度（超出截断并提示）
 
-# ---- Token 用量统计（缓存命中率）----
+# ---- Token 用量统计（缓存命中率 / 每请求明细）----
 _stats_lock = threading.Lock()
 _stats = {
     "calls": 0,             # 上游调用次数
@@ -231,6 +187,7 @@ _stats = {
     "completion_tokens": 0, # 输出 token 总数
     "reasoning_tokens": 0,  # 其中推理 token
 }
+_recent_usage: deque = deque(maxlen=200)   # 每请求 usage 明细（环形，供 /api/v1/usage）
 
 
 def _trim_messages(messages: list[dict]) -> list[dict]:
@@ -264,7 +221,10 @@ def _trim_messages(messages: list[dict]) -> list[dict]:
 
 
 def _record_usage(usage) -> None:
-    """聚合一次上游调用的 usage（线程安全）。兼容 DeepSeek / OpenAI 字段。"""
+    """聚合一次上游调用的 usage（线程安全）。兼容 DeepSeek / OpenAI 字段。
+
+    只记录数字与聚合值，不记录任何消息正文/密钥；明细环形保留 200 条。
+    """
     if not isinstance(usage, dict):
         return
     prompt = usage.get("prompt_tokens") or 0
@@ -283,16 +243,22 @@ def _record_usage(usage) -> None:
         _stats["cached_tokens"] += cached
         _stats["completion_tokens"] += completion
         _stats["reasoning_tokens"] += reasoning
+        _recent_usage.append({
+            "ts": time.time(),
+            "prompt_tokens": prompt, "cached_tokens": cached,
+            "completion_tokens": completion, "reasoning_tokens": reasoning,
+        })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("llm-backend")
 
 
 def _setup_file_logging() -> None:
-    """统一运行日志：写入项目根 .pcagent/server.log（1MB 轮转，保留 3 份）。"""
+    """统一运行日志：写入数据目录 server.log（1MB 轮转，保留 3 份）。"""
     try:
         from logging.handlers import RotatingFileHandler
-        log_dir = BASE_DIR.parent / ".pcagent"
+        from data_paths import data_dir
+        log_dir = data_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         fh = RotatingFileHandler(log_dir / "server.log", maxBytes=1_000_000,
                                  backupCount=3, encoding="utf-8")
@@ -329,10 +295,36 @@ def load_config() -> dict:
     }
     if CONFIG_PATH.exists():
         try:
-            return {**default, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
+            cfg = {**default, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
+            # 密钥安全存储：配置中为占位符时从 secure_store 读取真实值
+            for secret_key in ("api_key", "vision_api_key"):
+                if (cfg.get(secret_key) or "") == "__secure__":
+                    try:
+                        from secure_store import load as ss_load
+                        cfg[secret_key] = ss_load(secret_key)
+                    except Exception:
+                        cfg[secret_key] = ""
+            return cfg
         except Exception:
             log.warning("chat_config.json 解析失败，使用默认配置")
     return default
+
+
+def _write_config_atomic(cfg: dict) -> None:
+    """原子写配置（临时文件 + replace），权限限制为当前用户（POSIX 0600）。"""
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    if sys.platform != "win32":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    tmp.replace(CONFIG_PATH)
+    if sys.platform != "win32":
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
 
 
 def _apply_reasoning(payload: dict, mode: str | None = None) -> None:
@@ -503,52 +495,6 @@ def _call_router(query: str, cfg: dict) -> str | None:
     return data.get("message", {}).get("content") or ""
 
 
-def _route_tools(messages: list[dict]) -> list[dict] | None:
-    """路由入口：返回应注入的工具子集；返回 None = 降级（全量工具）。
-
-    调用链：开关检查 → 缓存 → 规则 → 模型 → 宽松解析；任一步失败回退全量。
-    """
-    cfg = load_config()
-    if not cfg.get("tool_router"):
-        return None
-    # 取最后一条用户消息作路由依据
-    query = next((m.get("content", "") for m in reversed(messages)
-                  if m.get("role") == "user"), "")
-    if not query:
-        return None
-    cache_key = query[:80]
-    now = time.monotonic()
-    with _router_lock:
-        hit = _router_cache.get(cache_key)
-        if hit and now - hit[0] < ROUTER_CACHE_TTL:
-            cat = hit[1]
-            if cat is not None:
-                tools = _tools_for_category(cat)
-                log.info("router 缓存命中: %s（%d 工具）", cat, len(tools))
-                return tools
-            return None
-    # 规则前置
-    cat = _route_rules(query)
-    src = "规则"
-    if cat is None:
-        # 模型路由
-        try:
-            out = _call_router(query, cfg)
-            cat = _parse_route_output(out)
-            src = "模型"
-        except Exception as exc:
-            log.warning("router 模型调用失败（降级全量）: %s", exc)
-            cat = None
-    with _router_lock:
-        _router_cache[cache_key] = (time.monotonic(), cat)
-    if cat is None:
-        log.info("router 未命中（降级全量）: %.60s", query)
-        return None
-    tools = _tools_for_category(cat)
-    log.info("router %s命中 %s: %d 工具（%.60s）", src, cat, len(tools), query)
-    return tools
-
-
 def _active_mcp_servers(messages: list[dict], max_rounds: int = 2) -> set[str]:
     """多轮任务保持：最近 N 轮 assistant tool_calls 里用过的 MCP server。
 
@@ -565,7 +511,15 @@ def _active_mcp_servers(messages: list[dict], max_rounds: int = 2) -> set[str]:
         for tc in m["tool_calls"]:
             name = (tc.get("function") or {}).get("name", "")
             if name.startswith("mcp_"):
-                servers.add(name.split("_", 2)[1])
+                mcp = _ensure_mcp()
+                server = mcp.server_of(name) if mcp is not None else None
+                if server is None:
+                    # 未连接 MCP（测试环境）：回退旧式解析
+                    parts = name.split("_", 2)
+                    if len(parts) == 3:
+                        server = parts[1]
+                if server:
+                    servers.add(server)
         if rounds >= max_rounds:
             break
     return servers
@@ -664,6 +618,9 @@ class ConfigUpdate(BaseModel):
     model: str | None = None
     context_window: int | None = None
     reasoning_mode: str | None = None
+    vision_api_url: str | None = None
+    vision_api_key: str | None = None
+    vision_model: str | None = None
 
 
 class LlmError(Exception):
@@ -708,7 +665,7 @@ async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
     cfg = load_config()
     cfg["confirm_mode"] = req.mode
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_config_atomic(cfg)
     except OSError as exc:
         raise HTTPException(500, f"配置写入失败：{exc}") from exc
     log.info("confirm mode -> %s", req.mode)
@@ -717,6 +674,83 @@ async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
 
 # 可选 token 鉴权：--token 启动时启用，所有请求须带 X-Api-Token 头
 AUTH_TOKEN = ""
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _token_ok(request) -> bool:
+    """常量时间比较验证 token（防时序攻击）。"""
+    if not AUTH_TOKEN:
+        return True
+    import hmac
+    return hmac.compare_digest(request.headers.get("X-Api-Token", ""), AUTH_TOKEN)
+
+
+def _parse_host_header(host: str) -> str | None:
+    """解析 Host 头为规范 hostname；非法格式（userinfo/多余冒号/坏端口）返回 None。
+
+    支持：127.0.0.1、localhost、[::1]、上述形式携带合法数字端口。
+    """
+    host = (host or "").strip()
+    if not host:
+        return None
+    if host.startswith("["):
+        # IPv6 字面量：[::1] 或 [::1]:8000
+        end = host.find("]")
+        if end < 0:
+            return None
+        inner = host[1:end]
+        rest = host[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return None
+        return inner.lower()
+    if "@" in host or host.count(":") > 1:
+        return None   # userinfo 或裸 IPv6 未加括号：拒绝
+    if ":" in host:
+        hostname, _, port = host.partition(":")
+        if not port.isdigit():
+            return None
+        return hostname.lower()
+    return host.lower()
+
+
+def _is_loopback(host: str) -> bool:
+    hostname = _parse_host_header(host)
+    if hostname is None:
+        return False
+    return hostname in _LOOPBACK_HOSTS
+
+
+@app.middleware("http")
+async def host_guard(request, call_next):
+    """Host/Origin 限制：防 DNS rebinding（恶意域名解析到本机）与跨站请求。
+
+    - Host 必须是本机回环地址（或 ::1）；
+    - Origin 若存在必须是本机来源（浏览器跨站防护）。
+    """
+    # Origin 检查先于 Host（与 Host 白名单分支互不影响）
+    origin = request.headers.get("origin")
+    if origin:
+        # URL 解析后精确比较 hostname（拒绝 http://localhost.evil.example 等欺骗）
+        from urllib.parse import urlparse as _up
+        try:
+            o = _up(origin)
+            ohost = (o.hostname or "").lower()
+        except Exception:
+            ohost = ""
+        if ohost not in _LOOPBACK_HOSTS or o.scheme not in ("http", "https"):
+            return JSONResponse(status_code=403,
+                                content={"detail": "非法 Origin（仅允许本机来源）"})
+    host = request.headers.get("host", "")
+    hostname = _parse_host_header(host)
+    if hostname is None or hostname not in _LOOPBACK_HOSTS:
+        # 测试环境（TestClient 默认 testserver）白名单：不放开任意 Host
+        if (os.environ.get("PCAGENT_ALLOW_TEST_HOST") == "1"
+                and hostname in ("testserver", "testclient", "localhost")):
+            return await call_next(request)
+        return JSONResponse(status_code=403,
+                            content={"detail": "非法 Host（仅允许本机回环访问）"})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -731,7 +765,7 @@ async def log_requests(request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request, call_next):
-    if AUTH_TOKEN and request.headers.get("X-Api-Token") != AUTH_TOKEN:
+    if AUTH_TOKEN and not _token_ok(request):
         return JSONResponse(
             status_code=401,
             content={"detail": "未授权：需要正确的 X-Api-Token（llm_server 已启用 token 鉴权）"},
@@ -739,19 +773,89 @@ async def auth_middleware(request, call_next):
     return await call_next(request)
 
 
+# 结构化压缩：schema 版本 + 稳定结构（规格第六章）
+SUMMARY_SCHEMA_VERSION = 1
 COMPRESS_PROMPT = (
     "你是一个上下文压缩引擎。以下是 Agent 与用户之间的早期对话历史（JSON 格式）。\n"
-    "请将其压缩为一份简洁的中文摘要，**保留对后续任务有用的信息**：\n"
-    "- 用户的核心需求与偏好\n"
-    "- 已完成的任务与结果\n"
-    "- 进行中的任务与状态\n"
-    "- 创建/修改/浏览过的文件路径\n"
-    "- 重要的决定、约束与错误教训\n"
-    "忽略寒暄和无关内容。只输出摘要正文，200 字以内，不要解释。"
+    "请压缩为**一个 JSON 对象**（不要其他文字、不要 markdown 围栏），字段：\n"
+    '{"objective": "", "success_criteria": [], "user_constraints": [], '
+    '"decisions": [], "assumptions": [], "completed_actions": [], '
+    '"files_and_artifacts": [], "commands_and_results": [], '
+    '"active_errors": [], "open_tasks": [], "pending_confirmations": [], '
+    '"tool_state": [], "workspace": "", "retrieval_keys": []}\n'
+    "规则：\n"
+    "- 只记录外部可验证的任务状态，不保存或伪造模型思维过程；\n"
+    "- 文件路径、函数名、错误文本、数字、版本、用户约束**尽量原样保存**；\n"
+    "- retrieval_keys：从历史中提取后续可能被引用的检索键（文件路径、函数名、端口号、版本号、约束短语），"
+    "供按需检索原始消息；\n"
+    "- 未完成任务、失败状态、关键决定必须保留，不得遗漏；\n"
+    "- 忽略寒暄和无关内容。JSON 总长控制在 400 字以内，不要解释。"
 )
 
 
-@app.post("/api/v1/compress", summary="上下文压缩（模型摘要早期对话）")
+def _extract_evidence_keys(early: list[dict]) -> list[str]:
+    """从早期对话提取证据键（路径/错误/数字），供摘要一致性校验与检索。"""
+    text = " ".join(str(m.get("content") or "") for m in early)
+    keys: set[str] = set()
+    for m in re.finditer(r"(?:^|[\s\"'(])([A-Za-z0-9_./\\\-]+\.(?:py|js|ts|json|md|html|css|txt|bat|sh|yml|yaml|toml|ini|png|jpg|exe))", text):
+        keys.add(m.group(1))
+    for m in re.finditer(r"(?:Error|Exception|Traceback|Failed)\s*[:：]?\s*([^\n，。]{4,60})", text):
+        keys.add(m.group(1).strip()[:40])
+    for m in re.finditer(r"\b(?:port|端口|version|版本|exit\s+code)\b[\s:：]*(\d+)", text, re.I):
+        keys.add(m.group(1))
+    return sorted(k for k in keys if k)[:30]
+
+
+def _summary_to_text(summary: dict) -> str:
+    """结构化摘要 → 注入上下文的稳定文本（顺序固定，不随时间变化）。
+
+    集合语义字段（标准/约束/决定/任务）排序后再拼接：相同逻辑 → 相同文本
+    （提示词缓存与一致性要求）；有序字段（已完成/命令结果）保持原文顺序。
+    """
+    parts = []
+    if summary.get("objective"):
+        parts.append(f"目标：{summary['objective']}")
+    for label, key in (("成功标准", "success_criteria"), ("用户约束", "user_constraints"),
+                       ("已确认决定", "decisions"), ("未完成任务", "open_tasks"),
+                       ("等待确认", "pending_confirmations")):
+        vals = summary.get(key) or []
+        if vals:
+            parts.append(f"{label}：" + "；".join(sorted(str(v) for v in vals)))
+    if summary.get("assumptions"):
+        parts.append("假设：" + "；".join(sorted(str(v) for v in summary["assumptions"])))
+    if summary.get("completed_actions"):
+        parts.append("已完成：" + "；".join(str(v) for v in summary["completed_actions"]))
+    if summary.get("files_and_artifacts"):
+        parts.append("文件：" + "；".join(str(v) for v in summary["files_and_artifacts"]))
+    if summary.get("active_errors"):
+        parts.append("未解决错误：" + "；".join(str(v) for v in summary["active_errors"]))
+    if summary.get("commands_and_results"):
+        parts.append("命令与结果：" + "；".join(str(v) for v in summary["commands_and_results"]))
+    if summary.get("workspace"):
+        parts.append(f"工作区：{summary['workspace']}")
+    return "\n".join(parts) or "（摘要为空）"
+
+
+def _validate_summary(summary: dict, evidence_keys: list[str]) -> tuple[bool, str]:
+    """摘要一致性校验：失败不得替换原始上下文。
+
+    - 路径类证据键：摘要必须覆盖大部分（缺失即判定遗漏风险）；
+    - 必须含 objective 或 open_tasks（否则摘要无法支撑后续任务）。
+    """
+    if not isinstance(summary, dict):
+        return False, "摘要不是 JSON 对象"
+    if not (summary.get("objective") or summary.get("open_tasks")):
+        return False, "摘要缺少目标或未完成任务（一致性校验失败）"
+    if evidence_keys:
+        joined = " ".join(str(v) for v in summary.values())
+        covered = sum(1 for k in evidence_keys if k in joined)
+        if covered < max(1, int(len(evidence_keys) * 0.4)):
+            return False, (f"摘要遗漏关键路径/错误（覆盖 {covered}/{len(evidence_keys)}，"
+                           f"一致性校验失败）")
+    return True, "ok"
+
+
+@app.post("/api/v1/compress", summary="上下文压缩（结构化摘要：schema + 校验 + 检索键）")
 async def compress(req: CompressRequest) -> dict:
     cfg = load_config()
     api_url = normalize_url(cfg.get("api_url"))
@@ -769,8 +873,9 @@ async def compress(req: CompressRequest) -> dict:
     keep = others[-req.keep_recent:]
     early = others[:-req.keep_recent]
     early_json = json.dumps(early, ensure_ascii=False)
+    evidence_keys = _extract_evidence_keys(early)
 
-    # 用模型生成早期对话摘要（非流式，少量 token）；摘要任务关闭思考，更快更省
+    # 用模型生成结构化摘要（非流式，少量 token）；摘要任务关闭思考，更快更省
     payload = {
         "model": model,
         "messages": [
@@ -778,7 +883,7 @@ async def compress(req: CompressRequest) -> dict:
             {"role": "user", "content": early_json},
         ],
         "temperature": 0.3,
-        "max_tokens": 500,
+        "max_tokens": 800,
     }
     _apply_reasoning(payload, "off")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -787,12 +892,33 @@ async def compress(req: CompressRequest) -> dict:
         data = await loop.run_in_executor(None, _call_upstream_raw, api_url, payload, headers)
     except LlmError as exc:
         raise HTTPException(exc.status, exc.message) from exc
-    summary = (data["choices"][0]["message"].get("content") or "").strip()
-    if not summary:
+    raw = (data["choices"][0]["message"].get("content") or "").strip()
+    if not raw:
         raise HTTPException(502, "摘要生成失败（模型返回空内容）")
+    # 解析 JSON（容忍 markdown 围栏）
+    parsed: dict | None = None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+        if fence:
+            try:
+                parsed = json.loads(fence.group(1))
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+    if parsed is None:
+        raise HTTPException(502, "摘要不是合法 JSON，已放弃本次压缩（保留原始上下文）")
+    ok, why = _validate_summary(parsed, evidence_keys)
+    if not ok:
+        log.warning("compress 校验失败：%s", why)
+        raise HTTPException(502, f"摘要一致性校验失败：{why}（已保留原始上下文）")
 
+    summary_text = _summary_to_text(parsed)
+    retrieval_keys = [str(k) for k in (parsed.get("retrieval_keys") or [])][:40]
     new_msgs = system + [
-        {"role": "system", "content": f"（较早对话的摘要，用于替代被压缩的历史）{summary}"},
+        {"role": "system",
+         "content": f"（较早对话的结构化摘要 v{SUMMARY_SCHEMA_VERSION}，用于替代被压缩的历史）"
+                    f"{summary_text}"},
     ] + keep
 
     def _chars(ms):
@@ -806,10 +932,15 @@ async def compress(req: CompressRequest) -> dict:
         "before_chars": before_c,
         "after_chars": after_c,
         "saved_chars": before_c - after_c,
+        "schema_version": SUMMARY_SCHEMA_VERSION,
+        "summary_hash": hashlib.sha256(early_json.encode("utf-8")).hexdigest()[:12],
+        "evidence_keys": len(evidence_keys),
+        "retrieval_keys": retrieval_keys,
     }
-    log.info("compress: %d -> %d messages, saved %d chars", len(msgs), len(new_msgs),
-             before_c - after_c)
-    return {"ok": True, "compressed": True, "messages": new_msgs, "summary": summary, "stats": stats}
+    log.info("compress: %d -> %d messages, saved %d chars, keys=%d",
+             len(msgs), len(new_msgs), before_c - after_c, len(retrieval_keys))
+    return {"ok": True, "compressed": True, "messages": new_msgs,
+            "summary": summary_text, "stats": stats}
 
 
 @app.get("/api/v1/config", summary="查看 API 配置（Key 脱敏）")
@@ -832,8 +963,47 @@ async def update_config(req: ConfigUpdate) -> dict:
         cfg["api_url"] = req.api_url.strip()
         updates["api_url"] = True
     if req.api_key is not None:
-        cfg["api_key"] = req.api_key.strip()
+        key = req.api_key.strip()
+        if key:
+            # 密钥安全存储：真实 Key 进 DPAPI/受限文件，配置只保留占位符
+            try:
+                from secure_store import store as ss_store
+                ss_store("api_key", key)
+            except Exception as exc:
+                raise HTTPException(500, f"密钥安全存储失败：{exc}（未保存 Key）") from exc
+            cfg["api_key"] = "__secure__"
+        else:
+            # 清空 Key：同步删除 secure store 旧值（不留残留凭据）
+            cfg["api_key"] = ""
+            try:
+                from secure_store import delete as ss_delete
+                ss_delete("api_key")
+            except Exception:
+                pass
         updates["api_key"] = True
+    if req.vision_api_url is not None:
+        cfg["vision_api_url"] = req.vision_api_url.strip()
+        updates["vision_api_url"] = True
+    if req.vision_api_key is not None:
+        vkey = req.vision_api_key.strip()
+        if vkey:
+            try:
+                from secure_store import store as ss_store
+                ss_store("vision_api_key", vkey)
+            except Exception as exc:
+                raise HTTPException(500, f"视觉密钥安全存储失败：{exc}（未保存 Key）") from exc
+            cfg["vision_api_key"] = "__secure__"
+        else:
+            cfg["vision_api_key"] = ""
+            try:
+                from secure_store import delete as ss_delete
+                ss_delete("vision_api_key")
+            except Exception:
+                pass
+        updates["vision_api_key"] = True
+    if req.vision_model is not None:
+        cfg["vision_model"] = req.vision_model.strip()
+        updates["vision_model"] = True
     if req.model is not None:
         cfg["model"] = req.model.strip()
         updates["model"] = True
@@ -849,9 +1019,22 @@ async def update_config(req: ConfigUpdate) -> dict:
         updates["reasoning_mode"] = True
     if not updates:
         raise HTTPException(
-            422, "没有可更新的字段（支持 api_url/api_key/model/context_window/reasoning_mode）")
+            422, "没有可更新的字段（支持 api_url/api_key/model/context_window/"
+                 "reasoning_mode/vision_api_url/vision_api_key/vision_model）")
+    # 写盘前脱敏：内存中的真实密钥（secure store 读出的明文）绝不落盘，
+    # 未在本请求中更新的密钥字段替换回占位符
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        from secure_store import load as ss_has
+        for secret_key in ("api_key", "vision_api_key"):
+            if cfg.get(secret_key) and cfg.get(secret_key) != "__secure__":
+                if ss_has(secret_key):
+                    cfg[secret_key] = "__secure__"
+                else:
+                    cfg[secret_key] = ""
+    except Exception:
+        pass
+    try:
+        _write_config_atomic(cfg)
     except OSError as exc:
         raise HTTPException(500, f"配置写入失败：{exc}") from exc
     log.info("config updated: %s", updates)
@@ -884,9 +1067,43 @@ async def list_agents() -> dict:
         {k: v for k, v in a.items() if k != "system_prompt"} for a in _scan_agents()]}
 
 
+@app.get("/api/v1/workspace", summary="查看当前工作区")
+async def get_workspace() -> dict:
+    ws = _get_workspace()
+    return {"ok": True, "workspace": str(ws)}
+
+
+class WorkspaceUpdate(BaseModel):
+    path: str = Field(..., description="工作区目录（绝对路径，须存在）")
+
+
+@app.post("/api/v1/workspace", summary="切换工作区（持久化；旧任务检测到切换后自动中止）")
+async def set_workspace(req: WorkspaceUpdate) -> dict:
+    global _workspace_path, _workspace_epoch
+    p = _resolve_workspace(req.path)
+    if p is None:
+        raise HTTPException(422, f"工作区目录无效或不存在：{req.path}")
+    with _workspace_lock:
+        _workspace_path = p
+        _workspace_epoch += 1
+    # 持久化到配置（resolve 后保存）
+    cfg = load_config()
+    cfg["workspace"] = str(p)
+    try:
+        _write_config_atomic(cfg)
+    except OSError as exc:
+        log.warning("工作区配置保存失败：%s", exc)
+    log.info("workspace -> %s（epoch %d）", p, _workspace_epoch)
+    return {"ok": True, "workspace": str(p), "epoch": _workspace_epoch}
+
+
 @app.get("/api/v1/health", summary="LLM 后端健康检查")
 async def health() -> dict:
     cfg = load_config()
+    # 工具枚举可能触发 MCP 连接等待：放到线程池，不阻塞 FastAPI 事件循环
+    loop = asyncio.get_running_loop()
+    tools = await loop.run_in_executor(
+        None, lambda: sorted(t["function"]["name"] for t in _agent_tools()))
     return {
         "ok": True,
         "version": APP_VERSION,
@@ -896,7 +1113,123 @@ async def health() -> dict:
         "context_window": cfg.get("context_window") or 65536,
         "reasoning_mode": cfg.get("reasoning_mode", "max"),
         "isolated": ISOLATED,
-        "tools": sorted(t["function"]["name"] for t in _agent_tools()),
+        "workspace": str(_get_workspace()),
+        "tools": tools,
+        "usage": _usage_summary(),
+    }
+
+
+@app.get("/api/v1/usage", summary="Token 用量统计（聚合 + 最近明细，无正文）")
+async def usage_stats() -> dict:
+    """Token 可观测性：聚合统计 + 缓存命中率 + 最近 N 次请求明细。
+
+    只含数字指标，不含任何消息正文、密钥或用户数据。统计失败不影响聊天主流程。
+    """
+    return _usage_summary(recent=True)
+
+
+def _usage_summary(recent: bool = False) -> dict:
+    """读取聚合用量（线程安全）。recent=True 时附加最近请求明细。"""
+    with _stats_lock:
+        stats = dict(_stats)
+        recent_list = list(_recent_usage) if recent else []
+    total_prompt = stats.get("prompt_tokens", 0)
+    cached = stats.get("cached_tokens", 0)
+    out = {
+        "calls": stats.get("calls", 0),
+        "prompt_tokens": total_prompt,
+        "cached_tokens": cached,
+        "uncached_tokens": max(0, total_prompt - cached),
+        "completion_tokens": stats.get("completion_tokens", 0),
+        "reasoning_tokens": stats.get("reasoning_tokens", 0),
+        "cache_hit_rate": (cached / total_prompt) if total_prompt else 0.0,
+        "total_tokens": total_prompt + stats.get("completion_tokens", 0),
+    }
+    if recent:
+        out["recent"] = recent_list
+    # 提示词缓存观测（本地构造层；不伪造供应商缓存命中）
+    try:
+        out["prefix_cache"] = _prompt_cache.metrics()
+    except Exception:
+        out["prefix_cache"] = {}
+    return out
+
+
+@app.get("/api/v1/diagnostics", summary="可见诊断入口（健康状态 + 脱敏导出）")
+async def diagnostics(redact: int = 1) -> dict:
+    """展示 Daemon/LLM/MCP/secure store 健康状态；默认脱敏（redact=1）。
+
+    绝不包含 api_key/token/Authorization 原文与用户消息正文；诊断失败
+    不影响聊天主流程（各分项独立容错）。
+    """
+    cfg = load_config()
+    daemon = {"status": "unknown", "detail": ""}
+    try:
+        code, data, _ = _call_daemon("GET", "/api/v1/status", timeout=5)
+        if code == 200 and data:
+            daemon = {"status": "ok", "detail": {
+                "screen": data.get("screen_size"),
+                "busy": data.get("busy"),
+                "queued": data.get("queued"),
+            }}
+        else:
+            daemon = {"status": "error", "detail": f"HTTP {code}"}
+    except Exception as exc:
+        daemon = {"status": "error", "detail": str(exc)[:200]}
+
+    mcp = []
+    try:
+        from mcp_manager import get_manager_state
+        for server in get_manager_state():
+            mcp.append({
+                "name": server.get("name"),
+                "connected": bool(server.get("connected")),
+                "tool_count": int(server.get("tool_count") or 0),
+                "error": (server.get("error") or "")[:200],
+            })
+    except Exception as exc:
+        mcp = [{"name": "(manager 不可用)", "connected": False,
+                "tool_count": 0, "error": str(exc)[:200]}]
+
+    secure = {"status": "unknown"}
+    try:
+        from secure_store import _secrets_path
+        p = _secrets_path()
+        secure = {
+            "status": "ok" if p.exists() else "empty",
+            "path": str(p) if redact == 0 else "…/secrets.json",
+            "keys": [],
+        }
+    except Exception as exc:
+        secure = {"status": "error", "detail": str(exc)[:200]}
+
+    # 会话状态（不含正文）
+    _ensure_sessions()
+    session_summary = {
+        "count": len(_sessions),
+        "unbound": sum(1 for s in _sessions.values() if not s.get("workspace")),
+    }
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "llm": {
+            "configured": bool(cfg.get("api_url") and cfg.get("api_key")),
+            "model": cfg.get("model") or "",
+            "api_url": normalize_url(cfg.get("api_url")) if redact == 0 else (
+                "…/" + (normalize_url(cfg.get("api_url") or "").rsplit("/", 1)[-1])
+                if cfg.get("api_url") else ""),
+            "api_key": "***" if cfg.get("api_key") else "",
+            "vision_configured": bool(cfg.get("vision_api_url")
+                                      and cfg.get("vision_api_key")),
+        },
+        "daemon": daemon,
+        "mcp": mcp,
+        "secure_store": secure,
+        "telegram": {"note": "Telegram bot 为独立进程，健康状态由 bot 自身日志记录"},
+        "sessions": session_summary,
+        "workspace": str(_get_workspace()),
+        "isolated": ISOLATED,
     }
 
 
@@ -1020,10 +1353,56 @@ AGENT_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "读取工作区内文件的内容（UTF-8 文本）。超过 10000 字符会被截断。",
+        "description": "读取工作区内文件的内容（UTF-8 文本）。可用 start_line/end_line 读取指定行范围"
+                       "（1 起始），返回总行数与实际范围；大文件分段读取用这两个参数。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string", "description": "相对工作区的文件路径"},
+                           "start_line": {"type": "integer", "description": "可选：起始行（1 起始）"},
+                           "end_line": {"type": "integer", "description": "可选：结束行（含）"}},
+                       "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "delete_file",
+        "description": "删除工作区内的文件。删除前自动备份，可用 undo 恢复。需用户确认。",
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string", "description": "相对工作区的文件路径"}},
                        "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "delete_folder",
+        "description": "删除工作区内的空目录（非空目录拒绝，需先删除其中文件）。可用 undo 恢复目录。需用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string", "description": "相对工作区的目录路径"}},
+                       "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "move_file",
+        "description": "移动或重命名工作区内的文件（源与目标均为相对路径）。移动前自动备份，可用 undo 撤销。"
+                       "需用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "src": {"type": "string", "description": "源文件路径（相对工作区）"},
+                           "dst": {"type": "string", "description": "目标路径（相对工作区，目录不存在会自动创建）"}},
+                       "required": ["src", "dst"]},
+    }},
+    {"type": "function", "function": {
+        "name": "rename_file",
+        "description": "重命名工作区内的文件（move_file 的别名，src→dst）。需用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "src": {"type": "string", "description": "原文件名（相对工作区）"},
+                           "dst": {"type": "string", "description": "新文件名（相对工作区）"}},
+                       "required": ["src", "dst"]},
+    }},
+    {"type": "function", "function": {
+        "name": "copy_file",
+        "description": "复制工作区内的文件（源→目标）。目标已存在时先备份再覆盖，可用 undo 恢复。需用户确认。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "src": {"type": "string", "description": "源文件路径（相对工作区）"},
+                           "dst": {"type": "string", "description": "目标路径（相对工作区）"}},
+                       "required": ["src", "dst"]},
     }},
     {"type": "function", "function": {
         "name": "run_code",
@@ -1038,8 +1417,8 @@ AGENT_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "run_shell",
-        "description": "在 Linux 系统中执行 shell 命令（ls/cat/grep/find/pip/apt/systemctl 等任意命令，"
-                       "支持管道 |、重定向 >、&& 等 shell 语法）。默认在工作区目录执行，可用 cwd 指定目录。"
+        "description": "在系统中执行 shell 命令（ls/cat/grep/find/pip/apt/systemctl 等任意命令）。"
+                       "默认在工作区目录执行，cwd 仅接受工作区内的相对路径（拒绝绝对路径与 ..）。"
                        "执行超时 30 秒，输出最多 3000 字符。"
                        "破坏性命令（rm -rf /、mkfs、shutdown、dd 写磁盘、fork bomb 等）会被拦截。"
                        "注意：sudo 命令需要交互密码，非交互环境会失败。",
@@ -1047,7 +1426,7 @@ AGENT_TOOLS = [
                        "properties": {
                            "command": {"type": "string", "description": "要执行的 shell 命令"},
                            "cwd": {"type": "string",
-                                   "description": "可选：执行目录（默认工作区 ~/agent_workspace，可用绝对路径如 /tmp）"}},
+                                   "description": "可选：执行目录（工作区内相对路径，默认工作区）"}},
                        "required": ["command"]},
     }},
     {"type": "function", "function": {
@@ -1104,8 +1483,10 @@ AGENT_TOOLS = [
     {"type": "function", "function": {
         "name": "create_plan",
         "description": "（计划审批模式）任务开始前提交执行计划：列出每个步骤、每步需要的工具和原因。"
-                       "用户批准后按计划执行，计划内声明的工具不再逐个确认；计划外的操作仍需确认。"
-                       "只声明计划，不执行任何实际动作。",
+                       "文件类工具（replace_text/create_file/undo）必须声明 files（文件或目录范围，"
+                       "目录以 / 结尾表示前缀匹配）；run_shell/start_process 必须声明 commands（允许的"
+                       "命令，可用前缀）。用户批准后按计划执行，声明范围内的操作免确认；范围外的参数、"
+                       "文件被外部修改、计划外工具都会重新确认。只声明计划，不执行任何实际动作。",
         "parameters": {"type": "object",
                        "properties": {
                            "steps": {"type": "array",
@@ -1114,6 +1495,10 @@ AGENT_TOOLS = [
                                                    "step": {"type": "string", "description": "步骤描述"},
                                                    "tools": {"type": "array", "items": {"type": "string"},
                                                              "description": "本步骤需要的工具名（如 create_file、run_shell）"},
+                                                   "files": {"type": "array", "items": {"type": "string"},
+                                                             "description": "可选：本步骤操作的文件/目录范围（相对工作区，目录以 / 结尾）"},
+                                                   "commands": {"type": "array", "items": {"type": "string"},
+                                                                "description": "可选：本步骤允许执行的 shell 命令（完整或前缀）"},
                                                    "reason": {"type": "string", "description": "为什么需要这个权限"}},
                                                "required": ["step", "tools"]},
                                      "description": "计划步骤列表"}},
@@ -1159,12 +1544,17 @@ AGENT_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "git_commit",
-        "description": "提交工作区 Git 仓库的所有改动（内部执行 git add -A + git commit）。"
-                       "提交前会展示改动统计并经用户确认。",
+        "description": "提交 Git 变更。默认只提交 Agent 本轮实际修改过的文件（replace_text/create_file/undo"
+                       "等记录的文件），也可用 files 显式指定（相对工作区的路径列表）。"
+                       "绝不使用 git add -A（不会误提交无关用户改动）。"
+                       "提交前展示完整文件列表与改动统计，经用户确认后执行；"
+                       "确认后工作树发生变化会要求重新确认。",
         "parameters": {"type": "object",
                        "properties": {
                            "message": {"type": "string", "description": "提交信息（说明改了什么、为什么）"},
-                           "path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"}},
+                           "path": {"type": "string", "description": "可选：仓库所在目录（相对工作区）"},
+                           "files": {"type": "array", "items": {"type": "string"},
+                                     "description": "可选：要提交的文件列表（相对工作区；省略则提交本轮修改的文件）"}},
                        "required": ["message"]},
     }},
     # ---- 编程工具：后台进程 ----
@@ -1274,6 +1664,17 @@ AGENT_TOOLS = [
             "question": {"type": "string", "description": "可选：针对图片的具体问题（默认描述内容）"},
         }, "required": ["path"]},
     }},
+    {"type": "function", "function": {
+        "name": "fetch_result",
+        "description": "取回被压缩的完整工具结果（按 result_id 与区段 head/tail/error/full）。"
+                       "当工具结果提示「完整结果已省略」并给出 id 时，用本工具查看被省略的部分"
+                       "（错误/堆栈/长输出在 error 或 tail 区段）。",
+        "parameters": {"type": "object", "properties": {
+            "result_id": {"type": "string", "description": "完整结果的 id（工具结果尾部提示中给出）"},
+            "section": {"type": "string", "enum": ["head", "tail", "error", "full"],
+                        "default": "tail", "description": "要取回的区段"},
+        }, "required": ["result_id"]},
+    }},
 ]
 
 # ---- Skill 包（用户导入的技能包：skills/<名称>/SKILL.md）----
@@ -1377,6 +1778,10 @@ SUBAGENT_MAX_STEPS = 10      # 子 agent 单次任务的工具轮数上限（与
 SUBAGENT_REPLY_CHARS = 2000  # 子 agent 最终回复回传主循环的长度上限
 MAX_IMAGE_BYTES = 10_000_000 # view_image 图片大小上限（10MB）
 VISION_SYSTEM_NOTE = "（视觉分析：view_image 需在配置中提供 vision_api_url/vision_api_key/vision_model）"
+# R3：view_image 同图复用缓存（60s；图片 mtime/size 变化即失效）
+_VIMAGE_TTL = 60.0
+_vimage_lock = threading.Lock()
+_vimage_cache: dict = {}
 
 
 def _scan_agents() -> list[dict]:
@@ -1409,27 +1814,32 @@ def _agent_catalog_text() -> str:
 
 
 AGENT_SYSTEM_SUFFIX = (
-    "\n\n你是 PC Agent，一个可以控制用户电脑的智能体。你可以通过工具操作电脑、编写和修改代码。\n"
+    "\n\n你是 PC Agent，可以控制用户电脑的智能体（工具操作、编写和修改代码）。\n"
     "编程工作流：\n"
-    "1. 先 repo_map 了解项目结构，search_text / glob_files 定位相关代码，list_symbols 查看文件内部结构。\n"
-    "2. 修改用 replace_text 小步替换（系统会展示 diff 请用户确认）；新文件用 create_file。\n"
-    "3. 用 git_status / git_diff 自查改动，完成一个阶段后用 git_commit 提交（需用户确认）。\n"
-    "4. 多步骤长任务用 create_todo 先列计划，每完成一步用 update_todo 更新状态。\n"
-    "5. 后台服务（dev server 等）用 start_process 启动，process_output 看输出。\n"
-    "6. 运行测试/一次性命令用 run_code 或 run_shell；修改代码后主动运行相关测试验证。\n"
-    "7. 操作要谨慎，只执行用户明确要求的动作；不确定时先询问用户。\n"
-    "8. 覆盖文件、修改代码、提交 git、执行系统级写操作等敏感动作系统会弹出确认，请尊重用户的选择。\n"
-    "9. 遇到关键抉择（如删除内容、安装软件、修改配置、二选一路径）时，"
-    "先用文字列出选项让用户选择，等待用户答复后再行动。\n"
-    "10. 完成任务后，用简短的中文总结你做了什么。\n"
-    "11. 用户要求停止或动作可能造成损害时，调用 stop 工具并告知用户。\n"
-    "12. 用户发来寒暄或状态询问（如「你还在吗」「在吗」「你好」）时，直接简短回答，"
-    "不要调用任何工具，不要执行命令。"
+    "1. 先 repo_map / search_text / glob_files / list_symbols 定位相关代码，"
+    "再用 replace_text 小步修改（系统展示 diff 请用户确认），新文件用 create_file。\n"
+    "2. 多步长任务先 create_todo 列计划并逐步 update_todo；后台服务用 start_process，"
+    "输出用 process_output；测试/一次性命令用 run_code / run_shell，改完代码主动运行相关测试验证。\n"
+    "3. 完成一个阶段用 git_status / git_diff 自查，需要时 git_commit 提交（均需用户确认）。\n"
+    "安全与确认：\n"
+    "4. 只执行用户明确要求的动作；覆盖文件、修改代码、git 提交、系统级写操作会弹出确认，"
+    "请尊重用户选择；关键抉择（删除内容、安装软件、修改配置、二选一路径）"
+    "先列选项等用户答复，再行动。\n"
+    "5. 可能造成损害时调用 stop 并告知用户；回答先给结论，再补充必要证据/风险/下一步；"
+    "简单问题直接简短回答；任务完成用简短中文总结；"
+    "寒暄/状态询问（「你还在吗」「你好」）直接简短回答，不调用任何工具、不执行命令。"
 )
 
 
 def _call_upstream_raw(api_url: str, payload: dict, headers: dict) -> dict:
-    """非流式调用上游，返回完整响应 JSON（供工具循环解析 tool_calls）。"""
+    """非流式调用上游，返回完整响应 JSON（供工具循环解析 tool_calls）。
+
+    Provider 能力过滤：按 api_url 识别 provider，移除不支持的参数
+    （如 Ollama 的 reasoning_effort），不因服务忽略未知参数就假装生效。
+    """
+    payload, caps = _build_payload_caps(
+        api_url, str(payload.get("model") or ""), payload,
+        _load_provider_overrides(load_config()))
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
@@ -1448,12 +1858,27 @@ def _call_upstream_raw(api_url: str, payload: dict, headers: dict) -> dict:
         raise LlmError(502, "上游返回了非 JSON 内容")
 
 
+def _daemon_base_url() -> str:
+    """daemon 地址：配置 daemon_base 优先（不再硬编码 127.0.0.1:8000）。"""
+    cfg = load_config()
+    return str(cfg.get("daemon_base") or DAEMON_BASE).strip().rstrip("/") or DAEMON_BASE
+
+
 def _call_daemon(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
-    """调用本地屏幕控制 daemon（127.0.0.1:8000）。"""
+    """调用本地屏幕控制 daemon。daemon 启用 token 时携带 X-Api-Token。"""
+    headers = {"Content-Type": "application/json"}
+    dt = str(load_config().get("daemon_token") or "").strip()
+    if dt == "__secure__":
+        try:
+            from secure_store import load as ss_load
+            dt = ss_load("daemon_token")
+        except Exception:
+            dt = ""
+    if dt:
+        headers["X-Api-Token"] = dt
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
-        DAEMON_BASE + path, data=data, method=method,
-        headers={"Content-Type": "application/json"})
+        _daemon_base_url() + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -1466,12 +1891,46 @@ def _call_daemon(method: str, path: str, payload: dict | None = None) -> tuple[i
         return 0, {"detail": f"无法连接屏幕控制 daemon（{exc}）——请确认 app.py 已运行"}
 
 
-def _get_workspace() -> Path:
-    """Agent 文件工作区：主目录下的 agent_workspace（跟随运行系统：
-    Windows 上是 C:\\Users\\xxx\\agent_workspace，WSL 上是 /home/xxx/agent_workspace）。"""
-    p = Path.home() / "agent_workspace"
-    p.mkdir(parents=True, exist_ok=True)
+# ---- 工作区（可配置，不再硬编码 %USERPROFILE%/agent_workspace）----
+_workspace_lock = threading.Lock()
+_workspace_path: Path | None = None      # resolve 后的当前工作区（首次访问时从配置加载）
+_workspace_epoch = 0                     # 切换工作区时递增：旧任务检测到变化即中止（隔离）
+
+
+def _resolve_workspace(raw: str) -> Path | None:
+    """解析并校验工作区路径：必须存在且为目录，resolve 后返回。"""
+    p = Path(raw).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        return None
+    if not p.is_dir():
+        return None
     return p
+
+
+def _get_workspace() -> Path:
+    """当前工作区：配置优先（chat_config.json 的 workspace 字段），默认主目录下 agent_workspace。
+
+    首次访问时从配置加载并 resolve 保存；切换（POST /api/v1/workspace）后全局生效。
+    """
+    global _workspace_path
+    with _workspace_lock:
+        if _workspace_path is None:
+            cfg_ws = str(load_config().get("workspace") or "").strip()
+            p = _resolve_workspace(cfg_ws) if cfg_ws else None
+            if p is None:
+                p = Path.home() / "agent_workspace"
+                p.mkdir(parents=True, exist_ok=True)
+                p = p.resolve()
+            _workspace_path = p
+        return _workspace_path
+
+
+def _workspace_changed(epoch: int) -> bool:
+    """工作区是否在任务创建后被切换（用于隔离旧任务）。"""
+    with _workspace_lock:
+        return epoch != _workspace_epoch
 
 
 def _safe_join(workspace: Path, rel: str) -> Path | None:
@@ -1578,22 +2037,85 @@ def _run_git(root: Path, *args: str, timeout: int = 20) -> tuple[bool, str]:
     return True, out
 
 
+# ---- Agent 本轮修改的文件追踪（git_commit 默认提交范围，绝不用 git add -A）----
+_modified_lock = threading.Lock()
+_agent_modified_files: set[str] = set()
+_pending_git_snapshot = ""      # git_commit 确认时记录的工作树快照（执行前校验）
+
+
+def _record_modified(rel: str) -> None:
+    """记录 Agent 本轮修改的文件（相对工作区），git_commit 默认提交范围。"""
+    with _modified_lock:
+        _agent_modified_files.add(rel)
+
+
+def _commit_targets(root: Path, workspace: Path, args: dict) -> list[str]:
+    """计算 git_commit 将要提交的文件（相对仓库根）：显式 files 或本轮修改文件。"""
+    files_arg = args.get("files")
+    rels: list[str] = []
+    if isinstance(files_arg, list) and files_arg:
+        for f in files_arg:
+            if isinstance(f, str):
+                t = _safe_join(workspace, f)
+                if t is not None:
+                    try:
+                        rels.append(t.relative_to(root).as_posix())
+                    except ValueError:
+                        pass
+    else:
+        with _modified_lock:
+            rels = sorted(_agent_modified_files)
+        out = []
+        for r in rels:
+            t = _safe_join(workspace, r)
+            if t is not None:
+                try:
+                    out.append(t.relative_to(root).as_posix())
+                except ValueError:
+                    pass
+        return out
+    return sorted(set(rels))
+
+
+def _git_worktree_snapshot(root: Path) -> str:
+    """工作树状态快照（porcelain + diff），确认后变化检测用。
+
+    porcelain 只反映文件增删改状态，不反映内容变化；叠加 diff 才能
+    捕获「外部修改了已跟踪文件内容」的情况。
+    """
+    ok, out = _run_git(root, "status", "--porcelain")
+    ok2, diff = _run_git(root, "diff")
+    return (out or "") + "\n<<DIFF>>\n" + (diff or "")
+
+
 # ---- 后台进程管理 ----
 _process_lock = threading.Lock()
-_processes: dict[int, dict] = {}   # pid -> {"proc", "cmd", "started", "lines"}
+_processes: dict[int, dict] = {}   # pid -> {"proc", "cmd", "started", "lines", "stopped", "stop_failed", "exit_code"}
+PROCESS_HISTORY_MAX = 20           # 已结束进程条目保留上限（供 process_output/list_processes 查询）
 
 
 def _process_reader(proc, lines: deque) -> None:
     """后台线程：逐行缓冲进程输出（环形，防内存膨胀）。bytes 解码容错，兼容任意编码输出。"""
-    for raw in proc.stdout:
-        lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+    try:
+        for raw in proc.stdout:
+            lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+    except (ValueError, OSError, AttributeError):
+        pass   # 管道已关闭（stop 时）：读取线程自然退出
 
 
 def _cleanup_dead_processes() -> None:
-    """移除已退出的进程条目。调用方须持有 _process_lock。"""
+    """移除进程表中超出历史上限的已结束条目；运行中条目不受影响。
+
+    刚停止的进程保留完整状态（stopped/stop_failed/exit_code）供查询，
+    不会因清理而立即变成「未知 PID」。
+    """
     dead = [pid for pid, e in _processes.items() if e["proc"].poll() is not None]
-    for pid in dead:
-        _processes.pop(pid, None)
+    overflow = len(dead) - PROCESS_HISTORY_MAX
+    if overflow > 0:
+        for pid in sorted(dead, key=lambda p: _processes[p].get("started_ts", 0))[:overflow]:
+            entry = _processes.pop(pid, None)
+            if entry is not None and entry.get("job"):
+                _close_windows_job(entry["job"])
 
 
 def _start_process_impl(command: str, cwd: Path) -> tuple[bool, str]:
@@ -1606,24 +2128,127 @@ def _start_process_impl(command: str, cwd: Path) -> tuple[bool, str]:
     else:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     proc = subprocess.Popen(command, **kwargs)
+    job = _create_windows_job()
+    if job is not None and not _assign_windows_job(job, proc.pid):
+        _close_windows_job(job)
+        job = None
     lines: deque = deque(maxlen=PROCESS_OUTPUT_LINES)
     threading.Thread(target=_process_reader, args=(proc, lines), daemon=True).start()
     with _process_lock:
         _cleanup_dead_processes()
-        if len(_processes) >= MAX_PROCESSES:
-            proc.kill()
+        running = sum(1 for e in _processes.values() if e["proc"].poll() is None)
+        if running >= MAX_PROCESSES:
+            _kill_process_tree(proc)
+            if job is not None:
+                _close_windows_job(job)
             return False, f"后台进程数已达上限 {MAX_PROCESSES}，请先 stop_process 清理"
         _processes[proc.pid] = {"proc": proc, "cmd": command[:200],
-                                "started": time.strftime("%H:%M:%S"), "lines": lines}
+                                "started": time.strftime("%H:%M:%S"),
+                                "started_ts": time.time(), "lines": lines,
+                                "stopped": False, "stop_failed": False, "exit_code": None,
+                                "job": job}
     return True, json.dumps({"pid": proc.pid, "command": command[:200],
                              "started": _processes[proc.pid]["started"]}, ensure_ascii=False)
+
+
+def _create_windows_job():
+    """创建带 KILL_ON_JOB_CLOSE 的 Windows Job Object；不可用返回 None。
+
+    Job 句柄关闭时整棵进程树被强制终止——作为超时/停止路径的最后兜底，
+    保证 shell 子进程/孙进程不会成为孤儿。调用方必须保存句柄直到进程结束。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", wintypes.ULONGLONG),
+                ("WriteOperationCount", wintypes.ULONGLONG),
+                ("OtherOperationCount", wintypes.ULONGLONG),
+                ("ReadTransferCount", wintypes.ULONGLONG),
+                ("WriteTransferCount", wintypes.ULONGLONG),
+                ("OtherTransferCount", wintypes.ULONGLONG),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _assign_windows_job(job, pid: int) -> bool:
+    """把进程归属到 Job Object；父进程已在其他 Job 时可能失败，返回 False。"""
+    if not job or sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.AssignProcessToJobObject(
+            job, ctypes.c_void_p(int(pid))))
+    except Exception:
+        return False
+
+
+def _close_windows_job(job) -> None:
+    """关闭 Job 句柄；若进程仍在运行，KILL_ON_JOB_CLOSE 会终止整树（兜底）。"""
+    if not job or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.CloseHandle(job)
+    except Exception:
+        pass
 
 
 def _kill_process_tree(proc) -> None:
     """杀整个进程组/控制台组（shell 启动的子进程一并结束），防止残留。"""
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       capture_output=True, text=True)
+        # errors="replace"：taskkill 输出可能为 GBK（中文 Windows），防解码崩溃
+        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, text=True, errors="replace")
+        if r.returncode != 0:
+            # taskkill 失败（权限/已退出/无子进程等）：直接 kill 后备，
+            # 不提前报告成功；Job Object 句柄关闭时还会再兜底一次。
+            try:
+                proc.kill()
+            except Exception:
+                pass
     else:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1634,22 +2259,47 @@ def _kill_process_tree(proc) -> None:
                 pass
 
 
-def _run_subprocess(cmd, cwd, timeout: float, shell: bool = True) -> tuple[int, str, str, bool]:
+def _controlled_env(extra: dict | None = None) -> dict:
+    """受控环境变量：run_code 执行用，只保留运行必需的系统变量 + 显式编码设置。
+
+    不继承完整父环境（隔离掉代理凭据、用户自定义变量等），降低代码执行副作用。
+    """
+    allow = {"PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP",
+             "SYSTEMROOT", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA",
+             "USERNAME", "USER", "LANG", "LC_ALL", "COMSPEC", "PATHEXT",
+             "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "COMPUTERNAME"}
+    env = {k: v for k, v in os.environ.items() if k in allow}
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _run_subprocess(cmd, cwd, timeout: float, shell: bool = True,
+                    env: dict | None = None) -> tuple[int, str, str, bool]:
     """统一子进程执行（run_shell / run_code 共用）。
 
     超时处理：杀整个进程组（防子进程残留），并带回超时前的完整部分输出——
     让模型能判断命令是「真慢（有进度）」还是「卡死（无输出）」。
+    env=None 继承父进程环境（run_shell）；显式传 env 时使用受控环境（run_code）。
 
     返回 (returncode, stdout, stderr, timed_out)；输出统一 bytes 解码容错。
     """
     kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                   cwd=str(cwd), shell=shell)
+    if env is not None:
+        kwargs["env"] = env
     if sys.platform != "win32":
         kwargs["executable"] = "/bin/bash" if shell else None
         kwargs["start_new_session"] = True          # 独立进程组，超时可整组击杀
     else:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     proc = subprocess.Popen(cmd, **kwargs)
+    job = _create_windows_job()
+    if job is not None and not _assign_windows_job(job, proc.pid):
+        _close_windows_job(job)
+        job = None
     try:
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, out, err, False
@@ -1657,6 +2307,10 @@ def _run_subprocess(cmd, cwd, timeout: float, shell: bool = True) -> tuple[int, 
         _kill_process_tree(proc)
         out, err = proc.communicate()               # 杀完后再取剩余输出
         return proc.returncode, out, err, True
+    finally:
+        # 关闭 Job 句柄：进程若仍残留（未杀干净），KILL_ON_JOB_CLOSE 兜底整树终止
+        if job is not None:
+            _close_windows_job(job)
 
 
 def _decode_out(data) -> str:
@@ -1666,6 +2320,13 @@ def _decode_out(data) -> str:
 
 
 def _stop_process_impl(pid: int) -> tuple[bool, str]:
+    """停止后台进程：杀进程树后显式 wait 验证，绝不谎报已停止。
+
+    - taskkill / killpg 后调用 proc.wait(timeout=8) 确认真正退出；
+    - 再次 proc.poll() 验证；
+    - 超时/仍在运行 → 返回 stopped=False + stop_failed=True（不谎报）；
+    - 停止后保留条目状态（stopped/exit_code）供查询，关闭输出管道让读取线程退出。
+    """
     with _process_lock:
         entry = _processes.get(pid)
         if entry is None:
@@ -1673,7 +2334,42 @@ def _stop_process_impl(pid: int) -> tuple[bool, str]:
         proc = entry["proc"]
     if proc.poll() is None:
         _kill_process_tree(proc)
-    return True, json.dumps({"pid": pid, "stopped": True}, ensure_ascii=False)
+        try:
+            proc.wait(timeout=8)            # taskkill 后显式等待完整进程树退出
+        except subprocess.TimeoutExpired:
+            with _process_lock:
+                e = _processes.get(pid)
+                if e is not None:
+                    e["stop_failed"] = True
+            return False, json.dumps({"pid": pid, "stopped": False, "stop_failed": True,
+                                      "detail": "进程未能及时终止（超时 8s），可能仍有残留"},
+                                     ensure_ascii=False)
+    if proc.poll() is None:
+        # 再次验证：仍在运行 → 失败
+        with _process_lock:
+            e = _processes.get(pid)
+            if e is not None:
+                e["stop_failed"] = True
+        return False, json.dumps({"pid": pid, "stopped": False, "stop_failed": True,
+                                  "detail": "进程仍在运行，停止失败"}, ensure_ascii=False)
+    # 关闭输出管道：读取线程随之退出（EOF）
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except (ValueError, OSError):
+        pass
+    with _process_lock:
+        e = _processes.get(pid)
+        if e is not None:
+            e["stopped"] = True
+            e["exit_code"] = proc.returncode
+            job = e.get("job")
+            e["job"] = None
+    if job is not None:
+        _close_windows_job(job)
+    return True, json.dumps({"pid": pid, "stopped": True,
+                             "exit_code": proc.returncode,
+                             "stop_failed": False}, ensure_ascii=False)
 
 
 def _process_output_impl(pid: int, tail: int, wait_seconds: float) -> tuple[bool, str]:
@@ -1723,12 +2419,37 @@ def _load_todos() -> None:
         _todos = []
 
 
+def _secure_atomic_write(path: Path, text: str) -> None:
+    """原子写 + 权限限制为当前用户（POSIX 0600；Windows 无 POSIX 权限概念）。
+
+    保存顺序：同目录唯一临时文件 → flush → fsync（条件允许）→ 原子 replace → 保留 .bak。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    tmp.replace(path)
+    if sys.platform != "win32":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def _save_todos() -> None:
     try:
-        p = _todo_file()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"todos": _todos}, ensure_ascii=False, indent=1),
-                     encoding="utf-8")
+        _secure_atomic_write(_todo_file(),
+                             json.dumps({"todos": _todos}, ensure_ascii=False, indent=1))
     except OSError as exc:
         log.warning("todo 持久化失败：%s", exc)
 
@@ -1759,48 +2480,150 @@ def _todos_system_note() -> str:
 # ---- 会话持久化（权威存储在项目目录 .pcagent/，跟随程序 / U 盘移动，已 gitignore）----
 SESSION_MAX = 50               # 会话数上限
 SESSION_MAX_MESSAGES = 200     # 单会话消息数上限（超出丢弃最早，防无限膨胀）
+SESSION_MSG_MAX_CHARS = 20_000      # 单条消息字符上限（超限拒绝）
+SESSION_TOTAL_MAX_CHARS = 500_000   # 单会话消息总字符上限
+SESSION_APPEND_MAX_CHARS = 200_000  # 单次 append 请求体总字符上限
 SESSION_TITLE_CHARS = 30       # 自动标题长度（取首条用户消息）
 _session_lock = threading.Lock()
-_sessions: dict[int, dict] = {}  # id -> {"id", "title", "messages": [...], "updated"}
+_sessions: dict[int, dict] = {}  # id -> {"id", "title", "messages": [...], "updated", "version"}
 _session_id_counter = itertools.count(1)
 _sessions_loaded = False
+_session_load_warning = ""     # 损坏恢复提示（向用户报告）
 
 
 def _session_file() -> Path:
-    """会话文件位置：项目根目录 .pcagent/sessions.json（程序数据，跟着代码/U 盘走）。"""
-    return BASE_DIR.parent / ".pcagent" / "sessions.json"
+    """会话文件位置：数据目录 sessions.json（PCAGENT_DATA_DIR 可重定向）。"""
+    from data_paths import data_file
+    return data_file("sessions.json")
+
+
+def _normalize_loaded_session(entry: dict) -> dict:
+    """兼容旧会话数据：无 workspace 字段的旧会话标记为 unbound（None）。"""
+    if "workspace" not in entry:
+        entry["workspace"] = None
+    return entry
 
 
 def _load_sessions() -> None:
-    global _sessions, _session_id_counter, _sessions_loaded
+    """加载会话；主文件缺失或损坏时不静默清空：自动尝试 .bak 恢复。"""
+    global _sessions, _session_id_counter, _sessions_loaded, _session_load_warning
     _sessions_loaded = True
+    p = _session_file()
+    if not p.exists():
+        # 主文件缺失：尝试 .bak 恢复
+        bak = p.with_suffix(".json.bak")
+        if bak.exists():
+            try:
+                data = json.loads(bak.read_text(encoding="utf-8"))
+                _sessions = {int(k): _normalize_loaded_session(v)
+                             for k, v in (data.get("sessions") or {}).items()}
+                if _sessions:
+                    _session_id_counter = itertools.count(max(_sessions) + 1)
+                _session_load_warning = "主文件缺失，已从 .bak 恢复"
+                log.warning(_session_load_warning)
+                return
+            except Exception:
+                pass
+        return
+    raw = None
     try:
-        p = _session_file()
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
+        raw = p.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        _sessions = {int(k): _normalize_loaded_session(v)
+                     for k, v in (data.get("sessions") or {}).items()}
+        if _sessions:
+            _session_id_counter = itertools.count(max(_sessions) + 1)
+        return
+    except Exception as exc:
+        _session_load_warning = f"sessions.json 损坏（{exc}），尝试从备份恢复"
+        log.warning(_session_load_warning)
+    # 损坏：备份原文件 + 尝试 .bak 恢复
+    try:
+        import time as _t
+        p.rename(p.with_name(f"sessions.json.corrupt-{int(_t.time())}"))
+    except OSError:
+        pass
+    bak = p.with_suffix(".json.bak")
+    if bak.exists():
+        try:
+            data = json.loads(bak.read_text(encoding="utf-8"))
             _sessions = {int(k): v for k, v in (data.get("sessions") or {}).items()}
             if _sessions:
                 _session_id_counter = itertools.count(max(_sessions) + 1)
-    except Exception:
-        _sessions = {}
+            _session_load_warning += "；已从 .bak 恢复"
+            log.warning("已从 .bak 恢复会话")
+            return
+        except Exception:
+            pass
+    _sessions = {}
+    _session_load_warning += "；备份不可用，会话已清空（原文件已保留为 .corrupt-*）"
 
 
 def _save_sessions() -> None:
-    """原子写：先写临时文件再 rename，防止写一半崩溃损坏数据。"""
+    """原子写会话文件，主文件永不被先移走。
+
+    顺序：同目录唯一临时文件 → flush/fsync → os.replace 原子替换主文件；
+    主文件安全落盘后再更新 .bak（失败不影响主文件）。
+    落盘失败抛出 OSError（调用方负责回滚），禁止吞掉错误。
+    """
+    p = _session_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}-{threading.get_ident()}")
     try:
-        p = _session_file()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"sessions": _sessions}, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"sessions": _sessions}, ensure_ascii=False, indent=1))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         tmp.replace(p)
+    finally:
+        # 新文件失败时清理残留临时文件；replace 成功后 tmp 已不存在
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    # 主文件已安全落盘：更新 .bak 用于损坏恢复（失败不影响主文件原子性）
+    try:
+        import shutil
+        shutil.copy2(p, p.with_suffix(".json.bak"))
+    except OSError:
+        pass
+
+
+def _persist_sessions_or_rollback(rollback) -> None:
+    """落盘失败 → 回滚内存 mutation → 抛 500；绝不吞错、绝不保留未落盘修改。"""
+    try:
+        _save_sessions()
     except OSError as exc:
-        log.warning("会话持久化失败：%s", exc)
+        try:
+            rollback()
+        except Exception:
+            pass
+        log.error("会话持久化失败，已回滚内存修改：%s", exc)
+        raise HTTPException(500, f"会话保存失败，修改已回滚：{exc}") from exc
 
 
 def _ensure_sessions() -> None:
     if not _sessions_loaded:
         _load_sessions()
+
+
+def _rollback_session_state(s: dict, snapshot: dict) -> None:
+    """恢复单会话字段到快照（append/clear 落盘失败时回滚）。
+
+    调用方必须已持有 _session_lock（mutation 接口在锁内调用）。
+    """
+    s.clear()
+    s.update(snapshot)
+
+
+def _rollback_session_restore(sid: int, saved: dict | None) -> None:
+    """删除会话落盘失败时恢复条目。调用方必须已持有 _session_lock。"""
+    if saved is not None:
+        _sessions[sid] = saved
 
 
 # ---- 修改回滚（undo）：replace_text / create_file 覆盖前自动备份 ----
@@ -1809,7 +2632,8 @@ _backup_lock = threading.Lock()
 
 
 def _backup_dir() -> Path:
-    return BASE_DIR.parent / ".pcagent" / "backups"
+    """备份目录绑定当前工作区（切换工作区后备份跟随，旧工作区数据不动）。"""
+    return _get_workspace() / ".pcagent" / "backups"
 
 
 def _backup_index() -> list[dict]:
@@ -1825,27 +2649,50 @@ def _backup_index() -> list[dict]:
 
 def _save_backup_index(idx: list) -> None:
     try:
-        p = _backup_dir()
-        p.mkdir(parents=True, exist_ok=True)
-        (p / "index.json").write_text(json.dumps(idx, ensure_ascii=False, indent=1),
-                                      encoding="utf-8")
+        _secure_atomic_write(_backup_dir() / "index.json",
+                             json.dumps(idx, ensure_ascii=False, indent=1))
     except OSError as exc:
         log.warning("备份清单写入失败：%s", exc)
 
 
-def _take_backup(workspace: Path, target: Path) -> bool:
-    """修改文件前备份原内容（供 undo 恢复）。失败不阻塞修改。"""
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """写文件：先写同目录唯一临时文件，flush 后原子 replace（同卷）。"""
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+    tmp.replace(path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def _take_backup(workspace: Path, target: Path, op: str = "overwrite",
+                 src: str | None = None, dst: str | None = None) -> bool:
+    """修改文件前备份原内容（供 undo 恢复）。
+
+    op 记录操作类型：overwrite（覆盖）/ create（新建）/ delete（删除）/
+    move（移动，记录 src/dst）/ mkdir（新建目录）。
+    备份失败返回 False：调用方必须中止高风险修改（不得继续）。
+    """
     try:
         rel = target.relative_to(workspace).as_posix()
-        content = target.read_text(encoding="utf-8", errors="replace")
         with _backup_lock:
             idx = _backup_index()
             bid = (idx[-1]["id"] + 1) if idx else 1
             bdir = _backup_dir() / str(bid)
             bdir.mkdir(parents=True, exist_ok=True)
-            (bdir / "content").write_text(content, encoding="utf-8")
-            idx.append({"id": bid, "file": rel,
-                        "time": time.strftime("%m-%d %H:%M:%S"), "backup": str(bid)})
+            if op not in ("create", "mkdir") and target.is_file():
+                # delete/move/overwrite：按 bytes 保存源内容（二进制无损）
+                _atomic_write_bytes(bdir / "content", target.read_bytes())
+            entry = {"id": bid, "file": rel,
+                     "time": time.strftime("%m-%d %H:%M:%S"), "backup": str(bid), "op": op}
+            if src:
+                entry["src"] = src
+            if dst:
+                entry["dst"] = dst
+            idx.append(entry)
             if len(idx) > BACKUP_MAX:          # 上限：丢最老
                 old = idx.pop(0)
                 shutil.rmtree(_backup_dir() / str(old["backup"]), ignore_errors=True)
@@ -1971,9 +2818,26 @@ def _safe_float(value, default: float, lo: float, hi: float) -> float:
     return min(max(v, lo), hi)
 
 
+# ---- MCP 客户端（外部工具接入，mcp_config.json 配置）----
+# 单一生命周期入口：初始化委托 mcp_manager（锁 + 短超时统一），
+# 结果绑定本模块引用（测试可 monkeypatch L._mcp_manager）。
+_mcp_manager = None
+
+
+def _ensure_mcp():
+    """惰性初始化 MCP 管理器（首次访问工具列表时连接各 server）。
+    委托 mcp_manager._ensure_mcp（初始化加锁，PCAGENT_DISABLE_MCP 跳过，2s 短超时）。"""
+    global _mcp_manager
+    if _mcp_manager is None:
+        from mcp_manager import _ensure_mcp as _shared_ensure
+        _mcp_manager = _shared_ensure()
+    return _mcp_manager
+
+
 def _agent_tools() -> list[dict]:
     """按运行模式返回可用工具：隔离模式只保留文件类工具。
-    MCP 外部工具（如 GitHub）与屏幕无关，隔离模式同样保留。"""
+    MCP 外部工具（如 GitHub）与屏幕无关，隔离模式同样保留。
+    工具按名称确定性排序（稳定前缀：防止顺序抖动破坏提示词缓存）。"""
     if ISOLATED:
         tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
     else:
@@ -1981,64 +2845,10 @@ def _agent_tools() -> list[dict]:
     mcp = _ensure_mcp()
     if mcp is not None:
         tools.extend(mcp.all_tools())     # MCP server 工具动态并入（mcp_<server>_<tool>）
+    tools.sort(key=lambda t: t["function"]["name"])
     return tools
 
 
-# ---- MCP 客户端（外部工具接入，mcp_config.json 配置）----
-_mcp_manager = None
-
-
-def _load_mcp_config() -> dict:
-    """读取 mcp_config.json 的 servers 段（含 token，已 gitignore；示例见 mcp_config.example.json）。"""
-    try:
-        p = BASE_DIR.parent / "mcp_config.json"
-        if p.exists():
-            cfg = json.loads(p.read_text(encoding="utf-8"))
-            return cfg.get("servers") or {}
-    except Exception as exc:
-        log.warning("mcp_config.json 解析失败：%s", exc)
-    return {}
-
-
-def _ensure_mcp():
-    """惰性初始化 MCP 管理器（首次访问工具列表时连接各 server）。
-    PCAGENT_DISABLE_MCP=1 时跳过（测试环境用，避免真实连接外部 server）。"""
-    global _mcp_manager
-    if _mcp_manager is None and os.environ.get("PCAGENT_DISABLE_MCP"):
-        return None
-    if _mcp_manager is None:
-        from mcp_client import McpManager
-        _mcp_manager = McpManager(_load_mcp_config())
-        _mcp_manager.start()
-    return _mcp_manager
-
-
-def _is_readonly_shell(command: str) -> bool:
-    """判断 shell 命令是否只读（免确认）。重定向到真实文件视为写操作。
-    平台相关：Windows(cmd) 用 Windows 白名单（dir/more/findstr 等）。"""
-    if re.search(r">\s*(?!/?dev/null\b)\S", command):   # > file 或 >> file（排除 >/dev/null、2>/dev/null）
-        return False
-    if sys.platform == "win32":
-        return bool(READONLY_SHELL_WIN.match(command))
-    return bool(READONLY_SHELL.match(command))
-
-
-def _needs_confirm(name: str, args: dict) -> bool:
-    """判断工具调用是否需要用户确认。"""
-    if name not in CONFIRM_TOOLS:
-        return False
-    if name == "create_file":
-        # 覆盖已存在的文件才需要确认（新建文件不需要）
-        workspace = _get_workspace()
-        target = _safe_join(workspace, args.get("path", ""))
-        return target is not None and target.exists()
-    if name in ("replace_text", "git_commit", "start_process", "undo"):
-        # 修改文件 / 提交 git / 启动后台进程 / 撤销修改：一律确认
-        return True
-    if name == "run_shell":
-        command = (args.get("command") or "").strip()
-        return bool(command) and not _is_readonly_shell(command)
-    return False
 
 
 def _exec_view_image(args: dict) -> tuple[bool, str]:
@@ -2062,6 +2872,18 @@ def _exec_view_image(args: dict) -> tuple[bool, str]:
     if not (vurl and vkey and vmodel):
         return False, ("未配置视觉模型：请在 chat_config.json 设置 "
                        "vision_api_url / vision_api_key / vision_model")
+    # 同一图片（mtime/size 未变）+ 同一问题：复用上次分析结果（60s），
+    # 避免坐标敏感任务反复重发同一张 base64 图片（规格：图片 hash 去重）
+    try:
+        st = target.stat()
+        _vkey = (str(target), st.st_mtime, st.st_size, question[:200])
+    except OSError:
+        _vkey = None
+    if _vkey is not None:
+        with _vimage_lock:
+            hit = _vimage_cache.get(_vkey)
+        if hit is not None and time.monotonic() - hit[0] <= _VIMAGE_TTL:
+            return True, hit[1] + "\n（同一图片与问题，已复用上次分析结果）"
     import base64
     try:
         b64 = base64.b64encode(target.read_bytes()).decode()
@@ -2085,13 +2907,18 @@ def _exec_view_image(args: dict) -> tuple[bool, str]:
     content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
     if not content:
         return False, "视觉模型返回空内容"
+    if _vkey is not None:
+        with _vimage_lock:
+            _vimage_cache[_vkey] = (time.monotonic(), content)
+            if len(_vimage_cache) > 64:
+                _vimage_cache.clear()
     return True, content
 
 
 def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
                    model: str | None, temperature: float,
                    q: queue.Queue | None, cancel: threading.Event | None,
-                   depth: int) -> tuple[bool, str]:
+                   depth: int, task_id: str = "") -> tuple[bool, str]:
     """委派子任务给子 agent：独立上下文 + 工具白名单循环执行，结果摘要返回。"""
     agent_name = (args.get("agent") or "").strip()
     task = (args.get("task") or "").strip()
@@ -2108,6 +2935,23 @@ def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
         return False, "delegate 仅在 agent 循环内可用"
     if cancel is not None and cancel.is_set():
         return False, "任务已由用户中止"
+    # ---- R3：子 Agent 智能路由决策（默认单 Agent；无拆分收益 → 拒绝并说明）----
+    # 只读子 agent（视觉/审查类，工具全只读）：独立上下文收益，允许委派
+    spec_tools = set(spec.get("tools") or [])
+    readonly_subagent = bool(spec_tools) and spec_tools <= set(QUERY_TOOLS)
+    decision = should_delegate(
+        task=task, purpose=task, model=str(model or ""),
+        messages=None, complexity=3,
+        risk=RISK_LOW if readonly_subagent else RISK_MEDIUM,
+        independent_subtasks=1,
+        shared_context_tokens=0, user_wants_multi=False,
+        agent_def=spec, readonly_subagent=readonly_subagent)
+    if not decision.allow:
+        log.info("delegate 路由拒绝：%s（%s）", agent_name, decision.reason)
+        return (False,
+                f"路由决策：不建议委派给子 agent（{decision.reason}）。"
+                f"请主 agent 直接完成任务；如确有独立子任务可并行，"
+                f"或用户明确要求多 Agent/独立复核，再使用 delegate。")
     # 工具白名单：声明的工具 + 只读工具兜底；不存在/未知的忽略（_agent_loop 过滤）
     known = {t["function"]["name"] for t in _agent_tools()}
     allowed = {t for t in (set(spec.get("tools") or []) | QUERY_TOOLS) if t in known}
@@ -2123,9 +2967,216 @@ def _exec_delegate(args: dict, api_url: str | None, headers: dict | None,
     reply = _agent_loop(api_url, headers, sub_msgs, sub_model, temperature,
                         q, cancel, depth=depth + 1,
                         max_steps=_safe_int(args.get("max_steps"), SUBAGENT_MAX_STEPS, 1, 12),
-                        tools_filter=allowed)
+                        tools_filter=allowed, task_id=task_id)
     summary = (reply or "（子 agent 无回复）").strip()[:SUBAGENT_REPLY_CHARS]
     return True, f"子 agent {agent_name} 执行完毕，最终回复：\n{summary}"
+
+
+# ---- 计划审批（plan）参数级授权 ----
+# 批准的计划步骤必须声明精确范围：文件类工具声明 files、shell/进程类声明 commands。
+# 未声明范围的高风险工具不授予「免确认」，执行时逐次确认；
+# 声明范围后，参数变化 / 路径变化 / 命令变化 / 文件被外部修改 都会触发重新确认。
+_PLAN_RANGE_REQUIRED = frozenset({"replace_text", "create_file", "undo",
+                                  "run_shell", "start_process", "run_code", "git_commit",
+                                  "delete_file", "delete_folder", "move_file",
+                                  "rename_file", "copy_file"})
+_PLAN_FILE_TOOLS = frozenset({"replace_text", "create_file", "undo",
+                              "delete_file", "delete_folder", "move_file",
+                              "rename_file", "copy_file"})
+
+
+def _tool_file_args(name: str, args: dict) -> list[str]:
+    """取工具调用中涉及的文件路径参数（相对工作区）。"""
+    if name in ("replace_text", "undo"):
+        v = args.get("file")
+        return [v] if isinstance(v, str) and v else []
+    if name in ("create_file", "delete_file", "delete_folder"):
+        v = args.get("path")
+        return [v] if isinstance(v, str) and v else []
+    if name in ("move_file", "rename_file", "copy_file"):
+        out = []
+        for k in ("src", "dst"):
+            v = args.get(k)
+            if isinstance(v, str) and v:
+                out.append(v)
+        return out
+    if name == "run_code":
+        v = args.get("file")
+        return [v] if isinstance(v, str) and v else []
+    if name == "git_commit":
+        files = args.get("files")
+        if isinstance(files, list):
+            return [f for f in files if isinstance(f, str)]
+        return []
+    return []
+
+
+def _norm_cmd(command: str) -> str:
+    """shell 命令规范化：strip + 合并连续空白（用于授权精确比较，禁止 startswith 授权）。"""
+    import shlex
+    try:
+        parts = shlex.split(command or "")
+        return " ".join(parts)
+    except ValueError:
+        # 引号不闭合等异常：退回空白合并（仍为保守比较）
+        return " ".join((command or "").split())
+
+
+def _path_in_scope(target: str, scope: str, workspace=None) -> bool:
+    """target 是否在 scope 范围内（scope 可为文件路径或目录前缀，如 src/ 覆盖 src/a.py）。
+
+    workspace 提供时额外做解析后的绝对路径校验：target 的 resolve 结果必须仍位于
+    scope 的 resolve 结果内（防符号链接/大小写路径绕过）。
+    """
+    t = (target or "").strip().replace("\\", "/").strip("/")
+    s = (scope or "").strip().replace("\\", "/").strip("/")
+    if not t or not s:
+        return False
+    if t == s or t.startswith(s.rstrip("/") + "/"):
+        # 字符串范围命中后，再做绝对路径校验（双保险）
+        if workspace is not None:
+            try:
+                from pathlib import Path as _P
+                t_abs = _P(workspace).joinpath(*t.split("/")).resolve()
+                s_abs = _P(workspace).joinpath(*s.split("/")).resolve()
+                if t_abs == s_abs or (s_abs.is_dir() and s_abs in t_abs.parents):
+                    return True
+                return False
+            except (OSError, ValueError):
+                return False
+        return True
+    return False
+
+
+def _plan_build_specs(plan_steps: list) -> list[dict]:
+    """把批准的计划步骤转为授权规格列表。每个步骤记录：
+    tools（工具名集合）、files（文件/目录范围，None=未声明）、
+    commands（命令范围，None=未声明，存储规范化形式）。"""
+    specs = []
+    for s in plan_steps:
+        if not isinstance(s, dict):
+            continue
+        tools = {t for t in (s.get("tools") or []) if isinstance(t, str)}
+        files_raw = s.get("files") or []
+        commands_raw = s.get("commands") or []
+        specs.append({
+            "tools": tools,
+            "files": frozenset(f for f in files_raw if isinstance(f, str)) or None,
+            "commands": frozenset(_norm_cmd(c) for c in commands_raw if isinstance(c, str)) or None,
+        })
+    return specs
+
+
+def _plan_authorized(specs: list[dict], name: str, args: dict,
+                     workspace=None) -> bool:
+    """计划内工具且本次参数在授权范围内 → True（可免确认执行）。
+
+    - 高风险范围类工具（_PLAN_RANGE_REQUIRED）：必须命中步骤声明的 files / commands
+      范围，未声明或超范围返回 False（重新确认）；
+    - run_code：file 参数必须在声明文件范围；纯 code 字符串不授予免确认（绑定内容）；
+    - git_commit：提交文件集合必须 ⊆ 声明文件范围；
+    - 命令比较使用规范化精确匹配（禁止 startswith，防止 git status & rm 拼接绕过）；
+    - 文件路径命中后额外做 resolve 绝对路径校验（防符号链接/路径穿越）。
+    """
+    for spec in specs:
+        if name not in spec["tools"]:
+            continue
+        if name in _PLAN_RANGE_REQUIRED:
+            if name in ("run_shell", "start_process"):
+                commands = spec["commands"]
+                if not commands:
+                    continue   # 该步骤未声明范围：尝试下一个步骤
+                cmd = _norm_cmd(args.get("command") or "")
+                if not cmd:
+                    return False
+                # 规范化后精确匹配（拒绝 startswith：git status 不得授权 git status & rm）
+                if cmd not in commands:
+                    continue   # 该步骤范围不匹配：尝试下一个步骤
+            elif name == "run_code":
+                # 绑定代码文件范围；纯 code 字符串无法预绑定 → 不授予免确认
+                files = spec["files"]
+                if not files:
+                    continue
+                file_args = _tool_file_args(name, args)
+                if not file_args:
+                    return False
+                if not all(any(_path_in_scope(p, f, workspace) for f in files)
+                           for p in file_args):
+                    continue
+            elif name == "git_commit":
+                # 提交范围必须 ⊆ 声明文件范围
+                files = spec["files"]
+                if not files:
+                    continue
+                targets = _commit_targets(workspace or _get_workspace(),
+                                          workspace or _get_workspace(), args)
+                if not targets:
+                    return False
+                if not all(any(_path_in_scope(rel, f, workspace) for f in files)
+                           for rel in targets):
+                    continue
+            else:  # 文件类工具
+                files = spec["files"]
+                if not files:
+                    continue
+                if not all(any(_path_in_scope(p, f, workspace) for f in files)
+                           for p in _tool_file_args(name, args)):
+                    continue
+        return True
+    return False
+
+
+def _plan_tool_names(specs: list[dict]) -> set[str]:
+    """计划内声明的全部工具名。"""
+    return {t for spec in specs for t in spec["tools"]}
+
+
+def _file_sha1(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _snapshot_plan_files(plan_steps: list) -> dict:
+    """批准时对计划声明的、当前存在的文件做快照 {rel: (size, mtime, sha1)}。"""
+    ws = _get_workspace()
+    snap: dict[str, tuple] = {}
+    for s in plan_steps:
+        if not isinstance(s, dict):
+            continue
+        for f in (s.get("files") or []):
+            if not isinstance(f, str):
+                continue
+            t = _safe_join(ws, f)
+            if t is None or not t.is_file():
+                continue
+            try:
+                st = t.stat()
+                snap[f] = (st.st_size, st.st_mtime, _file_sha1(t))
+            except OSError:
+                pass
+    return snap
+
+
+def _plan_files_changed(snapshot: dict) -> list[str]:
+    """返回批准后已被外部修改的文件列表（size/mtime/sha1 任一变化）。"""
+    ws = _get_workspace()
+    changed = []
+    for rel, (size, mtime, sha) in snapshot.items():
+        t = _safe_join(ws, rel)
+        if t is None or not t.is_file():
+            changed.append(rel)
+            continue
+        try:
+            st = t.stat()
+            if st.st_size != size or st.st_mtime != mtime or _file_sha1(t) != sha:
+                changed.append(rel)
+        except OSError:
+            changed.append(rel)
+    return changed
 
 
 def _timed_execute(fn_name: str, arguments: str, *ctx) -> tuple[bool, str]:
@@ -2142,6 +3193,22 @@ def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
     """生成 (确认问题, diff 文本)。diff 为空时前端不展示 diff 区域。"""
     if name == "create_file":
         return f"要覆盖已存在的文件 `{args.get('path')}` 吗？", None
+    if name == "delete_file":
+        return f"要删除文件 `{args.get('path')}` 吗？（删除前自动备份，可用 undo 恢复）", None
+    if name == "delete_folder":
+        return f"要删除目录 `{args.get('path')}` 吗？（仅空目录，可用 undo 恢复）", None
+    if name in ("move_file", "rename_file"):
+        return (f"要移动/重命名 `{args.get('src')}` → `{args.get('dst')}` 吗？"
+                f"（自动备份，可用 undo 撤销）", None)
+    if name == "copy_file":
+        dst = args.get("dst")
+        existed = False
+        ws = _get_workspace()
+        t = _safe_join(ws, dst) if dst else None
+        if t is not None:
+            existed = t.exists()
+        return (f"要复制 `{args.get('src')}` → `{dst}` 吗？"
+                + ("（目标已存在，将先备份再覆盖）" if existed else ""), None)
     if name == "run_shell":
         return f"要执行系统命令 `{(args.get('command') or '')[:80]}` 吗？", None
     if name == "replace_text":
@@ -2176,18 +3243,32 @@ def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
             ok, out = _run_git(root, "diff", "--stat")
             if ok and out:
                 diff = out[:REPLACE_DIFF_CHARS]
-        msg = (args.get("message") or "")[:60]
-        return f"要提交 Git 变更吗？提交信息：`{msg}`", diff
+            # 完整文件列表（staged + unstaged + untracked），未跟踪文件必须在预览中可见
+            targets = _commit_targets(root, workspace, args)
+            ok2, status = _run_git(root, "status", "--short")
+            msg = (args.get("message") or "")[:60]
+            files_line = "\n".join(f"  - {r}" for r in targets) or "  （无）"
+            status_line = (status or "")[:REPLACE_DIFF_CHARS]
+            return (f"要提交 Git 变更吗？提交信息：`{msg}`\n"
+                    f"将要提交的文件（{len(targets)} 个）：\n{files_line}\n\n"
+                    f"当前状态：\n{status_line or '（无改动）'}", diff)
+        return "工作区内未找到 Git 仓库", None
     if name == "start_process":
         return f"要在后台启动进程 `{(args.get('command') or '')[:80]}` 吗？", None
     return "确认执行该操作吗？", None
 
 
-def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT) -> str | None:
-    """等待用户对确认请求的响应；超时返回 None（视为拒绝）。"""
+def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
+                  task_id: str = "") -> str | None:
+    """等待用户对确认请求的响应；超时返回 None（视为拒绝）。
+
+    条目绑定 task_id 与过期时间：agent_respond 校验，取消/完成/过期任务的确认被拒绝。
+    """
     ev = threading.Event()
     with _confirm_lock:
-        _confirm_table[request_id] = {"event": ev, "choice": None}
+        _confirm_table[request_id] = {"event": ev, "choice": None,
+                                      "task_id": task_id, "source": "http",
+                                      "expires": time.monotonic() + timeout}
     ev.wait(timeout)
     with _confirm_lock:
         entry = _confirm_table.pop(request_id, None)
@@ -2201,10 +3282,26 @@ class AskResponse(BaseModel):
 
 @app.post("/api/v1/agent/respond", summary="响应 Agent 的确认请求")
 async def agent_respond(req: AskResponse) -> dict:
+    """响应确认请求。
+
+    生命周期：waiter（_wait_confirm）是确认记录的唯一所有者——它创建、读取并清理记录；
+    responder 只能原子地写入 choice 并触发 Event，绝不提前删除记录（否则 waiter 醒来
+    拿不到 choice，HTTP 返回 200 但 Agent 仍按拒绝/超时处理）。
+    重复响应幂等：已消费的确认不再改变结果。
+    """
     with _confirm_lock:
         entry = _confirm_table.get(req.request_id)
         if entry is None:
             raise HTTPException(404, "确认请求不存在或已超时（默认按拒绝处理）")
+        if entry["expires"] < time.monotonic():
+            raise HTTPException(404, "确认请求已过期（默认按拒绝处理）")
+        with _agent_task_lock:
+            current_task = _current_agent_task_id
+        if entry["task_id"] and entry["task_id"] != current_task:
+            raise HTTPException(404, "该确认请求所属任务已结束，无法应答")
+        if entry["choice"] is not None:
+            # 已消费（重复点击/并发响应）：幂等返回，不改变最终结果
+            return {"ok": True, "choice": entry["choice"], "already_processed": True}
         entry["choice"] = req.choice
         entry["event"].set()
     log.info("confirm %s -> %s", req.request_id, req.choice)
@@ -2214,6 +3311,8 @@ async def agent_respond(req: AskResponse) -> dict:
 class SessionAppend(BaseModel):
     messages: list[dict] = Field(..., description="新增消息（增量追加，如 [user, assistant]）")
     title: str | None = Field(default=None, description="可选：自定义标题（省略则自动取首条用户消息）")
+    request_id: str | None = Field(default=None, description="可选：幂等键（重复请求不重复追加）")
+    expected_version: int | None = Field(default=None, description="可选：乐观锁（不匹配返回 409）")
 
 
 @app.get("/api/v1/sessions", summary="会话列表（默认仅摘要；full=1 时含完整消息）")
@@ -2240,39 +3339,80 @@ async def session_create() -> dict:
         if len(_sessions) >= SESSION_MAX:
             raise HTTPException(409, f"会话数已达上限 {SESSION_MAX}，请先删除旧会话")
         sid = next(_session_id_counter)
+        # 记录 canonical workspace：会话与工作区绑定（防旧会话跨目录静默执行）
+        try:
+            bound_ws = str(_get_workspace().resolve())
+        except Exception:
+            bound_ws = None
         _sessions[sid] = {"id": sid, "title": "", "messages": [],
-                          "updated": time.strftime("%m-%d %H:%M")}
+                          "updated": time.strftime("%m-%d %H:%M"),
+                          "workspace": bound_ws}
         _save_sessions()
     log.info("session created: #%d", sid)
-    return {"ok": True, "id": sid}
+    return {"ok": True, "id": sid, "workspace": bound_ws}
 
 
-@app.get("/api/v1/sessions/{sid}", summary="读取单个会话")
-async def session_get(sid: int) -> dict:
+@app.get("/api/v1/sessions/{sid}", summary="读取单个会话（分页：limit/offset 取最近消息）")
+async def session_get(sid: int, limit: int = 0, offset: int = 0) -> dict:
+    """读取会话。limit>0 时返回最近 limit 条（offset 从最新往前数），并含总数。"""
     _ensure_sessions()
     with _session_lock:
         s = _sessions.get(sid)
         if s is None:
             raise HTTPException(404, f"会话不存在：{sid}")
+        if limit > 0:
+            msgs = s.get("messages", [])
+            start = max(0, len(msgs) - offset - limit)
+            chunk = msgs[start:start + limit] if offset > 0 else msgs[-limit:]
+            return {"ok": True, "session": {**s, "messages": chunk,
+                                            "total_messages": len(msgs)}}
         return {"ok": True, "session": s}
 
 
-@app.post("/api/v1/sessions/{sid}/messages", summary="向会话追加消息（增量）")
+@app.post("/api/v1/sessions/{sid}/messages", summary="向会话追加消息（增量；返回摘要而非完整历史）")
 async def session_append(sid: int, req: SessionAppend) -> dict:
     _ensure_sessions()
     if not req.messages:
         raise HTTPException(422, "messages 不能为空")
+    total_req = sum(len(m.get("content") or "") for m in req.messages)
+    if total_req > SESSION_APPEND_MAX_CHARS:
+        raise HTTPException(413, f"单次追加内容过大（{total_req} 字符 > {SESSION_APPEND_MAX_CHARS}）")
     with _session_lock:
         s = _sessions.get(sid)
         if s is None:
             raise HTTPException(404, f"会话不存在：{sid}")
-        msgs = s.setdefault("messages", [])
+        # 乐观并发控制：expected_version 不匹配 → 拒绝（多前端并发防覆盖）
+        ver = s.get("version", 1)
+        if req.expected_version is not None and req.expected_version != ver:
+            raise HTTPException(409, f"会话已被其他前端更新（版本 {ver} ≠ {req.expected_version}），请刷新后重试")
+        # 幂等：相同 request_id 已处理过 → 直接返回（不重复追加）
+        seen_rids = s.setdefault("request_ids", [])
+        if req.request_id and req.request_id in seen_rids:
+            return {"ok": True, "idempotent": True,
+                    "session": {"id": sid, "message_count": len(s["messages"]),
+                                "version": s.get("version", 1)}}
+        # 事务化：先完整校验全部消息（任一超限 → 整体拒绝，不留部分消息）
+        validated = []
         for m in req.messages:
             if m.get("role") in ("user", "assistant") and m.get("content"):
-                msgs.append({"role": m["role"], "content": m["content"]})
-        # 上限：超出丢弃最早消息
+                content = str(m["content"])
+                if len(content) > SESSION_MSG_MAX_CHARS:
+                    raise HTTPException(413, f"单条消息过长（{len(content)} 字符 > {SESSION_MSG_MAX_CHARS}）")
+                validated.append({"role": m["role"], "content": content})
+        # 校验通过后一次性修改
+        if req.request_id:
+            seen_rids.append(req.request_id)
+            if len(seen_rids) > 100:
+                del seen_rids[:-100]
+        msgs = s.setdefault("messages", [])
+        msgs.extend(validated)
+        # 单条上限（超出丢弃最早）+ 总字符上限
         if len(msgs) > SESSION_MAX_MESSAGES:
             del msgs[:len(msgs) - SESSION_MAX_MESSAGES]
+        total_chars = sum(len(m.get("content") or "") for m in msgs)
+        while msgs and total_chars > SESSION_TOTAL_MAX_CHARS:
+            dropped = msgs.pop(0)
+            total_chars -= len(dropped.get("content") or "")
         # 自动标题：首条用户消息前 N 字
         if not s.get("title"):
             for m in msgs:
@@ -2282,8 +3422,14 @@ async def session_append(sid: int, req: SessionAppend) -> dict:
         if req.title:
             s["title"] = req.title[:60]
         s["updated"] = time.strftime("%m-%d %H:%M")
-        _save_sessions()
-        return {"ok": True, "session": s}
+        s["version"] = s.get("version", 1) + 1
+        import copy as _copy
+        snapshot = _copy.deepcopy(s)
+        _persist_sessions_or_rollback(lambda: _rollback_session_state(s, snapshot))
+        # 只返回摘要，不返回完整历史（省传输；完整内容按需 GET）
+        return {"ok": True, "session": {"id": sid, "message_count": len(msgs),
+                                        "title": s.get("title", ""),
+                                        "version": s["version"]}}
 
 
 @app.delete("/api/v1/sessions/{sid}", summary="删除会话")
@@ -2292,8 +3438,9 @@ async def session_delete(sid: int) -> dict:
     with _session_lock:
         if sid not in _sessions:
             raise HTTPException(404, f"会话不存在：{sid}")
+        saved = _sessions.get(sid)
         del _sessions[sid]
-        _save_sessions()
+        _persist_sessions_or_rollback(lambda: _rollback_session_restore(sid, saved))
     log.info("session deleted: #%d", sid)
     return {"ok": True, "deleted": sid}
 
@@ -2305,10 +3452,12 @@ async def session_clear(sid: int) -> dict:
         s = _sessions.get(sid)
         if s is None:
             raise HTTPException(404, f"会话不存在：{sid}")
+        import copy as _copy
+        snapshot = _copy.deepcopy(s)
         s["messages"] = []
         s["title"] = ""
         s["updated"] = time.strftime("%m-%d %H:%M")
-        _save_sessions()
+        _persist_sessions_or_rollback(lambda: _rollback_session_state(s, snapshot))
     return {"ok": True, "cleared": sid}
 
 
@@ -2316,10 +3465,10 @@ def _execute_tool(name: str, arguments: str,
                   api_url: str | None = None, headers: dict | None = None,
                   model: str | None = None, temperature: float = 0.7,
                   q: queue.Queue | None = None, cancel: threading.Event | None = None,
-                  depth: int = 0) -> tuple[bool, str]:
+                  depth: int = 0, task_id: str = "") -> tuple[bool, str]:
     """执行工具，返回 (ok, 结果文本)。在工作线程中调用。
 
-    delegate 需要上游上下文（api_url/headers/model/q/cancel/depth），
+    delegate 需要上游上下文（api_url/headers/model/q/cancel/depth/task_id），
     由 agent 循环传入；纯函数测试/其他调用可省略。
     """
     """执行工具，返回 (ok, 结果文本)。在工作线程中调用。"""
@@ -2368,10 +3517,86 @@ def _execute_tool(name: str, arguments: str,
             target = _safe_join(workspace, args.get("path", ""))
             if target is None:
                 return False, "非法路径：必须是工作区内的相对路径（不能是绝对路径、空路径或包含 ..）"
+            if target.exists():
+                return False, f"目录已存在：{args.get('path')}"
             target.mkdir(parents=True, exist_ok=True)
+            _take_backup(workspace, target, op="mkdir")   # 登记（undo 可删除新建目录）
             rel = target.relative_to(workspace).as_posix()
             return True, json.dumps({"created": rel, "absolute": str(target)},
                                     ensure_ascii=False)
+        if name == "delete_file":
+            workspace = _get_workspace()
+            target = _safe_join(workspace, args.get("path", ""))
+            if target is None:
+                return False, "非法路径：必须是工作区内的相对路径"
+            if not target.is_file():
+                return False, f"文件不存在：{args.get('path')}"
+            if not _take_backup(workspace, target, op="delete"):
+                return False, "备份失败，已中止删除（可用性保护）"
+            target.unlink()
+            _record_modified(target.relative_to(workspace).as_posix())
+            return True, json.dumps({"deleted": args.get("path"), "backup": True},
+                                    ensure_ascii=False)
+        if name == "delete_folder":
+            workspace = _get_workspace()
+            target = _safe_join(workspace, args.get("path", ""))
+            if target is None:
+                return False, "非法路径：必须是工作区内的相对路径"
+            if not target.is_dir():
+                return False, f"目录不存在：{args.get('path')}"
+            try:
+                if any(target.iterdir()):
+                    return False, f"目录非空：{args.get('path')}（请先删除其中的文件）"
+            except OSError as exc:
+                return False, f"无法读取目录：{exc}"
+            if not _take_backup(workspace, target, op="delete_dir"):
+                return False, "备份登记失败，已中止删除"
+            target.rmdir()
+            return True, json.dumps({"deleted": args.get("path"), "backup": True},
+                                    ensure_ascii=False)
+        if name in ("move_file", "rename_file"):
+            workspace = _get_workspace()
+            src = _safe_join(workspace, args.get("src", ""))
+            dst = _safe_join(workspace, args.get("dst", ""))
+            if src is None or dst is None:
+                return False, "非法路径：src/dst 必须是工作区内的相对路径"
+            if not src.is_file():
+                return False, f"源文件不存在：{args.get('src')}"
+            if src == dst:
+                return False, "源与目标相同，无需移动"
+            if dst.exists():
+                # 目标被覆盖：先备份目标原内容（undo 恢复双边状态）
+                if not _take_backup(workspace, dst, op="overwrite"):
+                    return False, "目标备份失败，已中止移动"
+            # 源备份最后登记：全局 undo 取到的是 move 条目（双边备份作为整体撤销）
+            if not _take_backup(workspace, src, op="move",
+                                src=args.get("src"), dst=args.get("dst")):
+                return False, "备份失败，已中止移动"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            _record_modified(dst.relative_to(workspace).as_posix())
+            return True, json.dumps({"moved": [args.get("src"), args.get("dst")],
+                                     "backup": True}, ensure_ascii=False)
+        if name == "copy_file":
+            workspace = _get_workspace()
+            src = _safe_join(workspace, args.get("src", ""))
+            dst = _safe_join(workspace, args.get("dst", ""))
+            if src is None or dst is None:
+                return False, "非法路径：src/dst 必须是工作区内的相对路径"
+            if not src.is_file():
+                return False, f"源文件不存在：{args.get('src')}"
+            if src == dst:
+                return False, "源与目标相同，无需复制"
+            existed = dst.exists()          # 复制前记录（backup 字段必须反映复制前状态）
+            if existed:
+                if not _take_backup(workspace, dst, op="overwrite"):
+                    return False, "目标备份失败，已中止复制"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            import shutil as _sh
+            _sh.copy2(src, dst)
+            _record_modified(dst.relative_to(workspace).as_posix())
+            return True, json.dumps({"copied": [args.get("src"), args.get("dst")],
+                                     "backup": existed}, ensure_ascii=False)
         if name == "list_folder":
             workspace = _get_workspace()
             rel = (args.get("path") or "").strip() or "."
@@ -2406,9 +3631,16 @@ def _execute_tool(name: str, arguments: str,
             if len(content) > MAX_WRITE_CHARS:
                 return False, f"内容过长（{len(content)} 字符 > 上限 {MAX_WRITE_CHARS}）"
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                _take_backup(workspace, target)      # 覆盖前自动备份（供 undo 恢复）
-            target.write_text(content, encoding="utf-8")
+            existed = target.exists()
+            if existed:
+                if not _take_backup(workspace, target, op="overwrite"):
+                    return False, "备份失败，已中止覆盖写入（请检查 .pcagent/backups 权限）"
+            else:
+                # 新建也记录（undo 可删除新建文件）；无内容可备份，仅登记
+                if not _take_backup(workspace, target, op="create"):
+                    return False, "备份登记失败，已中止创建"
+            _atomic_write_text(target, content)
+            _record_modified(target.relative_to(workspace).as_posix())
             return True, json.dumps(
                 {"created": target.relative_to(workspace).as_posix(), "chars": len(content)},
                 ensure_ascii=False)
@@ -2422,10 +3654,22 @@ def _execute_tool(name: str, arguments: str,
             size = target.stat().st_size
             if size > MAX_FILE_SIZE:
                 return False, f"文件过大（{size} 字节 > {MAX_FILE_SIZE}）"
-            text = target.read_text(encoding="utf-8", errors="replace")
-            if len(text) > MAX_FILE_CHARS:
-                return True, text[:MAX_FILE_CHARS] + f"\n...(截断，共 {len(text)} 字符)"
-            return True, text
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            total = len(lines)
+            start = _safe_int(args.get("start_line"), 1, 1, max(total, 1))
+            end = _safe_int(args.get("end_line"), total, start, max(total, start))
+            if args.get("start_line") is None and args.get("end_line") is None:
+                # 兼容旧行为：返回全文（超长截断）
+                text = "\n".join(lines)
+                if len(text) > MAX_FILE_CHARS:
+                    return True, text[:MAX_FILE_CHARS] + f"\n...(截断，共 {len(text)} 字符)"
+                return True, text
+            # 分页读取：返回总行数与实际范围
+            chunk = "\n".join(lines[start - 1:end])
+            if len(chunk) > MAX_FILE_CHARS:
+                chunk = chunk[:MAX_FILE_CHARS] + "\n...(截断)"
+            return True, (f"（文件 {args['path']} 共 {total} 行，返回第 {start}-{end} 行）\n"
+                          + chunk)
         if name == "run_code":
             workspace = _get_workspace()
             code = args.get("code") or ""
@@ -2440,7 +3684,8 @@ def _execute_tool(name: str, arguments: str,
                 return False, "没有可执行的代码（请提供 file 或 code 参数）"
             try:
                 rc, out, err, timed_out = _run_subprocess(
-                    [sys.executable, "-c", code], workspace, RUN_CODE_TIMEOUT, shell=False)
+                    [sys.executable, "-c", code], workspace, RUN_CODE_TIMEOUT,
+                    shell=False, env=_controlled_env())
             except FileNotFoundError:
                 return False, "Python 解释器不存在"
             except Exception as exc:
@@ -2468,12 +3713,23 @@ def _execute_tool(name: str, arguments: str,
             for pat in DANGEROUS_PATTERNS:
                 if re.search(pat, command):
                     return False, f"危险命令已被拦截：{command[:80]}（破坏性操作禁止执行）"
-            cwd = (args.get("cwd") or "").strip() or str(_get_workspace())
+            # cwd 安全：默认当前工作区；只允许工作区内的相对路径（拒绝绝对路径与 ..）
+            workspace = _get_workspace()
+            cwd = str(workspace)
+            rel = (args.get("cwd") or "").strip()
+            if rel and rel != ".":
+                target = _safe_join(workspace, rel)
+                if target is None:
+                    return False, ("非法 cwd：必须是工作区内的相对路径"
+                                   "（拒绝绝对路径、空路径、.. 与符号链接越界）")
+                if not target.is_dir():
+                    return False, f"目录不存在：{rel}"
+                cwd = str(target)
             try:
                 rc, out, err, timed_out = _run_subprocess(
                     command, cwd, RUN_SHELL_TIMEOUT, shell=True)
             except FileNotFoundError:
-                return False, f"目录不存在：{cwd}"
+                return False, "shell 执行环境不可用（命令或解释器不存在）"
             except Exception as exc:
                 return False, f"执行失败：{exc}"
             stdout = _decode_out(out)[:RUN_SHELL_OUTPUT_LIMIT]
@@ -2608,8 +3864,10 @@ def _execute_tool(name: str, arguments: str,
                 fromfile=f"a/{args['file']}", tofile=f"b/{args['file']}", n=1))
             if len(diff) > REPLACE_DIFF_CHARS:
                 diff = diff[:REPLACE_DIFF_CHARS] + "\n...(diff 过长已截断)"
-            _take_backup(workspace, target)          # 修改前自动备份（供 undo 恢复）
-            target.write_text(new_text, encoding="utf-8")
+            if not _take_backup(workspace, target):   # 备份失败：中止修改（安全方向）
+                return False, "备份失败，已中止修改（请检查 .pcagent/backups 权限）"
+            _atomic_write_text(target, new_text)
+            _record_modified(target.relative_to(workspace).as_posix())
             return True, json.dumps({"file": args.get("file"), "occurrence": occ,
                                      "replacements": count, "diff": diff,
                                      "backup": True}, ensure_ascii=False)
@@ -2617,18 +3875,90 @@ def _execute_tool(name: str, arguments: str,
             workspace = _get_workspace()
             entry = _find_undo_entry((args.get("file") or "").strip())
             if entry is None:
-                return False, "没有可撤销的修改（replace_text / create_file 覆盖前会自动备份）"
+                return False, "没有可撤销的修改（写操作前会自动备份）"
             bdir = _backup_dir() / str(entry["backup"])
             content_path = bdir / "content"
-            if not content_path.exists():
-                return False, "备份文件缺失，无法撤销"
+            op = entry.get("op", "overwrite")   # 兼容旧条目（无 op = overwrite）
             target = _safe_join(workspace, entry["file"])
             if target is None:
                 return False, "非法路径：备份记录中的路径超出工作区"
-            content = content_path.read_text(encoding="utf-8", errors="replace")
-            _take_backup(workspace, target)          # 恢复前备份当前状态（撤销可逆）
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            if op == "create":
+                # 撤销新建：删除文件（目标不存在视为已删除）
+                if target.exists():
+                    if not _take_backup(workspace, target, op="create"):
+                        return False, "备份失败，已中止撤销（可逆性保护）"
+                    if target.is_dir():
+                        try:
+                            target.rmdir()
+                        except OSError as exc:
+                            return False, f"目录非空，无法撤销：{exc}"
+                    else:
+                        target.unlink()
+                result_note = f"已删除新建的 {entry['file']}"
+            elif op == "delete":
+                # 恢复被删除的文件（bytes 无损）
+                if not content_path.exists():
+                    return False, "备份文件缺失，无法撤销"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(target, content_path.read_bytes())
+                result_note = f"已恢复被删除的 {entry['file']}"
+            elif op == "move":
+                # 撤销移动/重命名：移回 src（先备份 dst 当前内容，保证可再撤销），
+                # 若移动时覆盖了目标，则从备份恢复目标原内容（完整双边状态）
+                dst_rel = entry.get("dst") or entry["file"]
+                dst = _safe_join(workspace, dst_rel)
+                if dst is None:
+                    return False, "非法路径：备份记录中的目标超出工作区"
+                extra_pop = None
+                if dst.exists():
+                    if not _take_backup(workspace, dst, op="overwrite"):
+                        return False, "备份失败，已中止撤销"
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.replace(target)   # 移回原位置（覆盖前已备份）
+                # 目标被覆盖（move 前存在）：恢复其原内容（找到最近的 overwrite 备份）
+                with _backup_lock:
+                    idx = _backup_index()
+                    # 只恢复「move 操作之前」的目标备份（id 小于 move 条目），
+                    # 排除 undo 自身刚创建的可逆备份
+                    prev = [e for e in idx if e.get("file") == dst_rel
+                            and e.get("op") == "overwrite"
+                            and int(e.get("id", 0)) < int(entry.get("id", 0))]
+                    if prev:
+                        last = prev[-1]
+                        last_bdir = _backup_dir() / str(last["backup"])
+                        last_content = last_bdir / "content"
+                        if last_content.exists():
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            _atomic_write_bytes(dst, last_content.read_bytes())
+                            extra_pop = last
+                if extra_pop is not None:
+                    with _backup_lock:
+                        idx2 = _backup_index()
+                        if extra_pop in idx2:
+                            idx2.remove(extra_pop)
+                            _save_backup_index(idx2)
+                    shutil.rmtree(_backup_dir() / str(extra_pop["backup"]), ignore_errors=True)
+                result_note = f"已撤销移动 {dst_rel} → {entry['file']}"
+            elif op == "mkdir":
+                # 撤销新建目录：删除空目录
+                if target.is_dir():
+                    try:
+                        target.rmdir()
+                    except OSError as exc:
+                        return False, f"目录非空，无法撤销：{exc}"
+                result_note = f"已删除新建目录 {entry['file']}"
+            elif op == "delete_dir":
+                # 恢复被删除的空目录
+                target.mkdir(parents=True, exist_ok=True)
+                result_note = f"已恢复目录 {entry['file']}"
+            else:   # overwrite：恢复覆盖前的备份内容（bytes 无损）
+                if not content_path.exists():
+                    return False, "备份文件缺失，无法撤销"
+                if not _take_backup(workspace, target):   # 恢复前备份当前状态（撤销可逆）
+                    return False, "备份失败，已中止撤销"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(target, content_path.read_bytes())
+                result_note = f"已恢复 {entry['file']}"
             # 移除该备份条目
             with _backup_lock:
                 idx = _backup_index()
@@ -2636,8 +3966,9 @@ def _execute_tool(name: str, arguments: str,
                     idx.remove(entry)
                     _save_backup_index(idx)
             shutil.rmtree(bdir, ignore_errors=True)
+            _record_modified(entry["file"])
             return True, json.dumps({"restored": entry["file"], "time": entry["time"],
-                                     "chars": len(content)}, ensure_ascii=False)
+                                     "op": op, "note": result_note}, ensure_ascii=False)
         # ================= 编程工具：Git =================
         if name in ("git_status", "git_diff", "git_log", "git_commit"):
             workspace = _get_workspace()
@@ -2680,15 +4011,32 @@ def _execute_tool(name: str, arguments: str,
                 return False, "提交信息不能为空"
             if len(message) > 200:
                 return False, "提交信息过长（≤200 字符）"
-            ok1, err1 = _run_git(root, "add", "-A")
-            if not ok1:
-                return False, f"git add 失败：{err1}"
+            # 工作树快照校验：确认后工作树变化 → 拒绝（要求重新确认）
+            global _pending_git_snapshot
+            snap = _git_worktree_snapshot(root)
+            if _pending_git_snapshot and snap != _pending_git_snapshot:
+                _pending_git_snapshot = ""
+                return False, ("工作树在确认后发生了变化（有其他文件被修改），"
+                               "为安全起见本次提交被拒绝，请重新确认后提交")
+            # 提交范围：显式 files 或本轮 Agent 修改的文件（绝不用 git add -A）
+            targets = _commit_targets(root, workspace, args)
+            if not targets:
+                return False, ("没有可提交的文件（本轮未修改任何文件，"
+                               "或 files 指定的文件均不在仓库内）")
+            for rel in targets:
+                ok1, err1 = _run_git(root, "add", "--", rel)
+                if not ok1:
+                    return False, f"git add 失败（{rel}）：{err1}"
             ok2, out2 = _run_git(root, "commit", "-m", message)
             if not ok2:
                 return False, f"git commit 失败：{out2}"
+            # 提交成功后清空本轮修改记录
+            with _modified_lock:
+                _agent_modified_files.clear()
+            _pending_git_snapshot = ""
             return True, json.dumps({"repo": rel_root, "committed": True,
-                                     "message": message, "result": out2},
-                                    ensure_ascii=False)
+                                     "message": message, "files": targets,
+                                     "result": out2}, ensure_ascii=False)
         # ================= 编程工具：后台进程 =================
         if name == "start_process":
             command = (args.get("command") or "").strip()
@@ -2730,6 +4078,8 @@ def _execute_tool(name: str, arguments: str,
                 _cleanup_dead_processes()
                 procs = [{"pid": pid, "command": e["cmd"], "started": e["started"],
                           "running": e["proc"].poll() is None,
+                          "stopped": e.get("stopped", False),
+                          "stop_failed": e.get("stop_failed", False),
                           "exit_code": None if e["proc"].poll() is None else e["proc"].returncode}
                          for pid, e in _processes.items()]
             return True, json.dumps({"processes": procs}, ensure_ascii=False)
@@ -2800,8 +4150,20 @@ def _execute_tool(name: str, arguments: str,
             return True, _system_status_text()
         if name == "view_image":
             return _exec_view_image(args)
+        if name == "fetch_result":
+            rid = (args.get("result_id") or "").strip()
+            section = (args.get("section") or "tail").strip()
+            if not rid:
+                return False, "fetch_result 需要 result_id 参数"
+            if section not in ("head", "tail", "error", "full"):
+                return False, f"非法区段：{section}（可选 head/tail/error/full）"
+            text = _result_store.section(rid, section)
+            if text is None:
+                return False, f"找不到结果 {rid}（可能已过期或被清理，请基于现有摘要继续）"
+            return True, text
         if name == "delegate":
-            return _exec_delegate(args, api_url, headers, model, temperature, q, cancel, depth)
+            return _exec_delegate(args, api_url, headers, model, temperature,
+                                  q, cancel, depth, task_id)
         if name.startswith("mcp_"):
             # MCP 外部工具转发（mcp_<server>_<tool>）
             mcp = _ensure_mcp()
@@ -2818,30 +4180,101 @@ def _execute_tool(name: str, arguments: str,
         return False, f"工具执行异常：{exc}"
 
 
+# ---- R3：跨轮只读结果缓存（防重复读取同一文件；文件变化即失效）----
+_READ_CACHE_TTL = 30.0            # 缓存有效期（秒）
+_READ_CACHE_PATH_ARGS = ("path", "file", "src", "dst", "folder", "directory")
+
+
+def _read_cache_key(name: str, args: dict) -> tuple[str, str]:
+    return (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+
+
+def _read_cache_paths(args: dict) -> dict:
+    """从参数提取工作区文件路径 → (mtime, size) 状态。无路径参数返回空（不缓存）。"""
+    out: dict[str, tuple[float, int]] = {}
+    ws = _get_workspace()
+    for key in _READ_CACHE_PATH_ARGS:
+        val = args.get(key)
+        if isinstance(val, str) and val:
+            target = _safe_join(ws, val)
+            if target is not None and target.is_file():
+                try:
+                    st = target.stat()
+                    out[val] = (st.st_mtime, st.st_size)
+                except OSError:
+                    pass
+    return out
+
+
+def _read_cache_hit(cache: dict, name: str, args: dict) -> tuple[bool, str] | None:
+    """只读缓存命中：文件参数未变化且未超 TTL 才复用（动态工具不缓存）。"""
+    if not _is_query_tool(name, args):
+        return None
+    entry = cache.get(_read_cache_key(name, args))
+    if entry is None:
+        return None
+    ts, ok, result, paths = entry
+    if time.monotonic() - ts > _READ_CACHE_TTL:
+        return None
+    for rel, (mtime, size) in paths.items():
+        target = _safe_join(_get_workspace(), rel)
+        if target is None or not target.is_file():
+            return None
+        try:
+            st = target.stat()
+        except OSError:
+            return None
+        if st.st_mtime != mtime or st.st_size != size:
+            return None   # 文件已变化：缓存失效
+    return (ok, result)
+
+
+def _read_cache_put(cache: dict, name: str, args: dict, ok: bool, result: str) -> None:
+    """登记只读缓存：只缓存带文件路径参数的查询工具，避免缓存动态状态。"""
+    paths = _read_cache_paths(args)
+    if paths and _is_query_tool(name, args):
+        cache[_read_cache_key(name, args)] = (time.monotonic(), ok, result, paths)
+
+
 def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 model: str, temperature: float, q: queue.Queue,
                 cancel: threading.Event, depth: int = 0,
                 max_steps: int | None = None,
-                tools_filter: set[str] | None = None) -> str:
+                tools_filter: set[str] | None = None,
+                task_id: str = "") -> str:
     """后台线程：工具调用循环，事件经 queue 发送给 SSE 生成器。
 
-    安全锁：轮数上限 / 总调用数上限 / 连续失败熔断 / 总时长上限 / 取消事件。
+    安全锁：轮数上限 / 总调用数上限 / 单轮上限 / 连续失败熔断 / 总时长上限 / 取消事件。
     事件: ("tool_call", {...}) / ("tool_result", {...}) /
           ("delta", text) / ("done", None) / ("error", msg)
     返回最终回复文本（主循环忽略；delegate 用它取子 agent 结果）。
     depth > 0 时（子 agent 循环）：工具轮数用 max_steps、tools 用白名单、
-    不套用计划审批模式（授权已在主层完成）。
+    不套用计划审批模式（授权已在主层完成）。task_id 绑定确认请求（主循环传入）。
     """
+    global _current_agent_task_id
+    if depth == 0 and task_id:
+        with _agent_task_lock:
+            _current_agent_task_id = task_id
+    # 工作区 epoch：切换工作区后旧任务在下一检查点中止（不允许旧任务操作新工作区）
+    ws_epoch = _workspace_epoch
     start = time.monotonic()
     tool_calls_total = 0
     consecutive_failures = 0
-    step_limit = max_steps or MAX_TOOL_STEPS
+    _lim_steps, _lim_secs = _agent_limits()
+    step_limit = max_steps or _lim_steps
+    _MAX_SECS = _lim_secs
     # ---- 计划审批模式状态（plan）：任务先列计划，统一批准后按计划执行 ----
     # 仅主循环（depth=0）生效；子 agent 的授权由主层批准委托
+    # 授权是参数级的：步骤声明 files/commands 范围，范围内免确认；
+    # 范围外参数、文件被外部修改、计划外工具都会重新确认/拒绝。
     plan_mode = _current_confirm_mode() == "plan" and depth == 0
     plan_submitted = not plan_mode
-    approved_tools: set[str] = set()
+    approved_specs: list[dict] = []
+    approved_plan_steps: list = []
+    plan_file_snapshot: dict = {}
     PLAN_CONFIRM_TIMEOUT = 300   # 计划审批等待更宽松（看表格+思考需要时间）
+    # 跨轮只读结果缓存：{key: (ts, ok, result, {path: (mtime, size)})}
+    read_cache: dict = {}
 
     for step in range(1, step_limit + 1):
         # 安全锁检查
@@ -2849,10 +4282,14 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             if depth == 0:
                 q.put(("error", "已由用户中止"))
             return "已由用户中止"
-        if time.monotonic() - start > MAX_AGENT_SECONDS:
+        if _workspace_changed(ws_epoch):
             if depth == 0:
-                q.put(("error", f"任务超过总时长上限 {MAX_AGENT_SECONDS}s，已自动中止"))
-            return f"任务超过总时长上限 {MAX_AGENT_SECONDS}s，已自动中止"
+                q.put(("error", "工作区已切换，旧任务已中止（不允许操作新工作区）"))
+            return "工作区已切换，任务中止"
+        if time.monotonic() - start > _MAX_SECS:
+            if depth == 0:
+                q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
+            return f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"
         if tool_calls_total >= MAX_TOOL_CALLS_TOTAL:
             if depth == 0:
                 q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
@@ -2894,11 +4331,42 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             if depth == 0:
                 q.put(("error", "已由用户中止"))
             return "已由用户中止"
+        # ---- 批次校验与限额（硬边界，绝不突破 MAX_TOOL_CALLS_TOTAL）----
+        # 1) 单轮上限：模型一次返回过多调用直接整批拒绝
+        if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
+            q.put(("error", f"模型单轮返回 {len(tool_calls)} 个工具调用，超过单轮上限 "
+                            f"{MAX_TOOL_CALLS_PER_ROUND}，任务已中止"))
+            return f"模型单轮工具调用超过上限 {MAX_TOOL_CALLS_PER_ROUND}"
+        # 2) 结构校验：缺少 id / function / name 或重复 id 的调用安全拒绝（跳过）
+        valid: list[dict] = []
+        seen_ids: set[str] = set()
+        for tc in tool_calls:
+            tc_id = tc.get("id")
+            fn = tc.get("function")
+            if (not isinstance(tc_id, str) or not tc_id
+                    or not isinstance(fn, dict) or not isinstance(fn.get("name"), str)
+                    or not fn["name"]):
+                continue
+            if tc_id in seen_ids:
+                continue
+            seen_ids.add(tc_id)
+            valid.append(tc)
+        if not valid:
+            q.put(("error", "模型返回的 tool_calls 全部无效（缺少 id/function 或重复），任务已中止"))
+            return "模型返回的 tool_calls 全部无效"
+        # 3) 剩余额度：只执行允许的数量，绝不突破总量上限
+        remaining = MAX_TOOL_CALLS_TOTAL - tool_calls_total
+        if len(valid) > remaining:
+            log.warning("tool_calls 请求 %d 个，剩余额度 %d，截断执行", len(valid), remaining)
+            valid = valid[:remaining]
+        tool_calls = valid
         tool_calls_total += len(tool_calls)
         names = ",".join((tc.get("function") or {}).get("name", "?") for tc in tool_calls)
         log.info("agent step %d: [%s] (total %d)", step, names, tool_calls_total)
         messages.append({"role": "assistant", "content": msg.get("content") or None,
                          "tool_calls": tool_calls})
+        # 同轮重复检测：相同 (工具, 参数) 的调用直接复用本轮结果（依赖状态必然相同）
+        round_cache: dict[tuple[str, str], tuple[bool, str]] = {}
         for tc in tool_calls:
             if cancel.is_set():
                 if depth == 0:
@@ -2907,11 +4375,57 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             fn = tc["function"]
             try:
                 args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
+                if not isinstance(args, dict):
+                    raise ValueError("arguments 不是 JSON 对象")
+            except (json.JSONDecodeError, ValueError):
+                args = None
+            if args is None:
+                # 非法参数：安全拒绝，不执行工具
+                log.warning("tool %s 参数非法已拒绝：%.120s", fn.get("name"), fn.get("arguments") or "")
+                result = "工具参数不是合法 JSON，已安全拒绝（不执行）"
+                ok = False
+                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result}))
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    q.put(("error", f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，"
+                                    f"熔断器已触发，任务自动中止"))
+                    return f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，熔断器已触发"
+                continue
+            # 同轮重复调用：相同 (工具, 参数) 直接复用本轮结果（依赖状态必然相同，
+            # 防止模型重复调用同一只读工具 / 反复执行同一失败操作）
+            fp = (fn["name"], fn.get("arguments") or "")
+            if fp in round_cache:
+                prev_ok, prev_result = round_cache[fp]
+                result = prev_result + "\n（同轮重复调用同一工具与参数，已复用本次结果）"
+                ok = prev_ok
+                q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
+                                     "arguments": fn["arguments"],
+                                     "step": step, "max_steps": MAX_TOOL_STEPS}))
+                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                       "reused": True}))
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                continue
+            # 跨轮只读结果缓存：文件参数未变化时避免重复读取同一文件（30s TTL）
+            if fp not in round_cache and _read_cache_hit(read_cache, fn["name"], args) is not None:
+                prev_ok, prev_result = _read_cache_hit(read_cache, fn["name"], args)
+                result = prev_result + "\n（文件未变化，已复用上次只读结果）"
+                ok = prev_ok
+                q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
+                                     "arguments": fn["arguments"],
+                                     "step": step, "max_steps": MAX_TOOL_STEPS}))
+                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                       "reused": True}))
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                continue
             q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
                                  "arguments": fn["arguments"],
                                  "step": step, "max_steps": MAX_TOOL_STEPS}))
+            # 工具执行前检查总时长（覆盖上游等待/确认等待/MCP 调用累计耗时）
+            if time.monotonic() - start > _MAX_SECS:
+                if depth == 0:
+                    q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
+                return f"任务超过总时长上限 {_MAX_SECS}s"
             # ---- 计划审批模式：先规划，批准后按计划执行 ----
             if plan_mode and not plan_submitted:
                 if fn["name"] == "create_plan":
@@ -2920,30 +4434,36 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         result = "计划无效：steps 必须是非空数组（每个步骤含 step/tools）"
                         ok = False
                     else:
-                        ask_id = f"ask-{next(_confirm_counter)}"
+                        ask_id = _new_confirm_id(task_id)
                         q.put(("ask", {"id": ask_id, "name": "create_plan",
                                        "arguments": fn["arguments"],
                                        "question": "任务计划需要你的批准：批准后按计划执行，"
-                                                   "计划内声明的操作不再逐个确认；计划外操作仍会确认。",
+                                                   "计划内声明的范围（files/commands）内操作免确认；"
+                                                   "范围外参数、文件被外部修改会重新确认。",
                                        "options": ["yes", "no"],
                                        "plan": plan_steps}))
-                        choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT)
+                        choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
+                                               task_id=task_id)
+                        if time.monotonic() - start > _MAX_SECS:
+                            # 确认等待也计入任务总时长
+                            q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                            return f"任务超过总时长上限 {_MAX_SECS}s"
                         if choice == "yes":
-                            approved_tools = {t for s in plan_steps
-                                              for t in (s.get("tools") or [])}
+                            approved_specs = _plan_build_specs(plan_steps)
+                            approved_plan_steps = plan_steps
+                            plan_file_snapshot = _snapshot_plan_files(plan_steps)
                             plan_submitted = True
+                            names = _plan_tool_names(approved_specs)
                             result = (f"计划已批准（{len(plan_steps)} 步，"
-                                      f"授权工具：{', '.join(sorted(approved_tools)) or '无'}），"
-                                      f"开始按计划执行")
+                                      f"授权工具：{', '.join(sorted(names)) or '无'}），"
+                                      f"开始按计划执行（范围外参数将重新确认）")
                             ok = True
                         else:
                             result = "计划被用户拒绝，请停止执行并询问用户如何调整"
                             ok = False
-                elif (fn["name"] in QUERY_TOOLS or _is_readonly_mcp(fn["name"]) or
-                      (fn["name"] == "run_shell" and
-                       _is_readonly_shell((args.get("command") or "").strip()))):
-                    # 只读操作（查询类工具/只读 shell/只读 MCP）天然无害：免规划直接执行
-                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+                elif _is_query_tool(fn["name"], args):
+                    # 只读操作（查询类工具/简单只读 shell/只读 MCP）天然无害：免规划直接执行
+                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
                 else:
                     result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
                               "（列出步骤与所需工具，用户批准后才可执行）")
@@ -2953,9 +4473,40 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 # 计划已批准后重复规划：提示而非误导
                 result = "计划已提交并批准，直接按计划执行即可，无需重复规划；如需调整请询问用户"
                 ok = False
-            elif plan_mode and fn["name"] in approved_tools:
-                # 计划内声明的工具：免确认直接执行
-                ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
+            elif plan_mode and fn["name"] in _plan_tool_names(approved_specs):
+                # 计划内工具：参数必须命中批准范围，且目标文件未被外部修改；
+                # 不满足 → 重新确认（显示实际参数与原因），用户拒绝则不执行。
+                authorized = _plan_authorized(approved_specs, fn["name"], args, workspace=_get_workspace())
+                changed = _plan_files_changed(plan_file_snapshot) if authorized else []
+                if authorized and not changed:
+                    ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                api_url, headers, model, temperature, q, cancel, depth)
+                    if ok:
+                        # 免确认执行成功后刷新快照（agent 自己的修改不算外部变化）
+                        plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
+                else:
+                    hint = (f"（文件已被外部修改：{', '.join(changed[:3])}）" if changed
+                            else "（参数超出计划批准的范围）")
+                    ask_id = _new_confirm_id(task_id)
+                    question = f"工具 `{fn['name']}` 需要重新确认{hint}"
+                    q.put(("ask", {"id": ask_id, "name": fn["name"],
+                                   "arguments": fn["arguments"],
+                                   "question": question,
+                                   "options": ["yes", "no"],
+                                   "diff": _confirm_question(fn["name"], args)[1]}))
+                    choice = _wait_confirm(ask_id, task_id=task_id)
+                    if time.monotonic() - start > _MAX_SECS:
+                        q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                        return f"任务超过总时长上限 {_MAX_SECS}s"
+                    if choice == "yes":
+                        ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                    api_url, headers, model, temperature, q, cancel, depth)
+                        if ok:
+                            plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
+                    else:
+                        log.info("plan tool %s re-confirm rejected by user", fn["name"])
+                        result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+                        ok = False
             else:
                 # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
                 policy = _confirm_policy(fn["name"], args)
@@ -2964,25 +4515,47 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                     result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
                               f"如需执行请先切换到其他问询模式")
                 elif policy == "ask":
-                    ask_id = f"ask-{next(_confirm_counter)}"
+                    ask_id = _new_confirm_id(task_id)
                     question, diff = _confirm_question(fn["name"], args)
                     q.put(("ask", {"id": ask_id, "name": fn["name"],
                                    "arguments": fn["arguments"],
                                    "question": question,
                                    "options": ["yes", "no"], "diff": diff}))
-                    choice = _wait_confirm(ask_id)
-                    if choice != "yes":
+                    choice = _wait_confirm(ask_id, task_id=task_id)
+                    if time.monotonic() - start > _MAX_SECS:
+                        q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                        return f"任务超过总时长上限 {_MAX_SECS}s"
+                    if choice == "yes":
+                        if fn["name"] == "git_commit":
+                            # 批准时记录工作树快照：执行前变化则要求重新确认
+                            global _pending_git_snapshot
+                            ws_root = _find_git_root(_get_workspace(), args.get("path", ""))
+                            _pending_git_snapshot = (_git_worktree_snapshot(ws_root)
+                                                     if ws_root is not None else "")
+                        ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                    api_url, headers, model, temperature, q, cancel, depth, task_id)
+                    else:
                         log.info("tool %s rejected by user (%s)", fn["name"], choice)
                         result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
                         ok = False
-                    else:
-                        ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
                 else:
-                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth)
-            # 工具结果截断：避免大结果（read_file 等）撑爆上下文
+                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
+            # 工具结果压缩：完整原文存本地（result_id 引用，模型可 fetch_result 取回），
+            # 发送给模型的是 head/error/tail 分区保留的摘要（错误绝不丢）
             if len(result) > MAX_TOOL_RESULT_CHARS:
-                result = result[:MAX_TOOL_RESULT_CHARS] + "\n...(结果过长已截断)"
-            q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result}))
+                result, _rmeta = reduce_tool_result(
+                    fn["name"], args, result, ok,
+                    max_chars=MAX_TOOL_RESULT_CHARS, store=_result_store)
+                log.info("tool %s 结果 %d 字符 → 压缩为 %d（可 fetch_result 取回 %s）",
+                         fn["name"], _rmeta["original_chars"], _rmeta["reduced_chars"],
+                         _rmeta["result_id"])
+            else:
+                _rmeta = None
+            round_cache[fp] = (ok, result)
+            _read_cache_put(read_cache, fn["name"], args, ok, result)
+            q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                   **({"reduced": True, "result_id": _rmeta["result_id"]}
+                                      if _rmeta and _rmeta.get("result_id") else {})}))
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             # 任务清单变化：推送 todo_update 事件（前端刷新任务面板）
             if fn["name"] in ("create_todo", "update_todo"):
@@ -2997,24 +4570,85 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     return f"工具调用超过 {step_limit} 轮上限，已自动中止"
 
 
+def _agent_limits() -> tuple[int, int]:
+    """工具轮数/任务时长上限：优先配置（设置界面保存后实时生效），否则默认常量。"""
+    cfg = load_config()
+    steps = _safe_int(cfg.get("max_tool_steps"), MAX_TOOL_STEPS, 1, 50)
+    secs = _safe_int(cfg.get("max_agent_seconds"), MAX_AGENT_SECONDS, 10, 3600)
+    return steps, secs
+
+
+def _new_task_id() -> str:
+    """agent 任务唯一 ID（确认请求绑定 / 旧任务隔离）。"""
+    import uuid
+    return uuid.uuid4().hex[:12]
+
+
+async def _release_lock_when_done(fut) -> None:
+    """后台 watcher：worker 最终结束后释放全局 agent 锁（防锁永久泄漏，幂等）。"""
+    try:
+        await asyncio.shield(fut)
+    except Exception:
+        pass
+    finally:
+        with _agent_task_lock:
+            _current_agent_task_id = ""
+        try:
+            _agent_lock.release()
+        except RuntimeError:
+            pass   # 已释放（幂等）
+        log.info("agent worker 已结束，全局锁已释放")
+
+
 async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict],
                                model: str, temperature: float):
-    """把 agent 循环的事件流转发为 SSE；客户端断开时通知循环线程停止。"""
-    # 并发互斥：同一时刻只允许一个 agent 循环（防止多循环同时操作屏幕）
+    """把 agent 循环的事件流转发为 SSE；客户端断开时通知循环线程停止。
+
+    并发互斥：持有 _agent_lock 期间不允许第二条 Agent 任务启动；
+    客户端断开后必须等 worker 真正结束才释放锁（防止旧任务工具与
+    新任务并发执行文件/Shell/MCP/屏幕操作）。worker 无法及时取消时
+    保持全局 busy，由 watcher 在 worker 结束后释放。
+    """
     if not _agent_lock.acquire(blocking=False):
-        yield f"event: error\ndata: {json.dumps({'detail': '已有另一个 Agent 任务正在执行，请等待完成'}, ensure_ascii=False)}\n\n"
+        yield f"event: error\ndata: {json.dumps({'detail': '已有另一个 Agent 任务正在执行（或旧任务仍在终止），请等待完成'}, ensure_ascii=False)}\n\n"
         return
     cancel = threading.Event()
     q: queue.Queue = queue.Queue()
+    task_id = _new_task_id()
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _agent_loop, api_url, headers, messages, model,
-                         temperature, q, cancel)
+    fut = loop.run_in_executor(None, _agent_loop, api_url, headers, messages, model,
+                               temperature, q, cancel, 0, None, None, task_id)
+    released = False
+
+    def _release_lock() -> None:
+        nonlocal released
+        if not released:
+            _agent_lock.release()
+            released = True
+
+    async def _agent_cleanup() -> None:
+        """任务结束清理：清任务 ID + 残留确认条目 + 释放锁（幂等，可多次调用）。"""
+        global _current_agent_task_id
+        with _agent_task_lock:
+            _current_agent_task_id = ""
+        with _confirm_lock:
+            stale = [rid for rid, e in _confirm_table.items()
+                     if e.get("task_id") == task_id]
+            for rid in stale:
+                entry = _confirm_table.pop(rid, None)
+                if entry is not None and entry["event"] is not None:
+                    entry["event"].set()   # 唤醒等待方（醒来 pop 不到记录 → 按拒绝）
+        if fut.done():
+            _release_lock()
+
     try:
         while True:
             kind, data = await loop.run_in_executor(None, q.get)
             if kind == "done":
+                await _agent_cleanup()   # 显式清理：async generator 的 finally 依赖 aclose
                 break
             if kind == "error":
+                await _agent_cleanup()
                 yield f"event: error\ndata: {json.dumps({'detail': data}, ensure_ascii=False)}\n\n"
                 break
             if kind == "tool_call":
@@ -3032,7 +4666,18 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
         cancel.set()
         raise
     finally:
-        _agent_lock.release()
+        # async generator 的 finally 仅在 aclose（框架关闭流）时执行；
+        # done/error 分支已显式清理，此处为 aclose/异常路径兜底（幂等）。
+        await _agent_cleanup()
+        if fut.done():
+            _release_lock()
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=15)
+            _release_lock()
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.warning("agent worker 未能及时退出，保持全局 busy（旧任务仍在终止）")
+            loop.create_task(_release_lock_when_done(fut))
 
 
 # --------------------------------------------------------------------------
@@ -3088,13 +4733,17 @@ async def chat_stream(req: ChatRequest):
     )
 
 
-def _upstream_reader(api_url: str, payload: dict, headers: dict, q: queue.Queue) -> None:
-    """后台线程：读取上游 SSE 流，逐行放入 queue（保持 data: 前缀原样）。"""
+def _upstream_reader(api_url: str, payload: dict, headers: dict, q: queue.Queue,
+                     holder: dict | None = None) -> None:
+    """后台线程：读取上游 SSE 流，逐行放入 queue（保持 data: 前缀原样）。
+    holder 用于向事件循环暴露响应对象（客户端断开时 close 以停止读取，防 token 浪费）。"""
     req = urllib.request.Request(
         api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
+            if holder is not None:
+                holder["resp"] = resp
             for raw in resp:                      # 逐行迭代 SSE
                 line = raw.decode("utf-8", "replace")
                 if '"usage"' in line:             # 流式末尾的用量块
@@ -3113,8 +4762,9 @@ def _upstream_reader(api_url: str, payload: dict, headers: dict, q: queue.Queue)
 async def _stream_events(api_url: str, payload: dict, headers: dict):
     """把上游 SSE 流逐块转发给客户端。"""
     q: queue.Queue = queue.Queue()
+    holder: dict = {}
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _upstream_reader, api_url, payload, headers, q)
+    loop.run_in_executor(None, _upstream_reader, api_url, payload, headers, q, holder)
     try:
         while True:
             # q.get 是阻塞调用，放在线程池执行，不阻塞事件循环
@@ -3126,8 +4776,14 @@ async def _stream_events(api_url: str, payload: dict, headers: dict):
                 break
             yield data.decode("utf-8", "replace") if isinstance(data, bytes) else data
     except asyncio.CancelledError:
-        # 客户端断开：无法强停上游读取线程（urllib 阻塞），记录后正常退出
-        log.info("chat stream 客户端断开，上游读取线程将自然结束")
+        # 客户端断开：关闭上游响应，停止读取（避免继续消耗 Token）
+        resp = holder.get("resp")
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        log.info("chat stream 客户端断开，上游读取已停止")
         raise
 
 
@@ -3215,8 +4871,36 @@ if __name__ == "__main__":
     parser.add_argument("--isolated", action="store_true",
                         help="隔离模式：禁用屏幕操作工具，只保留文件类工具（WSL 隔离测试用）")
     args = parser.parse_args()
+    # 安全要求：绑定非回环地址时必须提供 token（否则拒绝启动）
+    if not _is_loopback(args.host) and not args.token:
+        print(f"错误：绑定非回环地址（{args.host}）时必须提供 --token 鉴权，"
+              f"否则任何局域网内主机都能控制本机。\n"
+              f"请加 --token <随机字符串> 后重试，或改回 127.0.0.1。")
+        sys.exit(1)
     AUTH_TOKEN = args.token   # 模块级赋值即修改全局
     ISOLATED = args.isolated
+    # ---- 密钥迁移：旧明文 api_key → 安全存储（配置文件只保留占位符）----
+    try:
+        from secure_store import PLACEHOLDER as _SS_PH, store as _ss_store
+        from secure_store import platform_warning as _ss_warn
+        cfg0 = load_config()
+        plain = (cfg0.get("api_key") or "").strip()
+        if plain and plain != _SS_PH:
+            _ss_store("api_key", plain)
+            cfg0["api_key"] = _SS_PH
+            _write_config_atomic(cfg0)
+            log.info("旧明文 api_key 已迁移到安全存储")
+        warn = _ss_warn()
+        if warn:
+            log.warning(warn)
+    except Exception as exc:
+        log.warning("密钥安全存储初始化失败：%s", exc)
+    # 日志级别：设置界面保存的 log_level 生效（重启后）
+    try:
+        lvl = str(load_config().get("log_level") or "info").upper()
+        logging.getLogger().setLevel(getattr(logging, lvl, logging.INFO))
+    except Exception:
+        pass
     if args.isolated:
         log.warning("隔离模式：屏幕操作工具已禁用，仅保留 %s", sorted(_FILE_TOOLS))
     if args.token:

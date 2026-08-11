@@ -1,14 +1,13 @@
 """工具路由测试：规则前置 / 宽松解析 / 类别映射 / 缓存 / 降级 / 主循环集成。
-import os
-os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 
 路由模型调用全部打桩，不依赖 Ollama，CI 可跑。
 """
-import json
+import os
+os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

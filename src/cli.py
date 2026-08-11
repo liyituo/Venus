@@ -916,7 +916,7 @@ class Cli:
         cfg = load_config()
         for a in args:
             if "=" not in a:
-                print(color(f"用法：/config host=IP token=KEY port=8001", "yellow"))
+                print(color("用法：/config host=IP token=KEY port=8001", "yellow"))
                 return
             k, v = a.split("=", 1)
             cfg[k.strip()] = v.strip()
@@ -976,6 +976,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=None, help="llm_server 端口（默认 8001）")
     parser.add_argument("--token", default=None, help="鉴权 token（llm_server --token 启用时必填）")
     parser.add_argument("--once", default=None, help="单次模式：发送一条消息后退出（脚本用）")
+    parser.add_argument("--workspace", default=None,
+                        help="切换工作区（绝对路径，须存在；持久化保存）")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -999,6 +1001,14 @@ def main() -> int:
         model = info.get("model", "?")
         configured = "已配置" if info.get("configured") else "未配置 API（在主机 Chat 的 Settings 中设置）"
         print(color(f"✓ 已连接 llm_server（{host}:{port}）| 模型: {model} | {configured}", "green"))
+        if args.workspace:
+            status, data = cli.client.api("POST", "/api/v1/workspace",
+                                          {"path": args.workspace}, timeout=10)
+            if status == 200:
+                print(color(f"✓ 工作区已切换：{data.get('workspace')}", "green"))
+            else:
+                print(color(f"✗ 工作区切换失败：{data.get('detail', '?')}", "red"))
+                return 1
 
     if args.once:
         cli._last_content = ""
