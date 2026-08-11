@@ -12,6 +12,18 @@ import app as daemon_mod    # noqa: E402
 import llm_server as L      # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# 截图必须 mock（R2 要求）：daemon 的 screenshot 动作不读取真实屏幕，
+# 否则无显示/无 gnome-screenshot 的环境（Ubuntu CI）会 500
+import pyautogui  # noqa: E402
+from PIL import Image  # noqa: E402
+
+
+def _fake_screenshot():
+    return Image.new("RGB", (320, 200), (20, 40, 80))
+
+
+pyautogui.screenshot = _fake_screenshot
+
 passed = failed = 0
 
 
