@@ -5,7 +5,6 @@
 """
 import os
 import sys
-import tempfile
 import unittest.mock as um
 from pathlib import Path
 
