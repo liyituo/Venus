@@ -208,18 +208,6 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 - 用量可观测：`GET /api/v1/usage`（聚合 + 最近 200 次请求明细 + 缓存命中率 + prefix 指标），Chat 侧栏底部实时显示「累计 tok · 缓存% · 压缩次数 · 调用数」
 - 评测入口：`python tests/token_eval.py`（12 类匿名案例的 prompt 层确定性对比）；`--live` 追加真实 API 前后对比（真实 usage，不伪造节省）
 
-### 密钥管理：什么文件不能提交
-
-| 文件 | 内容 | 状态 |
-| --- | --- | --- |
-| `chat_config.json` | API Key | 已 gitignore |
-| `telegram_config.json` | bot token | 已 gitignore |
-| `mcp_config.json` | 第三方 PAT | 已 gitignore |
-| `.pcagent/` | 聊天记录 / 修改备份 / 运行日志 | 已 gitignore |
-| `tools/` | 本地工具目录 | 已 gitignore |
-
-`*.example.json` 样例无密钥，可入库。
-
 ## MCP 外部工具
 
 通过 MCP（Model Context Protocol）接入生态工具，配置 `mcp_config.json`（含第三方 token，**已 gitignore 不入库**；示例见 `mcp_config.example.json`）：
