@@ -153,6 +153,17 @@
   }
   button.reset:hover:not(:disabled) { background: rgba(16, 185, 129, 0.2); color: #fff; box-shadow: 0 0 16px rgba(16, 185, 129, 0.3); }
 
+  .quant-link {
+    display: inline-flex; align-items: center; gap: 7px;
+    color: #b9f5ff; text-decoration: none; white-space: nowrap;
+    border-color: rgba(56, 232, 176, 0.35);
+    background: rgba(56, 232, 176, 0.10);
+  }
+  .quant-link:hover { color: #fff; border-color: rgba(56, 232, 176, 0.75); }
+  .quant-link.offline { color: var(--text-muted); border-color: var(--panel-border); background: rgba(255,255,255,0.04); }
+  .quant-link .quant-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--offline); }
+  .quant-link.ready .quant-dot { background: var(--idle); box-shadow: 0 0 9px var(--idle); }
+
   label.check { display: inline-flex; align-items: center; gap: 8px; color: var(--text-muted); cursor: pointer; user-select: none; transition: color 0.2s; }
   label.check:hover { color: var(--text-main); }
   input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer; }
@@ -262,6 +273,9 @@
   <div class="spacer"></div>
   <label class="check"><input type="checkbox" id="autoRefresh" checked> 自动刷新</label>
   <button id="btnRefresh">刷新画面</button>
+  <a class="quant-link offline" id="quantCenterLink" href="http://127.0.0.1:4173/#/dashboard" target="_blank" rel="noopener noreferrer" title="量化服务离线；桌面 ChatApp 按钮可自动启动">
+    <span class="quant-dot"></span><span id="quantCenterText">量化中心 · 离线</span>
+  </a>
   <button class="reset" id="btnReset">恢复 (Reset)</button>
   <button class="danger" id="btnStop">紧急止停 (STOP)</button>
 </header>
@@ -417,6 +431,23 @@ async function pollStatus() {
   }
 }
 
+async function pollQuantCenter() {
+  const link = $('quantCenterLink');
+  try {
+    const response = await fetch('http://127.0.0.1:4173/healthz', { cache: 'no-store' });
+    const data = await response.json().catch(() => ({}));
+    const ready = response.ok && data.status === 'ok';
+    link.classList.toggle('ready', ready);
+    link.classList.toggle('offline', !ready);
+    $('quantCenterText').textContent = ready ? '量化中心 · 可用' : '量化中心 · 离线';
+    link.title = ready ? '打开独立量化中心（Paper Trading）' : '量化服务离线；桌面 ChatApp 按钮可自动启动';
+  } catch {
+    link.classList.remove('ready');
+    link.classList.add('offline');
+    $('quantCenterText').textContent = '量化中心 · 离线';
+  }
+}
+
 /* ---------------- 止停 / 恢复 ---------------- */
 $('btnStop').addEventListener('click', async () => {
   if (!confirm('确认紧急止停？将拒绝所有后续指令，直到点击"恢复"。')) return;
@@ -471,6 +502,7 @@ function toast(msg, kind = 'ok') {
 
 /* ---------------- 初始化 ---------------- */
 setInterval(pollStatus, 1500);
+setInterval(pollQuantCenter, 3000);
 setInterval(() => { if ($('autoRefresh').checked) refreshScreen(); }, 2500);
 // 切回标签页时立即刷新一次（后台标签页的定时器会被浏览器节流）
 document.addEventListener('visibilitychange', () => {
@@ -478,6 +510,7 @@ document.addEventListener('visibilitychange', () => {
 });
 refreshScreen();
 pollStatus();
+pollQuantCenter();
 </script>
 </body>
 </html>

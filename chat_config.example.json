@@ -11,5 +11,12 @@
   "vision_model": "",
   "tool_router": false,
   "tool_router_url": "http://127.0.0.1:11434",
-  "tool_router_model": "gemma3:1b"
+  "tool_router_model": "gemma3:1b",
+  "quant_enabled": true,
+  "quant_auto_start": true,
+  "quant_project_path": "",
+  "quant_backend_url": "http://127.0.0.1:8014",
+  "quant_gui_url": "http://127.0.0.1:4173",
+  "quant_open_mode": "auto",
+  "quant_stop_owned_processes_on_exit": true
 }

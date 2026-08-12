@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-agent-lab"
+version = "0.1.0"
+description = "Offline, approval-gated quantitative decision and paper trading MVP"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.100",
+  "pydantic>=2.0",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+  "mypy>=1.10",
+  "httpx>=0.27",
+  "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+quant-agent = "quant_agent.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra --basetemp=var/test-tmp"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["quant_agent"]
+check_untyped_defs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

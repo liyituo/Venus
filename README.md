@@ -20,6 +20,20 @@
 
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
 
+### 量化中心
+
+桌面 ChatApp 顶部工具栏的「量化中心」按钮会在后台检查并按需启动仓库内隔离的量化后端与正式 standalone host，然后打开 Dashboard。它不会清空当前对话、切换会话、停止主 Agent，也不会生成报告、审批计划或执行交易。
+
+- 后端：`http://127.0.0.1:8014`；GUI：`http://127.0.0.1:4173/#/dashboard`
+- 量化项目：仓库内的 [`quant-agent-lab`](quant-agent-lab/README.md)，默认自动发现，无需填写绝对路径
+- 设置：打开「设置 → 量化」可修改项目路径、loopback 地址、自动启动和退出清理策略
+- 手动启动后端：`cd quant-agent-lab; $env:PYTHONPATH='src'; python -m uvicorn quant_agent.api.app:app --host 127.0.0.1 --port 8014`
+- 手动启动 GUI：`cd quant-agent-lab\plugins\quant-agent-dashboard; node scripts\build.mjs; node standalone\server.mjs`
+- Dashboard 包含 K 线与信号、策略实验室、回测、风控、审批和审计；当前仅允许 Paper Trading，`LiveBroker` 保持禁用
+- 接入边界、端口、进程生命周期和验证记录见 [`docs/quant-integration.md`](docs/quant-integration.md)
+
+运行量化中心需要 Python 3.12+、主项目依赖，以及本机可用的 Node.js。按钮只启动绑定在 `127.0.0.1` 的本地服务；重复点击会复用已有健康进程。
+
 ## WSL / Linux（隔离测试环境）
 
 配好 Python 3.13 环境后：
@@ -262,9 +276,10 @@ src/prompt_cache.py            分层提示词缓存（稳定前缀、版本失�
 src/subagent_router.py         子 Agent 智能路由（成本模型、信封、工件注册表）
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
+quant-agent-lab/    隔离的量化研究、策略调试、回测、MCP Apps GUI 与 Paper Trading 子项目
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
-tests/              二十六套测试（700+ 断言，含 Token 优化专项）
-.github/workflows/  CI（Windows + Ubuntu 双矩阵自动跑全部测试）
+tests/              二十九套测试（含量化中心隔离、GUI 合同与真实服务联调）
+.github/workflows/  CI（主 Agent 双平台 + RAG + 量化子项目独立验证）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
@@ -299,10 +314,13 @@ mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
 .venv\Scripts\python tests\token_opt_test.py    # Token 优化基础模块（68 断言：能力/预算/压缩/检索/缓存/路由）
 .venv\Scripts\python tests\token_opt_integration_test.py # Token 优化集成（26 断言：去重/缓存/fetch/校验/usage）
 .venv\Scripts\python tests\settings_save_test.py # 设置保存回归（20 断言：下拉收集/显示匹配/候选地址）
+.venv\Scripts\python tests\quant_integration_test.py # 量化中心控制器（安全 URL/复用/进程归属/并发）
+.venv\Scripts\python tests\quant_gui_contract_test.py # 主 Chat 与量化 Dashboard 的 GUI 合同
+.venv\Scripts\python tests\quant_integration_e2e_test.py # 真实量化后端 + standalone GUI 联调
 .venv\Scripts\python tests\token_eval.py        # Token/质量评测（12 类匿名案例；--live 追加真实 API 对比）
 .venv\Scripts\python src\mock_llm.py            # 无 Key 时本地假 API 验证全链路
 ```
 
-推送后 GitHub Actions 自动跑全部测试（Windows + Ubuntu 双矩阵），回归结果在 Actions 页面一眼可见。
+推送后 GitHub Actions 会分别验证主 Agent（Windows + Ubuntu）、RAG 服务和隔离量化子项目；量化任务覆盖 29 个 Python 测试、静态检查、Dashboard 构建及 Node 合同测试。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。

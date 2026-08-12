@@ -1,0 +1,20 @@
+{
+  "name": "quant-agent-dashboard",
+  "version": "0.1.0+codex.20260812094534",
+  "description": "Offline Paper Trading dashboard for Quant Agent Lab via MCP Apps.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Quant Agent Dashboard",
+    "shortDescription": "Inspect and approve Paper Trading plans.",
+    "longDescription": "Quant Agent Dashboard renders the isolated Quant Agent Lab workflow as an MCP App. It never enables live trading or bypasses backend risk and approval controls.",
+    "developerName": "Local developer",
+    "category": "Finance",
+    "capabilities": [],
+    "defaultPrompt": "Open the isolated Quant Agent Lab Paper Trading dashboard."
+  },
+  "mcpServers": "./.mcp.json",
+  "apps": "./.app.json"
+}

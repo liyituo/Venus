@@ -1,0 +1,8 @@
+{
+  "apps": {
+    "quant-agent-dashboard": {
+      "id": "quant-agent-dashboard",
+      "category": "finance"
+    }
+  }
+}

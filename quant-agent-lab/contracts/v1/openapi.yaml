@@ -1,0 +1,202 @@
+openapi: 3.0.3
+info:
+  title: Quant Agent Lab API
+  version: 1.0.0
+  description: Offline, approval-gated, paper-only quantitative workflow.
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /api/v1/health:
+    get:
+      responses:
+        '200':
+          description: Service is alive and reports paper-only mode.
+  /api/v1/dashboard:
+    get:
+      parameters:
+        - name: report_id
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200':
+          description: Dashboard projection for the latest or requested report.
+          content:
+            application/json:
+              schema: {type: object}
+        '404':
+          description: Requested report was not found.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorDetail'}
+  /api/v1/audit:
+    get:
+      parameters:
+        - name: report_id
+          in: query
+          required: false
+          schema: {type: string}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 200, default: 100}
+      responses:
+        '200':
+          description: Structured audit events, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {type: object}
+  /api/v1/daily-plans:
+    post:
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DailyPlanRequest'
+      responses:
+        '200':
+          description: Generated report/plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyReport'
+  /api/v1/reports/{report_id}:
+    get:
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        '200':
+          description: Structured report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyReport'
+  /api/v1/reports/{report_id}/approve:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveRequest'
+      responses:
+        '200':
+          description: Bound approval.
+  /api/v1/reports/{report_id}/reject:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                approver: {type: string}
+                request_id: {type: string}
+      responses:
+        '200':
+          description: Rejected report.
+  /api/v1/reports/{report_id}/execute:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/ReportId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteRequest'
+      responses:
+        '200':
+          description: Paper execution result.
+  /api/v1/executions/{execution_id}:
+    get:
+      parameters:
+        - name: execution_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Execution result.
+  /api/v1/kill-switch:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KillSwitchRequest'
+      responses:
+        '200':
+          description: New local Kill Switch state.
+components:
+  parameters:
+    ReportId:
+      name: report_id
+      in: path
+      required: true
+      schema: {type: string}
+  schemas:
+    DailyPlanRequest:
+      type: object
+      properties:
+        date: {type: string, format: date}
+        request_id: {type: string}
+    ApproveRequest:
+      type: object
+      properties:
+        all: {type: boolean, default: false}
+        order_ids:
+          type: array
+          items: {type: string}
+        approver: {type: string}
+        request_id: {type: string}
+      description: Choose exactly one of all=true or a non-empty order_ids list.
+    ExecuteRequest:
+      type: object
+      properties:
+        mode: {type: string, enum: [paper], default: paper}
+        request_id: {type: string}
+    KillSwitchRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: {type: boolean}
+        reason: {type: string}
+        actor: {type: string}
+        request_id: {type: string}
+    ErrorDetail:
+      type: object
+      required: [code, error, message]
+      properties:
+        code: {type: string}
+        error: {type: string}
+        message: {type: string}
+    DailyReport:
+      type: object
+      required: [report_id, report_version, status, generated_at, expires_at, plan]
+      properties:
+        report_id: {type: string}
+        report_version: {type: integer}
+        status:
+          type: string
+          enum: [DRAFT, GENERATED, RISK_BLOCKED, PENDING_APPROVAL, APPROVED, PARTIALLY_APPROVED, REJECTED, EXPIRED, EXECUTING, PARTIALLY_FILLED, FILLED, FAILED, CANCELLED]
+        generated_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        plan:
+          type: object
+          required: [plan_id, plan_hash, account_id, strategy_id, strategy_version, risk_config_version]
+          properties:
+            plan_id: {type: string}
+            plan_hash: {type: string}
+            account_id: {type: string}
+            strategy_id: {type: string}
+            strategy_version: {type: string}
+            risk_config_version: {type: string}

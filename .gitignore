@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .venv/
 venv/
 *.log
@@ -22,5 +25,5 @@ mcp_config.json
 # 本地工具二进制（不入库）
 tools/
 
-# 独立子项目（quant-agent-lab 自管理，不入本仓库）
-quant-agent-lab/
+# 量化子项目作为隔离子目录纳入主仓库；其缓存、数据库、日志和构建产物
+# 由 quant-agent-lab/.gitignore 单独排除。

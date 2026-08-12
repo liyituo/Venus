@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-agent-lab.local/contracts/v1/approval.schema.json",
+  "title": "Approval",
+  "type": "object",
+  "required": ["approval_id", "report_id", "report_version", "plan_hash", "account_id", "strategy_id", "strategy_version", "risk_config_version", "approved_order_ids", "approved_at", "expires_at", "approver", "approval_scope"],
+  "properties": {
+    "approval_id": {"type": "string"},
+    "report_id": {"type": "string"},
+    "report_version": {"type": "integer"},
+    "plan_hash": {"type": "string", "minLength": 16},
+    "account_id": {"type": "string"},
+    "strategy_id": {"type": "string"},
+    "strategy_version": {"type": "string"},
+    "risk_config_version": {"type": "string"},
+    "approved_order_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "approved_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "approver": {"type": "string"},
+    "approval_scope": {"type": "string", "enum": ["ALL", "PARTIAL", "REJECT"]}
+  }
+}

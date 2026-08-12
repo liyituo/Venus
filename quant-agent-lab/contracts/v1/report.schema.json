@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-agent-lab.local/contracts/v1/report.schema.json",
+  "title": "DailyReport",
+  "type": "object",
+  "required": ["report_id", "report_version", "status", "generated_at", "expires_at", "plan", "account", "market"],
+  "properties": {
+    "report_id": {"type": "string"},
+    "report_version": {"type": "integer", "minimum": 1},
+    "status": {"type": "string", "enum": ["DRAFT", "GENERATED", "RISK_BLOCKED", "PENDING_APPROVAL", "APPROVED", "PARTIALLY_APPROVED", "REJECTED", "EXPIRED", "EXECUTING", "PARTIALLY_FILLED", "FILLED", "FAILED", "CANCELLED"]},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "plan": {"type": "object", "required": ["plan_id", "plan_hash", "account_id", "strategy_id", "strategy_version", "risk_config_version", "orders", "risk_decision"]},
+    "account": {"type": "object", "required": ["account_id", "cash", "equity", "currency", "positions"]},
+    "market": {"type": "object", "required": ["snapshot_id", "as_of", "source", "bars"]}
+  }
+}

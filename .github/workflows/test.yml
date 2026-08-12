@@ -80,3 +80,37 @@ jobs:
 
       - name: RAG 测试（mock 向量，无外部依赖）
         run: python RAG/tests/rag_test.py
+
+  # 量化子项目：离线后端、研究合同与嵌入式 Dashboard（不连接券商或真实资金）
+  test-quant:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: 安装量化子项目开发依赖
+        run: pip install --quiet -e "./quant-agent-lab[dev]"
+
+      - name: 后端编译、格式、静态检查与测试
+        working-directory: quant-agent-lab
+        run: |
+          python -m compileall -q src tests
+          ruff check src tests
+          ruff format --check src tests
+          mypy src
+          pytest -q
+
+      - name: Dashboard 构建与 Node 合同测试
+        working-directory: quant-agent-lab/plugins/quant-agent-dashboard
+        run: |
+          node scripts/build.mjs
+          node --test mcp-server/tests/contract.test.mjs ui/tests/ui-contract.test.mjs standalone/tests/host-contract.test.mjs

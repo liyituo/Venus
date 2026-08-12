@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "quant-agent-dashboard": {
+      "command": "node",
+      "args": ["${__dirname}/mcp-server/dist/index.mjs"],
+      "env": {
+        "QUANT_AGENT_BACKEND_URL": "http://127.0.0.1:8014"
+      }
+    }
+  }
+}

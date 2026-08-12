@@ -1,0 +1,17 @@
+version: demo-v1
+local_timezone: Asia/Shanghai
+strategy:
+  id: moving-average-demo
+  version: 1.0.0
+  fast_window: 3
+  slow_window: 5
+  minimum_strength: "0.001"
+portfolio:
+  target_notional_per_signal: "1000"
+  lot_size: "1"
+  fee_bps: "5"
+  slippage_bps: "10"
+  currency: USD
+  approval_ttl_seconds: 3600
+paper_broker:
+  default_fill_policy: full

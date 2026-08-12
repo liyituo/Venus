@@ -7,3 +7,4 @@ pynput>=1.7.6   # 可选：紧急止停全局热键（Ctrl+Alt+Shift+X），不�
 fastmcp==3.4.6
 mcp==1.29.0
 pydantic-settings
+PyYAML>=6.0      # 量化中心版本化配置（quant-agent-lab）

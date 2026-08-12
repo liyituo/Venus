@@ -39,6 +39,11 @@ from PIL import Image, ImageEnhance, ImageTk, ImageOps
 # R3：Token 预算（动态压缩阈值）与历史检索（压缩后按需取回原文）
 from token_budget import plan_budget
 from history_index import HistoryIndex, find_keys
+from quant_integration import (
+    QuantIntegrationConfig,
+    QuantLaunchError,
+    QuantServiceController,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "chat_config.json"
@@ -124,6 +129,17 @@ def _match_option(options: dict, current) -> str:
     cur = _opt_value_str(current)
     return next((k for k, v in options.items() if _opt_value_str(v) == cur),
                 next(iter(options)))
+
+
+def _as_bool_setting(value, default: bool = False) -> bool:
+    """Read legacy JSON bool/string values without changing unrelated config."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "开启"}
 
 
 # 会话首条 system 提示（本地结构发送用；后端只存 user/assistant 消息）
@@ -257,6 +273,13 @@ def load_config() -> dict:
         "api_key": "",
         "model": "deepseek-v4-flash",
         "reasoning_mode": "max",   # 推理强度：max（最高）/ high（高）/ off（关闭）
+        "quant_enabled": True,
+        "quant_auto_start": True,
+        "quant_project_path": str(BASE_DIR.parent / "quant-agent-lab"),
+        "quant_backend_url": "http://127.0.0.1:8014",
+        "quant_gui_url": "http://127.0.0.1:4173",
+        "quant_open_mode": "auto",
+        "quant_stop_owned_processes_on_exit": True,
     }
 
 
@@ -372,6 +395,7 @@ class SettingsWindow:
         self._tab_router = self._make_tab(nb, "工具路由")
         self._tab_mcp = self._make_tab(nb, "MCP")
         self._tab_adv = self._make_tab(nb, "高级")
+        self._tab_quant = self._make_tab(nb, "量化")
 
         self._build_common()
         self._build_model()
@@ -379,6 +403,7 @@ class SettingsWindow:
         self._build_router()
         self._build_mcp()
         self._build_advanced()
+        self._build_quant()
 
         # 底部：状态提示 + 按钮
         footer = tk.Frame(self.win, bg="#070b12", highlightthickness=1,
@@ -645,13 +670,96 @@ class SettingsWindow:
                  bg=BG, fg=TEXT_DIM, font=("Microsoft YaHei UI", 8)).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=18, pady=(12, 0))
 
+    # ---- 量化中心：仅配置 loopback 服务，不保存交易凭据 ----
+    def _build_quant(self) -> None:
+        tab = self._tab_quant
+        self._quant_vars = {}
+        fields = (
+            ("启用量化中心", "quant_enabled", True),
+            ("自动启动独立服务", "quant_auto_start", True),
+            ("主 Agent 退出时停止自己启动的服务", "quant_stop_owned_processes_on_exit", True),
+        )
+        for row, (label, key, default) in enumerate(fields):
+            var = tk.BooleanVar(value=_as_bool_setting(self.config.get(key), default))
+            tk.Checkbutton(tab, text=label, variable=var, bg=BG, fg=TEXT,
+                           activebackground=BG, activeforeground=TEXT,
+                           selectcolor=PANEL_LIGHT, font=(self._ui_family, 9),
+                           anchor="w").grid(row=row, column=0, columnspan=2,
+                                             sticky="w", padx=18, pady=(14 if row == 0 else 6, 0))
+            self._quant_vars[key] = var
+        quant_defaults = {
+            "quant_project_path": str(BASE_DIR.parent / "quant-agent-lab"),
+            "quant_backend_url": "http://127.0.0.1:8014",
+            "quant_gui_url": "http://127.0.0.1:4173",
+        }
+        for key, value in quant_defaults.items():
+            if not self.config.get(key):
+                self.config[key] = value
+        self._row(tab, 3, "量化项目路径", "quant_project_path", width=54)
+        self._row(tab, 4, "量化后端 URL", "quant_backend_url")
+        self._row(tab, 5, "量化 GUI URL", "quant_gui_url")
+        self._select(tab, 6, "打开方式", {"自动": "auto", "浏览器": "browser", "原生窗口（未启用）": "embedded"}, "quant_open_mode")
+        tk.Label(tab, text="只允许 loopback；默认后端 8014、GUI 4173，不占用主 Agent 的 8000/8001。\n"
+                           "按钮只负责健康检查、启动和导航，不生成报告、不审批、不执行交易。",
+                 bg=BG, fg=TEXT_DIM, justify="left", font=(self._ui_family, 8)).grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=18, pady=(16, 0))
+        self.quant_result = tk.Label(tab, text="", bg=BG, fg=TEXT_DIM, justify="left",
+                                     anchor="w", wraplength=680, font=(self._ui_family, 9))
+        self.quant_result.grid(row=8, column=0, columnspan=2, sticky="ew", padx=18, pady=(10, 0))
+        self._btn(tab, "测试连接", self._test_quant).grid(row=9, column=0, sticky="w", padx=18, pady=(12, 0))
+        self._btn(tab, "打开量化中心", self._open_quant_from_settings, accent=True).grid(row=9, column=1, sticky="e", padx=18, pady=(12, 0))
+
+    def _collect_quant(self, cfg: dict) -> dict:
+        for key, var in getattr(self, "_quant_vars", {}).items():
+            cfg[key] = bool(var.get())
+        for key in ("quant_project_path", "quant_backend_url", "quant_gui_url"):
+            entry = getattr(self, f"entry_{key}", None)
+            if entry is not None:
+                cfg[key] = entry.get().strip()
+        var = getattr(self, "var_quant_open_mode", None)
+        opts = getattr(self, "opts_quant_open_mode", None)
+        if var is not None and opts is not None:
+            cfg["quant_open_mode"] = opts.get(var.get(), "auto")
+        # Reuse the controller's strict loopback/project validation.
+        QuantIntegrationConfig.from_mapping(cfg)
+        return cfg
+
+    def _test_quant(self) -> None:
+        try:
+            cfg = self._collect_quant(self._collect())
+            controller = QuantServiceController.from_mapping(cfg)
+        except (ValueError, QuantLaunchError) as exc:
+            self.quant_result.config(text=f"✗ {exc}", fg=STOP)
+            return
+        self.quant_result.config(text="◌ 正在检查量化后端和 GUI…", fg=TEXT_DIM)
+        threading.Thread(target=self._quant_probe_worker, args=(controller,), daemon=True).start()
+
+    def _quant_probe_worker(self, controller: QuantServiceController) -> None:
+        status = controller.probe()
+        self.win.after(0, lambda: self.quant_result.config(
+            text=(f"✓ {status.message} · backend={status.backend_url} · gui={status.gui_url}"
+                  if status.ready else f"✗ {status.code}：{status.message}"),
+            fg=OK if status.ready else WARN))
+
+    def _open_quant_from_settings(self) -> None:
+        try:
+            cfg = self._collect_quant(self._collect())
+            save_config(cfg)
+            if self.on_changed:
+                self.on_changed()
+            self.win.destroy()
+            self.parent.after(0, lambda: self.parent.event_generate("<<OpenQuantCenter>>", when="tail"))
+        except (ValueError, QuantLaunchError) as exc:
+            self.quant_result.config(text=f"✗ {exc}", fg=STOP)
+
     # ------------------------------------------------------------------ 保存 / 测试
     def _collect(self) -> dict:
         """收集全部字段（保存前验证）。"""
         cfg = dict(self.config)
         for key in ("api_url", "api_key", "model", "context_window", "vision_api_url",
                     "vision_api_key", "vision_model", "max_tool_steps", "max_agent_seconds",
-                    "tool_router_url", "tool_router_model", "daemon_base", "llm_base"):
+                    "tool_router_url", "tool_router_model", "daemon_base", "llm_base",
+                    "quant_project_path", "quant_backend_url", "quant_gui_url"):
             ent = getattr(self, f"entry_{key}", None)
             if ent is not None:
                 cfg[key] = ent.get().strip()
@@ -678,6 +786,12 @@ class SettingsWindow:
         ws = self.entry_workspace.get().strip()
         if ws:
             cfg["workspace"] = ws
+        for key, var in getattr(self, "_quant_vars", {}).items():
+            cfg[key] = bool(var.get())
+        var_quant_mode = getattr(self, "var_quant_open_mode", None)
+        opts_quant_mode = getattr(self, "opts_quant_open_mode", None)
+        if var_quant_mode is not None and opts_quant_mode is not None:
+            cfg["quant_open_mode"] = opts_quant_mode.get(var_quant_mode.get(), "auto")
         # 数值验证
         for key in ("context_window", "max_tool_steps", "max_agent_seconds"):
             v = str(cfg.get(key) or "").strip()
@@ -689,6 +803,7 @@ class SettingsWindow:
         for key in ("api_url", "llm_base", "daemon_base", "vision_api_url", "tool_router_url"):
             if cfg.get(key):
                 cfg[key] = self._validate_base_url(str(cfg[key]), key)
+        QuantIntegrationConfig.from_mapping(cfg)
         return cfg
 
     @staticmethod
@@ -860,6 +975,10 @@ class ChatApp:
         self._history_index = HistoryIndex()
         self._retrieval_keys: list[str] = []
         self._compress_count = 0
+        self._quant_busy = False
+        self._quant_controller = None
+        self._quant_controllers = []
+        self._quant_status = "未检查"
         # 首个会话在 _build_ui 完成后创建（需要 UI 组件已就绪）
 
         threading.Thread(target=self._bg_loop, daemon=True).start()
@@ -924,10 +1043,14 @@ class ChatApp:
         self.status_model = tk.Label(status_pill, text="", bg="#0a101b",
                                      fg=TEXT_MUTED, font=(self._mono_family, 7))
         self.status_model.pack(side="left", padx=(0, 10), pady=4)
+        self.quant_center_btn = self._toolbar_btn(
+            toolbar, "量化中心", self._open_quant_center)
+        self.quant_center_btn.pack(side="right", padx=4, pady=11)
         self._toolbar_btn(toolbar, "设置", self._open_settings).pack(side="right", padx=4, pady=11)
         self.sidebar_toggle_btn = self._toolbar_btn(
             toolbar, "隐藏侧栏", self._shortcut_toggle_sidebar)
         self.sidebar_toggle_btn.pack(side="right", padx=4, pady=11)
+        self.root.bind("<<OpenQuantCenter>>", lambda _event: self._open_quant_center(), add="+")
 
         main = tk.Frame(self.root, bg=BG)
         main.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -2679,6 +2802,115 @@ class ChatApp:
     def _open_settings(self) -> None:
         SettingsWindow(self.root, on_changed=self._settings_changed)
 
+    def _open_quant_center(self) -> None:
+        """Start/check only the isolated quant services in a worker thread."""
+        if self._quant_busy:
+            return
+        try:
+            cfg = load_config()
+            current_config = QuantIntegrationConfig.from_mapping(cfg)
+            controller = self._quant_controller
+            if controller is None or controller.config != current_config:
+                controller = QuantServiceController(current_config)
+                self._quant_controllers.append(controller)
+        except (ValueError, QuantLaunchError) as exc:
+            self._set_quant_button("量化中心 ⚠", STOP, enabled=True)
+            self._log(f"量化中心配置错误：{str(exc)[:180]}", "err")
+            messagebox.showerror("量化中心", str(exc), parent=self.root)
+            return
+        if not controller.config.enabled:
+            self._set_quant_button("量化中心 ⚠", WARN, enabled=True)
+            messagebox.showinfo("量化中心", "量化中心已禁用。请在设置 → 量化中启用。", parent=self.root)
+            return
+        self._quant_busy = True
+        self._quant_controller = controller
+        self._set_quant_button("检查量化服务…", WARN, enabled=False)
+        threading.Thread(target=self._quant_open_worker, args=(controller,), daemon=True).start()
+
+    def _quant_open_worker(self, controller: QuantServiceController) -> None:
+        def progress(stage: str) -> None:
+            labels = {
+                "checking": "检查量化服务…",
+                "starting-backend": "启动量化后端…",
+                "starting-gui": "启动量化中心…",
+                "opening": "打开量化中心…",
+            }
+            try:
+                self.root.after(0, self._set_quant_button, labels.get(stage, "启动量化中心…"), WARN, False)
+            except tk.TclError:
+                pass
+        try:
+            status = controller.open_quant_center(progress=progress)
+            self.root.after(0, self._quant_open_done, status, None)
+        except QuantLaunchError as exc:
+            self.root.after(0, self._quant_open_done, None, exc)
+        except Exception as exc:
+            error = QuantLaunchError("STARTUP_ERROR", "量化中心启动失败", stage="集成控制层", detail=str(exc))
+            self.root.after(0, self._quant_open_done, None, error)
+
+    def _quant_open_done(self, status, error) -> None:
+        self._quant_busy = False
+        if error is None:
+            self._quant_status = "可用"
+            self._set_quant_button("量化中心 · 可用", OK, enabled=True)
+            self._log("量化中心已打开（Paper Trading only）", "ok")
+            return
+        self._quant_status = "启动失败"
+        self._set_quant_button("量化中心 ⚠", STOP, enabled=True)
+        self._log(f"量化中心失败：{error.code} · {error.user_message}", "err")
+        detail = error.user_message
+        if error.detail:
+            detail += f"\n诊断：{error.detail[:240]}"
+        if error.manual_command:
+            detail += f"\n手动启动：{error.manual_command}"
+        self._show_quant_error(error, detail)
+
+    def _show_quant_error(self, error: QuantLaunchError, detail: str) -> None:
+        """Offer retry and project-local log viewing without exposing secrets."""
+        win = tk.Toplevel(self.root)
+        win.title("量化中心启动失败")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+        tk.Label(win, text="QUANT CENTER // STARTUP FAULT", bg=BG, fg=STOP,
+                 font=(self._mono_family, 9, "bold")).pack(anchor="w", padx=22, pady=(18, 4))
+        tk.Label(win, text=f"{error.code} · {detail}", bg=BG, fg=TEXT,
+                 justify="left", anchor="w", wraplength=600,
+                 font=(self._ui_family, 9)).pack(fill="x", padx=22, pady=(0, 12))
+        log_dir = (self._quant_controller.config.project_path / "var" / "integration"
+                   if self._quant_controller is not None else BASE_DIR.parent / "quant-agent-lab" / "var" / "integration")
+        tk.Label(win, text=f"日志目录：{log_dir}", bg=BG, fg=TEXT_DIM,
+                 justify="left", anchor="w", wraplength=600,
+                 font=(self._mono_family, 8)).pack(fill="x", padx=22, pady=(0, 12))
+        actions = tk.Frame(win, bg=BG)
+        actions.pack(fill="x", padx=18, pady=(0, 18))
+
+        def retry() -> None:
+            win.destroy()
+            self._open_quant_center()
+
+        def view_logs() -> None:
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                if sys.platform == "win32":
+                    os.startfile(str(log_dir))
+                else:
+                    subprocess.Popen(["xdg-open", str(log_dir)], start_new_session=True)
+            except Exception as exc:
+                messagebox.showinfo("量化中心日志", f"日志目录：\n{log_dir}\n\n无法自动打开：{exc}", parent=win)
+
+        self._btn(actions, "查看日志", view_logs).pack(side="left", padx=4)
+        self._btn(actions, "关闭", win.destroy).pack(side="right", padx=4)
+        self._btn(actions, "重试", retry, accent=True).pack(side="right", padx=4)
+        win.grab_set()
+
+    def _set_quant_button(self, text: str, color: str, enabled: bool = True) -> None:
+        try:
+            self.quant_center_btn.config(text=f"● {text}", fg=color,
+                                         state="normal" if enabled else "disabled")
+        except tk.TclError:
+            pass
+
     def _settings_changed(self) -> None:
         """Settings 保存 / 连接测试成功后：刷新侧边栏 LLM 状态。"""
         if not self.quit_flag:
@@ -2761,6 +2993,18 @@ class ChatApp:
                 self._daemon_err_fh.close()
             except Exception:
                 pass
+        cfg = load_config()
+        controllers = list(dict.fromkeys(self._quant_controllers))
+        if self._quant_controller is not None and self._quant_controller not in controllers:
+            controllers.append(self._quant_controller)
+        if controllers and _as_bool_setting(cfg.get("quant_stop_owned_processes_on_exit"), True):
+            # Stop only exact Popen objects owned by this controller, but do it
+            # off the Tk thread so a slow child cannot freeze window teardown.
+            threading.Thread(
+                target=lambda: [item.close_owned_processes() for item in controllers],
+                name="quant-owned-process-cleanup",
+                daemon=False,
+            ).start()
         try:
             self.root.destroy()
         except Exception:

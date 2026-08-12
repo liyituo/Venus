@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-agent-lab.local/contracts/v1/execution.schema.json",
+  "title": "ExecutionResult",
+  "type": "object",
+  "required": ["execution_id", "report_id", "request_id", "mode", "status", "started_at", "completed_at", "broker_orders", "fills", "reconciliation", "idempotency_key"],
+  "properties": {
+    "execution_id": {"type": "string"},
+    "report_id": {"type": "string"},
+    "request_id": {"type": "string"},
+    "mode": {"const": "paper"},
+    "status": {"type": "string", "enum": ["FILLED", "PARTIALLY_FILLED", "FAILED"]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "broker_orders": {"type": "array"},
+    "fills": {"type": "array"},
+    "reconciliation": {"type": "object", "required": ["ok", "messages", "before_cash", "after_cash", "remaining_order_ids"]},
+    "idempotency_key": {"type": "string"}
+  }
+}
