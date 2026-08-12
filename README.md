@@ -235,7 +235,7 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 
 ## 记忆系统（L0-L3 分层记忆 + 动态 Skill + CodeGraph）
 
-借鉴 TencentDB-Agent-Memory 的分层架构，在本项目轻量技术栈上等价实现（零 Docker/数据库），让 Agent 跨会话沉淀经验：
+架构设计借鉴 [TencentCloud/TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)（MIT 协议），在本项目轻量技术栈上等价实现（零 Docker/数据库），让 Agent 跨会话沉淀经验：
 
 | 层 | 机制 | 存储 |
 | --- | --- | --- |
