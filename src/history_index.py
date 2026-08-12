@@ -118,12 +118,14 @@ class HistoryIndex:
             for t in q_tokens:
                 for idx in self._by_term.get(t, ()):
                     scores[idx] += 1
-            # 长键（>=4 字符）命中加权：精确子串价值更高
-            for m in self._messages:
+            # 长键（>=4 字符）命中加权：精确子串价值更高。
+            # 用消息在 self._messages 中的位置索引加权：消息可能没有 id
+            # （msg_by_id 缺失时 get 回退 0 会把所有加权错加到索引 0）。
+            for idx, m in enumerate(self._messages):
                 content = m["content"].lower()
                 for t in q_tokens:
                     if len(t) >= 4 and t in content:
-                        scores[self._msg_by_id.get(m["id"], 0)] += 2
+                        scores[idx] += 2
             ranked = sorted(scores.items(), key=lambda kv: (-kv[1], -kv[0]))
         hits = []
         total_chars = 0

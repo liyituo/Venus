@@ -22,6 +22,10 @@ TESTS = sorted(ROOT.glob("tests/*_test.py"))
 PYTHON = sys.executable
 ENV = dict(os.environ)
 ENV.setdefault("PYTHONUTF8", "1")
+# 数据目录统一重定向到临时目录：会话/记忆/密钥全部隔离，
+# 防止 agent 循环测试经 MemoryWorker 污染真实 .pcagent
+ENV.setdefault("PCAGENT_DATA_DIR", str(
+    Path(__import__("tempfile").mkdtemp(prefix="pcagent_testdata_"))))
 
 
 def main() -> int:

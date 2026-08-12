@@ -262,6 +262,20 @@ TOOL_META: dict[str, dict] = {
                      "workspace_scoped": False, "requires_confirmation": False,
                      "allowed_in_query": True, "allowed_in_isolated": True,
                      "external_side_effect": False},
+    # ---- 记忆系统（R4）----
+    # remember 写记忆：auto 免确认但 query 模式禁止；strict/plan 仍走原确认语义
+    "remember": {"category": "memory", "read_only": False, "risk_level": "low",
+                 "workspace_scoped": False, "requires_confirmation": False,
+                 "allowed_in_query": False, "allowed_in_isolated": True,
+                 "external_side_effect": False},
+    "recall_memory": {"category": "memory", "read_only": True, "risk_level": "low",
+                      "workspace_scoped": False, "requires_confirmation": False,
+                      "allowed_in_query": True, "allowed_in_isolated": True,
+                      "external_side_effect": False},
+    "codegraph_query": {"category": "memory", "read_only": True, "risk_level": "low",
+                        "workspace_scoped": True, "requires_confirmation": False,
+                        "allowed_in_query": True, "allowed_in_isolated": True,
+                        "external_side_effect": False},
 }
 
 # 兼容派生（旧引用保留；权限判断统一走 _is_query_tool / _needs_confirm / _confirm_policy）

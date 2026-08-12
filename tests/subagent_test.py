@@ -5,6 +5,7 @@ AGENTS_DIR 重定向到临时目录；上游响应打桩（TestClient 单事件�
 """
 import os
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_DATA_DIR", str(__import__("tempfile").mkdtemp(prefix="pcagent_td_")))
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import json
 import sys

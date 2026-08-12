@@ -38,6 +38,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from pathlib import Path
 
@@ -59,6 +60,8 @@ from provider_capabilities import build_payload as _build_payload_caps  # noqa: 
 from provider_capabilities import load_overrides_from_config as _load_provider_overrides  # noqa: E402
 from prompt_cache import PromptCacheManager  # noqa: E402
 from subagent_router import should_delegate, RISK_LOW, RISK_MEDIUM  # noqa: E402
+# R4：记忆系统（L0-L3 + Skill + CodeGraph）——只在需要时 import，失败不影响主流程
+import agent_memory as _agent_memory  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -71,8 +74,205 @@ DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 # ---- R3：全局工具结果存储（LRU）与提示词缓存管理器 ----
 _result_store = ResultStore()
 _prompt_cache = PromptCacheManager()
-# 结果压缩上限：工具结果回传模型的最大长度（head/tail/error 分区保留，错误不丢）
+# 结果压缩上限：工具结果回传模型的最大长度（head/tail/error 分区保留）
 MAX_TOOL_RESULT_CHARS = 800
+
+# ---- R4：记忆系统（有界队列 + 单 worker；失败静默不影响主流程）----
+_memory_jobs = _agent_memory.MemoryJobQueue()
+_memory_worker = _agent_memory.MemoryWorker(_memory_jobs, lambda job: None)  # handler 后置
+_memory_worker.start()
+
+
+def _dynamic_memory_message(last_user: str, workspace: str = "") -> str | None:
+    """组装动态记忆上下文（独立 system 消息，不并入稳定前缀）。
+
+    内容：L3 画像注入版 + 当前消息召回的 L1 top3（去重）。
+    为空/失败返回 None（不注入）。
+    """
+    try:
+        if not _memory_enabled():
+            return None
+        if not (last_user and last_user.strip()):
+            return None
+        parts: list[str] = []
+        profile_text = _agent_memory.profile_inject_text()
+        if profile_text:
+            parts.append("用户画像：" + profile_text)
+        hits = _agent_memory.recall_memories(last_user, top_k=3,
+                                             workspace_id=workspace)
+        if hits:
+            seen: set[str] = set()
+            lines = []
+            for h in hits:
+                c = str(h.get("content") or "").strip()
+                if c and c not in seen:
+                    seen.add(c)
+                    lines.append(f"- {c}")
+            if lines:
+                parts.append("相关记忆：\n" + "\n".join(lines))
+        if not parts:
+            return None
+        return ("（动态记忆上下文，与对话正文独立；如与本轮用户要求冲突，以本轮为准）\n"
+                + "\n".join(parts))
+    except Exception:
+        return None
+
+
+def _memory_enabled() -> bool:
+    """记忆系统开关：chat_config.json 的 memory_enabled（默认 true）。"""
+    try:
+        return bool(load_config().get("memory_enabled", True))
+    except Exception:
+        return True
+
+
+def _submit_memory_record(record: dict, status: str | None = None) -> None:
+    """把 AgentRunRecord 提交给 MemoryWorker（非阻塞，失败静默）。
+
+    status 非 None 时兜底覆盖（loop 异常退出未填充状态的情况）。
+    """
+    try:
+        if not _memory_enabled():
+            return
+        if status is not None:
+            record["status"] = status
+        if not record.get("status"):
+            record["status"] = "failed"
+        record.setdefault("finished_at", time.time())
+        _memory_jobs.put(record)
+    except Exception:
+        pass
+
+
+def _llm_extract_memories(user_texts: list[str], api_url: str, headers: dict,
+                          model: str) -> list[dict] | None:
+    """LLM 兜底提取（配置 llm_memory_extract=true 时启用）：把规则候选
+    精化为结构化 JSON 列表；失败返回 None（调用方回退规则结果）。
+
+    关闭思考（off 模式）+ 校验；绝不保存隐藏推理——只提取显式陈述。
+    """
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system",
+             "content": ("你是记忆提取器。从用户消息中提取值得长期记住的偏好/约束/决定，"
+                         "输出 JSON 数组：[{\"type\":\"preference|constraint|decision|fact\","
+                         "\"content\":\"原样引用用户表述\"}]。"
+                         "规则：只提取用户明确陈述；不要推断人格；不要提取疑问句/假设句/"
+                         "密钥/代码；没有可提取内容输出 []。只输出 JSON，不要解释。")},
+            {"role": "user", "content": json.dumps(user_texts, ensure_ascii=False)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 500,
+    }
+    _apply_reasoning(payload, "off")
+    try:
+        data = _call_upstream_raw(api_url, payload, headers)
+        raw = (data["choices"][0]["message"].get("content") or "").strip()
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return None
+        out = []
+        for item in parsed:
+            if (isinstance(item, dict) and item.get("content")
+                    and item.get("type") in
+                    ("preference", "constraint", "decision", "fact")):
+                out.append({"type": item["type"], "content": str(item["content"])[:200],
+                            "confidence": 0.8, "explicit": True,
+                            "retrieval_keys": _agent_memory._default_keys(
+                                str(item["content"]))})
+        return out or None
+    except Exception:
+        return None
+
+
+def _memory_process_run(record: dict) -> None:
+    """MemoryWorker handler：L0 归档 → 幂等检查 → L1 提取 → 画像重建。
+
+    全部失败静默（记忆提取不能影响聊天主流程）。
+    """
+    import uuid as _uuid
+    if not _memory_enabled():
+        return
+    sid = record.get("session_id")
+    rid = str(record.get("request_id") or _uuid.uuid4().hex[:12])
+    ws = str(record.get("workspace") or "")
+    try:
+        # 幂等：同一 request_id 不重复处理
+        env = _agent_memory.load_l1()
+        cur = (env.get("extraction_cursors") or {}).get(
+            f"session-{sid}" if sid else "default") or {}
+        if cur.get("last_request_id") == rid:
+            return
+        # L0 归档（原文永久保留）
+        for m in (record.get("input_messages") or [])[-40:]:
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                _agent_memory.l0_append(session_id=sid, request_id=rid,
+                                        role=m.get("role", ""),
+                                        content=content[:4000], workspace=ws)
+        if record.get("status") == "cancelled":
+            return
+        # L1 提取（保守规则）
+        items = _agent_memory.extract_l1_from_run(record)
+        # LLM 兜底精化（默认关闭；有规则候选且配置开启时才调用）
+        try:
+            if items and load_config().get("llm_memory_extract"):
+                cfg = load_config()
+                aurl = normalize_url(cfg.get("api_url"))
+                akey = (cfg.get("api_key") or "").strip()
+                if aurl and akey:
+                    refined = _llm_extract_memories(
+                        [str(m.get("content") or "") for m in
+                         (record.get("input_messages") or [])
+                         if m.get("role") == "user"][-6:],
+                        aurl,
+                        {"Content-Type": "application/json",
+                         "Authorization": f"Bearer {akey}"},
+                        cfg.get("model") or "")
+                    if refined:
+                        items = refined
+        except Exception:
+            pass    # LLM 兜底失败：用规则结果（cursor 幂等防重试）
+        if items:
+            now = time.time()
+            for it in items:
+                it.setdefault("id", _uuid.uuid4().hex[:12])
+                it.setdefault("scope", "global")
+                it.setdefault("workspace_id", ws)
+                it.setdefault("status", "active")
+                it.setdefault("pinned", False)
+                it.setdefault("source_refs",
+                              [{"session_id": sid, "request_id": rid}])
+                it.setdefault("supersedes", [])
+                it.setdefault("created_at", now)
+                it.setdefault("updated_at", now)
+                it.setdefault("last_accessed_at", now)
+                it.setdefault("access_count", 0)
+            cursor = {"version": record.get("session_version"),
+                      "last_request_id": rid,
+                      "last_content_hash": hashlib.sha256(
+                          json.dumps(record.get("input_messages") or [],
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()[:16]}
+            if items:
+                _agent_memory.add_memories(items, session_id=sid,
+                                           request_id=rid, cursor=cursor)
+            else:
+                # 无候选也必须记录 cursor：否则同一请求重复处理时
+                # 会再次追加 L0 归档（幂等失效）
+                _agent_memory.add_memories([], session_id=sid,
+                                           request_id=rid, cursor=cursor)
+            log.info("记忆提取：会话 %s 请求 %s → %d 条候选",
+                     sid, rid, len(items))
+        # L3 画像重建（有偏好/约束类记忆时）
+        if any(it.get("type") in ("preference", "constraint") for it in items):
+            _agent_memory.rebuild_profile()
+    except Exception:
+        log.debug("memory worker 处理失败（不影响主流程）", exc_info=True)
+
+
+# handler 后置绑定（worker 已启动）
+_memory_worker.handler = _memory_process_run
 
 # ---- Agent 安全锁（防循环调用导致系统崩溃）----
 MAX_TOOL_STEPS = 20             # 单次请求最多工具轮数
@@ -399,6 +599,7 @@ ROUTER_CORE_TOOLS = {
     "system_status", "load_skill", "view_image",
     "process_output", "list_processes", "create_todo", "update_todo",
     "create_plan", "stop", "delegate", "create_file",
+    "remember", "recall_memory", "codegraph_query",
 }
 
 # 类别 → 追加工具（MCP 按前缀动态展开）
@@ -605,11 +806,17 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, description="覆盖配置中的模型名")
     temperature: float = Field(default=0.7, ge=0, le=2)
     agent: bool = Field(default=False, description="启用内置 Agent 工具调用循环")
+    # ---- 记忆系统会话身份（可选；提供后记忆提取可溯源到会话/工作区）----
+    session_id: int | None = Field(default=None, description="当前会话 ID（记忆溯源用）")
+    request_id: str | None = Field(default=None, description="本次请求唯一 ID（幂等）")
+    workspace: str | None = Field(default=None, description="规范化工作区路径（记忆隔离用）")
+    session_version: int | None = Field(default=None, description="会话版本（提取进度游标）")
 
 
 class CompressRequest(BaseModel):
     messages: list[dict] = Field(..., description="待压缩的完整消息列表")
     keep_recent: int = Field(default=8, ge=2, le=30, description="保留最近 N 条消息不压缩")
+    session_id: int | None = Field(default=None, description="会话 ID（L2 场景归属溯源）")
 
 
 class ConfigUpdate(BaseModel):
@@ -939,6 +1146,13 @@ async def compress(req: CompressRequest) -> dict:
     }
     log.info("compress: %d -> %d messages, saved %d chars, keys=%d",
              len(msgs), len(new_msgs), before_c - after_c, len(retrieval_keys))
+    # R4：L2 场景旁路派生（压缩成功时写场景；失败静默，不改变压缩流程）
+    try:
+        if _memory_enabled():
+            _agent_memory.add_scenario_from_summary(
+                summary=parsed, session_id=req.session_id or 0)
+    except Exception:
+        pass
     return {"ok": True, "compressed": True, "messages": new_msgs,
             "summary": summary_text, "stats": stats}
 
@@ -1116,7 +1330,26 @@ async def health() -> dict:
         "workspace": str(_get_workspace()),
         "tools": tools,
         "usage": _usage_summary(),
+        "memory_stats": _memory_stats(),
     }
+
+
+def _memory_stats() -> dict:
+    """记忆系统统计（health 下发；失败返回空，不影响 health）。"""
+    try:
+        env = _agent_memory.load_l1()
+        profile = _agent_memory.load_profile()
+        return {
+            "enabled": _memory_enabled(),
+            "l1_memories": len([e for e in env.get("items", [])
+                                if e.get("status") == "active"]),
+            "l2_scenarios": len(_agent_memory.list_scenario_paths()),
+            "profile_preferences": len(profile.get("preferences") or []),
+            "profile_updated": profile.get("updated") or 0,
+            "dynamic_skills": len(_agent_memory.load_skills_dynamic()),
+        }
+    except Exception:
+        return {"enabled": False}
 
 
 @app.get("/api/v1/usage", summary="Token 用量统计（聚合 + 最近明细，无正文）")
@@ -1675,6 +1908,39 @@ AGENT_TOOLS = [
                         "default": "tail", "description": "要取回的区段"},
         }, "required": ["result_id"]},
     }},
+    {"type": "function", "function": {
+        "name": "remember",
+        "description": "主动写入一条长期记忆（用户明确表达且值得跨会话记住的偏好/约束/事实/决定）。"
+                       "仅用于用户明确要求记住的内容；对话中自动提取的记忆无需调用本工具。",
+        "parameters": {"type": "object", "properties": {
+            "content": {"type": "string", "description": "记忆内容（原样保留用户表述）"},
+            "type": {"type": "string", "enum": ["fact", "preference", "constraint", "decision"],
+                     "default": "preference", "description": "记忆类型"},
+        }, "required": ["content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "recall_memory",
+        "description": "检索长期记忆：查询用户之前明确表达的偏好/约束/事实/决定，"
+                       "或按场景路径加载被压缩的会话场景正文（scope=scenario 时）。"
+                       "用于需要参考历史上下文时；只读操作。",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "检索关键词（如「端口」「编码风格」）"},
+            "scope": {"type": "string", "enum": ["memory", "scenario", "profile"],
+                      "default": "memory", "description": "检索范围：记忆/场景正文/用户画像"},
+            "scenario_id": {"type": "string", "description": "scope=scenario 时：场景 id（来自 recall_memory 的路径清单）"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "codegraph_query",
+        "description": "代码图谱查询：查符号定义位置、谁调用它（callers），或对文件做影响分析。"
+                       "修改代码前用它评估影响范围；首次调用会自动构建索引（缓存）。",
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "enum": ["symbol", "impact", "build"],
+                     "default": "symbol", "description": "symbol=查符号调用关系；impact=文件影响分析；build=重建索引"},
+            "symbol": {"type": "string", "description": "mode=symbol：符号名（函数/类名）"},
+            "file": {"type": "string", "description": "mode=impact：工作区相对路径"},
+        }, "required": ["mode"]},
+    }},
 ]
 
 # ---- Skill 包（用户导入的技能包：skills/<名称>/SKILL.md）----
@@ -1717,13 +1983,26 @@ def _scan_skills() -> list[dict]:
 
 
 def _skill_catalog_text() -> str:
-    """可用技能清单（只注入清单不注入全文，模型按需 load_skill 加载）。"""
+    """可用技能清单（只注入清单不注入全文，模型按需 load_skill 加载）。
+
+    静态 skills/ + 动态记忆 Skill（active 状态；命名空间 dynamic: 不覆盖静态同名）。
+    """
     skills = _scan_skills()
-    if not skills:
-        return ""
-    lines = ["可用技能包（任务匹配某技能时，用 load_skill 加载该技能全文再执行）："]
-    for s in skills:
-        lines.append(f"- {s['name']}：{s['description'] or '无描述'}")
+    lines = []
+    if skills:
+        lines.append("可用技能包（任务匹配某技能时，用 load_skill 加载该技能全文再执行）：")
+        for s in skills:
+            lines.append(f"- {s['name']}：{s['description'] or '无描述'}")
+    # R4：动态 Skill（active）清单
+    try:
+        dyn = [s for s in _agent_memory.load_skills_dynamic()
+               if s.get("status") == "active"]
+        if dyn:
+            lines.append("可用动态技能（从成功任务提炼，按触发条件自动适配）：")
+            for s in dyn[:10]:
+                lines.append(f"- dynamic:{s['name']}：{s.get('trigger') or '无触发条件'}")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -3451,6 +3730,12 @@ async def session_delete(sid: int) -> dict:
         saved = _sessions.get(sid)
         del _sessions[sid]
         _persist_sessions_or_rollback(lambda: _rollback_session_restore(sid, saved))
+    # R4：删除会话后清除其来源记忆（pinned 显式记忆保留；失败静默）
+    try:
+        if _memory_enabled():
+            _agent_memory.forget_session_memories(sid)
+    except Exception:
+        pass
     log.info("session deleted: #%d", sid)
     return {"ok": True, "deleted": sid}
 
@@ -4171,6 +4456,93 @@ def _execute_tool(name: str, arguments: str,
             if text is None:
                 return False, f"找不到结果 {rid}（可能已过期或被清理，请基于现有摘要继续）"
             return True, text
+        if name == "remember":
+            content = (args.get("content") or "").strip()
+            mtype = args.get("type") or "preference"
+            if not content:
+                return False, "remember 需要 content 参数"
+            if len(content) > 300:
+                return False, "记忆内容过长（≤300 字符）"
+            if mtype not in ("fact", "preference", "constraint", "decision"):
+                return False, f"非法记忆类型：{mtype}"
+            # 密钥/注入防御：与自动提取同一套排除规则
+            from agent_memory import _is_excluded
+            if _is_excluded(content):
+                return False, "该内容疑似包含密钥或提示注入，已拒绝写入记忆"
+            now = time.time()
+            n = _agent_memory.add_memories([{
+                "id": uuid.uuid4().hex[:12], "type": mtype, "content": content,
+                "scope": "global", "workspace_id": "", "confidence": 1.0,
+                "status": "active", "explicit": True, "pinned": False,
+                "retrieval_keys": _agent_memory._default_keys(content),
+                "source_refs": [], "supersedes": [],
+                "created_at": now, "updated_at": now,
+                "last_accessed_at": now, "access_count": 0}])
+            if n:
+                _agent_memory.rebuild_profile()
+                return True, f"已记住（{mtype}）：{content[:80]}"
+            return True, "该内容已在记忆中（未重复写入）"
+        if name == "recall_memory":
+            query = (args.get("query") or "").strip()
+            scope = args.get("scope") or "memory"
+            if not query:
+                return False, "recall_memory 需要 query 参数"
+            if scope == "scenario":
+                sid = (args.get("scenario_id") or "").strip()
+                if sid:
+                    body = _agent_memory.get_scenario_body(sid)
+                    if body is None:
+                        return False, f"场景不存在：{sid}"
+                    return True, body
+                # 场景路径清单（注入只给路径，正文按需加载）
+                paths = _agent_memory.list_scenario_paths()
+                if not paths:
+                    return True, json.dumps({"scenarios": []}, ensure_ascii=False)
+                return True, json.dumps({"scenarios": paths[:20]}, ensure_ascii=False)
+            if scope == "profile":
+                return True, (_agent_memory.profile_inject_text(limit=1000)
+                              or "（暂无画像）")
+            ws_id = str(_get_workspace())
+            hits = _agent_memory.recall_memories(query, top_k=5, workspace_id=ws_id)
+            if not hits:
+                return True, json.dumps({"hits": []}, ensure_ascii=False)
+            return True, json.dumps({"hits": hits}, ensure_ascii=False)
+        if name == "codegraph_query":
+            mode = args.get("mode") or "symbol"
+            ws = _get_workspace()
+            try:
+                files_iter = _iter_workspace_files(ws)
+                if mode == "build":
+                    res = _agent_memory.build_codegraph(ws, files_iter)
+                    return True, json.dumps({"built": True, "files": len(res.get("files", {})),
+                                             "truncated": res.get("truncated", False)},
+                                            ensure_ascii=False)
+                # 先尝试直接查询；索引不存在时构建
+                if mode == "symbol":
+                    sym = (args.get("symbol") or "").strip()
+                    if not sym:
+                        return False, "codegraph_query(symbol) 需要 symbol 参数"
+                    q = _agent_memory.codegraph_query(ws, sym)
+                    if q.get("ok"):
+                        return True, json.dumps(q, ensure_ascii=False)
+                elif mode == "impact":
+                    f = (args.get("file") or "").strip()
+                    if not f:
+                        return False, "codegraph_query(impact) 需要 file 参数"
+                    imp = _agent_memory.codegraph_impact(ws, f)
+                    if imp.get("ok"):
+                        return True, json.dumps(imp, ensure_ascii=False)
+                else:
+                    return False, f"非法模式：{mode}"
+                # 索引缺失 → 构建后重试一次
+                _agent_memory.build_codegraph(ws, files_iter)
+                if mode == "symbol":
+                    return True, json.dumps(_agent_memory.codegraph_query(ws, sym),
+                                            ensure_ascii=False)
+                return True, json.dumps(_agent_memory.codegraph_impact(ws, f),
+                                        ensure_ascii=False)
+            except Exception as exc:
+                return False, f"代码图谱失败：{exc}"
         if name == "delegate":
             return _exec_delegate(args, api_url, headers, model, temperature,
                                   q, cancel, depth, task_id)
@@ -4317,12 +4689,22 @@ def _read_cache_put(cache: dict, name: str, args: dict, ok: bool, result: str) -
         cache[_read_cache_key(name, args)] = (time.monotonic(), ok, result, paths)
 
 
+def _is_verification_result(tool_name: str, result: str) -> bool:
+    """工具结果是否构成「验证通过」证据（Skill 候选/lesson 三要素用）。"""
+    if tool_name not in ("run_code", "run_shell"):
+        return False
+    r = (result or "")
+    return any(k in r for k in ("PASS", "通过", "passed", "✓", "ok=true",
+                                "全部通过", "0 failed", "0 失败"))
+
+
 def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 model: str, temperature: float, q: queue.Queue,
                 cancel: threading.Event, depth: int = 0,
                 max_steps: int | None = None,
                 tools_filter: set[str] | None = None,
-                task_id: str = "") -> str:
+                task_id: str = "",
+                run_record: dict | None = None) -> str:
     """后台线程：工具调用循环，事件经 queue 发送给 SSE 生成器。
 
     安全锁：轮数上限 / 总调用数上限 / 单轮上限 / 连续失败熔断 / 总时长上限 / 取消事件。
@@ -4331,8 +4713,14 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     返回最终回复文本（主循环忽略；delegate 用它取子 agent 结果）。
     depth > 0 时（子 agent 循环）：工具轮数用 max_steps、tools 用白名单、
     不套用计划审批模式（授权已在主层完成）。task_id 绑定确认请求（主循环传入）。
+    run_record（可选，主循环传入）：AgentRunRecord 收集器，填充
+    started_at/tool_events/final_answer/status/finished_at（记忆系统用）。
     """
     global _current_agent_task_id
+    if run_record is not None:
+        run_record.setdefault("started_at", time.time())
+        run_record.setdefault("tool_events", [])
+        run_record.setdefault("status", "")
     if depth == 0 and task_id:
         with _agent_task_lock:
             _current_agent_task_id = task_id
@@ -4406,6 +4794,12 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             if depth == 0:
                 q.put(("done", None))
             log.info("agent done after %d step(s)", step)
+            if run_record is not None:
+                run_record["final_answer"] = content
+                run_record["status"] = "completed"
+                run_record["finished_at"] = time.time()
+                run_record.setdefault("verification_ok", any(
+                    e.get("verification") for e in run_record.get("tool_events", [])))
             return content or "（模型未返回内容）"
 
         # 模型要求调用工具
@@ -4635,6 +5029,13 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                 _rmeta = None
             round_cache[fp] = (ok, result)
             _read_cache_put(read_cache, fn["name"], args, ok, result)
+            if run_record is not None:
+                run_record["tool_events"].append({
+                    "name": fn["name"],
+                    "args_preview": (fn.get("arguments") or "")[:200],
+                    "ok": ok,
+                    "verification": _is_verification_result(fn["name"], result),
+                })
             q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
                                    **({"reduced": True, "result_id": _rmeta["result_id"]}
                                       if _rmeta and _rmeta.get("result_id") else {})}))
@@ -4683,13 +5084,19 @@ async def _release_lock_when_done(fut) -> None:
 
 
 async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict],
-                               model: str, temperature: float):
+                               model: str, temperature: float,
+                               session_id: int | None = None,
+                               request_id: str | None = None,
+                               workspace: str | None = None,
+                               session_version: int | None = None):
     """把 agent 循环的事件流转发为 SSE；客户端断开时通知循环线程停止。
 
     并发互斥：持有 _agent_lock 期间不允许第二条 Agent 任务启动；
     客户端断开后必须等 worker 真正结束才释放锁（防止旧任务工具与
     新任务并发执行文件/Shell/MCP/屏幕操作）。worker 无法及时取消时
     保持全局 busy，由 watcher 在 worker 结束后释放。
+
+    会话身份（可选）→ AgentRunRecord → MemoryWorker（记忆提取，失败静默）。
     """
     if not _agent_lock.acquire(blocking=False):
         yield f"event: error\ndata: {json.dumps({'detail': '已有另一个 Agent 任务正在执行（或旧任务仍在终止），请等待完成'}, ensure_ascii=False)}\n\n"
@@ -4698,8 +5105,15 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
     q: queue.Queue = queue.Queue()
     task_id = _new_task_id()
     loop = asyncio.get_running_loop()
+    run_record = {"session_id": session_id, "request_id": request_id or task_id,
+                  "workspace": workspace or "",
+                  "session_version": session_version,
+                  "input_messages": [dict(m) for m in messages],
+                  "status": "", "final_answer": "", "tool_events": [],
+                  "started_at": 0, "finished_at": 0}
     fut = loop.run_in_executor(None, _agent_loop, api_url, headers, messages, model,
-                               temperature, q, cancel, 0, None, None, task_id)
+                               temperature, q, cancel, 0, None, None, task_id,
+                               run_record)
     released = False
 
     def _release_lock() -> None:
@@ -4728,9 +5142,11 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
             kind, data = await loop.run_in_executor(None, q.get)
             if kind == "done":
                 await _agent_cleanup()   # 显式清理：async generator 的 finally 依赖 aclose
+                _submit_memory_record(run_record, status=None)  # 状态由 loop 填充
                 break
             if kind == "error":
                 await _agent_cleanup()
+                _submit_memory_record(run_record, status="cancelled" if cancel.is_set() else "failed")
                 yield f"event: error\ndata: {json.dumps({'detail': data}, ensure_ascii=False)}\n\n"
                 break
             if kind == "tool_call":
@@ -4778,29 +5194,45 @@ async def chat_stream(req: ChatRequest):
     if req.agent:
         # Agent 模式：附加工具说明到 system 消息，走工具调用循环
         messages = [dict(m) for m in _trim_messages(req.messages)]
+        # R4：动态记忆上下文作为独立 system 消息插入（不拼进稳定前缀，
+        # 避免破坏提示词缓存；L3 注入版 + 去重后的 L1 召回）
+        dyn = _dynamic_memory_message(
+            next((str(m.get("content") or "") for m in reversed(messages)
+                  if m.get("role") == "user"), ""),
+            workspace=str(req.workspace or ""))
+        if dyn:
+            messages.insert(0, {"role": "system", "content": dyn})
+        appended = False
         for m in messages:
-            if m.get("role") == "system":
-                m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
-                # 注入当前任务清单：中断后模型能感知进度（半恢复）
-                todo_note = _todos_system_note()
-                if todo_note:
-                    m["content"] += todo_note
-                # 注入可用技能包清单（只注入清单，全文按需 load_skill）
-                m["content"] += _skill_catalog_text()
-                # 注入可用子 agent 清单（delegate 委派）
-                m["content"] += _agent_catalog_text()
-                # 计划审批模式：提示先规划
-                if _current_confirm_mode() == "plan":
-                    m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
-                                     "列出步骤与所需工具；用户批准前不要执行任何工具。"
-                                     "批准后按计划执行，计划内操作免确认。）")
-                break
-        else:
+            if m.get("role") != "system":
+                continue
+            if "（动态记忆上下文" in (m.get("content") or ""):
+                continue    # 动态记忆消息保持独立：SUFFIX 加到原 system
+            m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
+            # 注入当前任务清单：中断后模型能感知进度（半恢复）
+            todo_note = _todos_system_note()
+            if todo_note:
+                m["content"] += todo_note
+            # 注入可用技能包清单（只注入清单，全文按需 load_skill）
+            m["content"] += _skill_catalog_text()
+            # 注入可用子 agent 清单（delegate 委派）
+            m["content"] += _agent_catalog_text()
+            # 计划审批模式：提示先规划
+            if _current_confirm_mode() == "plan":
+                m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
+                                 "列出步骤与所需工具；用户批准前不要执行任何工具。"
+                                 "批准后按计划执行，计划内操作免确认。）")
+            appended = True
+            break
+        if not appended:
             messages.insert(0, {"role": "system",
                                 "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
                                 + _skill_catalog_text() + _agent_catalog_text()})
         return StreamingResponse(
-            _agent_stream_events(api_url, headers, messages, model, req.temperature),
+            _agent_stream_events(api_url, headers, messages, model, req.temperature,
+                                 session_id=req.session_id, request_id=req.request_id,
+                                 workspace=req.workspace,
+                                 session_version=req.session_version),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

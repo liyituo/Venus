@@ -2055,9 +2055,15 @@ class ChatApp:
         t = _token_for_base(self.llm_url)
         if t:
             headers["X-Api-Token"] = t
+        # 会话身份：记忆提取溯源（session/请求幂等/工作区/版本）
+        sess = self._sessions.get(self._current_sid) or {}
+        body = {"messages": snapshot, "agent": True,
+                "session_id": self._current_sid,
+                "request_id": f"chat-{task_id}",
+                "workspace": str(load_config().get("workspace") or ""),
+                "session_version": int(sess.get("version") or 0)}
         req = urllib.request.Request(
-            url, data=json.dumps({"messages": snapshot, "agent": True},
-                                 ensure_ascii=False).encode("utf-8"),
+            url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers=headers, method="POST")
         # 块级 SSE 状态机：按空行分隔的完整事件块解析
         # （event 行 + 一条或多条 data 行 = 一个事件；事件消费后立即重置，

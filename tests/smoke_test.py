@@ -3,10 +3,12 @@
 import os
 import sys
 import threading
+import tempfile
 import time
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_DATA_DIR", str(Path(tempfile.mkdtemp(prefix="pcagent_td_"))))
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 import pyautogui

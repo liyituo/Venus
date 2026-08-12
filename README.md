@@ -245,10 +245,31 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 - 若 server 需要走代理/特殊环境（如 WSL 里的 npx、node、uvx），在 `env` 里显式补 `HTTP_PROXY`、`HOME` 等——MCP 的 `env` 会替换子进程完整环境，缺 PATH 时 npx 会启动失败
 - Spotify 首次授权：dashboard.spotify.com 建 Developer App（Redirect URI 必须 `http://127.0.0.1:8888/callback`，不能用 localhost），配好 env 后首次调用走 OAuth，token 缓存 `~/.spotify_mcp_cache`；换区不影响凭据，仅 Premium 空窗期 API 不可用
 
+## 记忆系统（L0-L3 分层记忆 + 动态 Skill + CodeGraph）
+
+借鉴 TencentDB-Agent-Memory 的分层架构，在本项目轻量技术栈上等价实现（零 Docker/数据库），让 Agent 跨会话沉淀经验：
+
+| 层 | 机制 | 存储 |
+| --- | --- | --- |
+| **L0** 原文归档 | 每次任务的消息只追加归档（会话裁剪/清空不丢原文） | `.pcagent/memory/l0_events.jsonl`（10MB 轮转） |
+| **L1** 原子记忆 | 自动提取用户明确表达的偏好/约束/决定/事实；带来源溯源、可纠正可遗忘（superseded/retracted）；幂等游标防重复 | `.pcagent/memory/l1_memories.json`（版本信封） |
+| **L2** 场景归纳 | 上下文压缩成功时旁路派生场景（同目标聚合）；注入只给路径，正文按需加载 | `.pcagent/memory/l2_scenarios.json` |
+| **L3** 长期画像 | 显式偏好一次即入；推断模式需 ≥2 个独立会话；矛盾取最新表达；每条可反查 L1 来源 | `.pcagent/memory/profile.json` |
+| **动态 Skill** | 跑通的任务提炼 SOP 候选 → 2 次独立成功复用（或用户批准）才激活；`dynamic:` 命名空间不覆盖静态 skill | `.pcagent/memory/skills_dynamic.json` |
+| **CodeGraph** | Python 用 ast（其他语言正则回退）提取符号/调用/import；按工作区隔离、增量更新；改代码前影响分析 | `.pcagent/memory/codegraph.json` |
+
+关键设计：
+
+- **保守提取**：只处理用户消息，排除代码块/疑问句/假设句/密钥/提示注入；规则候选优先，LLM 兜底默认关闭（配置 `llm_memory_extract: true` 开启）；只保存可追溯到用户明确陈述的内容，绝不存隐藏推理
+- **安全**：单 MemoryWorker + 有界队列，失败静默不影响聊天；会话删除同步遗忘来源记忆（pinned 显式记忆保留）；记忆文件全部在 `.pcagent/`（已 gitignore）
+- **工具**：`remember`（主动写入）/ `recall_memory`（查记忆/场景正文/画像）/ `codegraph_query`（符号调用关系/影响分析）；均进工具路由核心集（路由开启仍可见），isolated 模式保留
+- **注入**：每轮对话在独立动态 system 消息中注入「画像 + 相关记忆」（≤300 字符，与对话冲突时以本轮为准），不破坏稳定前缀提示词缓存
+- **会话身份**：Chat GUI 流式请求携带 session_id/request_id/workspace/session_version，记忆可溯源到会话与工作区
+
 ## 会话与数据
 
 - 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）；重启自动恢复，chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
-- 文件修改自动备份到 `.pcagent/backups/`（`undo` 回滚用，50 条上限）
+- 记忆数据在 `.pcagent/memory/`（见上节）；文件修改自动备份到 `.pcagent/backups/`（`undo` 回滚用，50 条上限）
 - 运行日志写入 `.pcagent/server.log` 与 `.pcagent/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
 - 任务清单存在工作区 `.pcagent/todos.json`（跟随机器）；定时任务存 `.pcagent/schedules.json`
 - 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
@@ -274,11 +295,12 @@ src/tool_result_reducer.py     工具结果压缩（head/error/tail 分区 + res
 src/history_index.py           历史消息关键词索引（压缩后按需检索）
 src/prompt_cache.py            分层提示词缓存（稳定前缀、版本失效、观测）
 src/subagent_router.py         子 Agent 智能路由（成本模型、信封、工件注册表）
+src/agent_memory.py            记忆系统（L0-L3 分层 + 动态 Skill + CodeGraph，见上节）
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
 quant-agent-lab/    隔离的量化研究、策略调试、回测、MCP Apps GUI 与 Paper Trading 子项目
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
-tests/              二十九套测试（含量化中心隔离、GUI 合同与真实服务联调）
+tests/              三十套自动测试 + 评测入口（含记忆系统 L0-L3/Skill/CodeGraph）
 .github/workflows/  CI（主 Agent 双平台 + RAG + 量化子项目独立验证）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）

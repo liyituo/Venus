@@ -4,6 +4,7 @@
 """
 import os
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_DATA_DIR", str(__import__("tempfile").mkdtemp(prefix="pcagent_td_")))
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 import sys
 import tempfile

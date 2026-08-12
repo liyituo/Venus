@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_DATA_DIR", str(Path(tempfile.mkdtemp(prefix="pcagent_td_"))))
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

@@ -13,6 +13,7 @@ import queue
 from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
+os.environ.setdefault("PCAGENT_DATA_DIR", str(Path(tempfile.mkdtemp(prefix="pcagent_td_"))))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import llm_server as L  # noqa: E402
