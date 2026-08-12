@@ -2884,23 +2884,21 @@ def _exec_view_image(args: dict) -> tuple[bool, str]:
     if not (vurl and vkey and vmodel):
         return False, ("未配置视觉模型：请在 chat_config.json 设置 "
                        "vision_api_url / vision_api_key / vision_model")
-    # 同一图片（mtime/size 未变）+ 同一问题：复用上次分析结果（60s），
-    # 避免坐标敏感任务反复重发同一张 base64 图片（规格：图片 hash 去重）
-    try:
-        st = target.stat()
-        _vkey = (str(target), st.st_mtime, st.st_size, question[:200])
-    except OSError:
-        _vkey = None
-    if _vkey is not None:
-        with _vimage_lock:
-            hit = _vimage_cache.get(_vkey)
-        if hit is not None and time.monotonic() - hit[0] <= _VIMAGE_TTL:
-            return True, hit[1] + "\n（同一图片与问题，已复用上次分析结果）"
+    # 同一图片（内容 hash 未变）+ 同一问题：复用上次分析结果（60s），
+    # 避免坐标敏感任务反复重发同一张 base64 图片。
+    # 用内容 hash 而非 mtime/size：快速连续写入时 mtime 可能不更新
+    # （文件系统时间戳粒度/缓存），内容变化必然反映在 hash 上（规格 §13）。
     import base64
     try:
-        b64 = base64.b64encode(target.read_bytes()).decode()
+        img_bytes = target.read_bytes()
     except OSError as exc:
         return False, f"读取图片失败：{exc}"
+    _vkey = (str(target), hashlib.sha256(img_bytes).hexdigest()[:16], question[:200])
+    with _vimage_lock:
+        hit = _vimage_cache.get(_vkey)
+    if hit is not None and time.monotonic() - hit[0] <= _VIMAGE_TTL:
+        return True, hit[1] + "\n（同一图片与问题，已复用上次分析结果）"
+    b64 = base64.b64encode(img_bytes).decode()
     payload = {
         "model": vmodel,
         "messages": [{"role": "user", "content": [
