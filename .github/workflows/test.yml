@@ -56,3 +56,27 @@ jobs:
 
       - name: 统一测试入口（Xvfb 虚拟显示，GUI 测试走 mock）
         run: xvfb-run -a python tests/run_all_tests.py
+
+  # RAG 独立服务：分块/存储/向量检索/API（mock 模式，不依赖 Ollama；live 需本机 Ollama）
+  test-rag:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖（RAG/requirements.txt 管理）
+        run: pip install --quiet -r RAG/requirements.txt ruff
+
+      - name: 编译检查
+        run: python -m compileall -q RAG
+
+      - name: Ruff F/E9
+        run: python -m ruff check --select F,E9 RAG
+
+      - name: RAG 测试（mock 向量，无外部依赖）
+        run: python RAG/tests/rag_test.py

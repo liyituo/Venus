@@ -1,0 +1,8 @@
+# RAG 服务配置（复制为 rag_config.json 后按需修改；本文件无密钥可入库）
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "embed_model": "nomic-embed-text",
+  "data_dir": "data",
+  "port": 8010,
+  "token": ""
+}

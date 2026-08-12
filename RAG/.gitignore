@@ -1,0 +1,5 @@
+# RAG 服务本地文件（不入库）
+__pycache__/
+*.pyc
+data/
+rag_config.json
