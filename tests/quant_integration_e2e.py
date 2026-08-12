@@ -3,11 +3,16 @@
 This test is intentionally opt-in because it starts local child services on
 8014/4173.  It never opens a browser, generates a report, approves a plan or
 executes Paper Trading.
+
+注意：文件名不含 _test.py 后缀——run_all_tests.py 只自动发现 *_test.py，
+本脚本不会在 CI 上跑（CI 无 Node/无本地子服务环境）。
+手动运行：python tests/quant_integration_e2e.py
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import urllib.request
 from pathlib import Path
@@ -36,7 +41,24 @@ def post_json(url: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _environment_ready() -> bool:
+    """环境守卫：quant 子项目与 Node 缺一不可；缺失时 SKIP（不失败）。
+
+    防止脚本被误放进自动发现（改名后仍可能被手动/误配置在 CI 执行），
+    缺失环境时安全跳过而不是抛 QuantLaunchError。
+    """
+    if not QUANT.is_dir():
+        print("SKIP: quant-agent-lab/ 不存在（真实 E2E 需要完整子项目）")
+        return False
+    if shutil.which("node") is None:
+        print("SKIP: 未找到 Node.js（GUI 构建需要 node）")
+        return False
+    return True
+
+
 def main() -> None:
+    if not _environment_ready():
+        return
     config = {
         "quant_project_path": str(QUANT),
         "quant_backend_url": "http://127.0.0.1:8014",
