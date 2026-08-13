@@ -236,5 +236,35 @@ check("并发添加无异常", not errs, str(errs)[:150])
 check("并发后文档齐全", len(cc.list_documents()) == 8, str(len(cc.list_documents())))
 check("并发后持久化一致", Collection("conc", tmp).stats()["documents"] == 8)
 
+# ============ 8. ingest 端点与 symbol 过滤 ============
+print("== 8. ingest 与 symbol 过滤 ==")
+report_file = Path(tempfile.mkdtemp()) / "earnings.txt"
+report_file.write_text("苹果公司 2026Q2 财报：营收 950 亿美元，同比增长 8%；"
+                       "iPhone 收入 480 亿，服务收入 240 亿。", encoding="utf-8")
+r = c.post("/api/v1/collections/demo/ingest", json={
+    "title": "AAPL 2026Q2 财报", "file_path": str(report_file),
+    "meta": {"symbol": "AAPL", "report_date": "2026-07-31", "market": "us"}})
+check("ingest 文件入库", r.status_code == 200 and r.json()["chunks"] >= 1, r.text[:150])
+r = c.post("/api/v1/collections/demo/ingest", json={
+    "title": "MSFT 财报", "text": "微软云业务增长 20%，总营收 700 亿。",
+    "meta": {"symbol": "MSFT", "report_date": "2026-07-31", "market": "us"}})
+check("ingest 文本入库", r.status_code == 200, r.text[:120])
+r = c.post("/api/v1/collections/demo/ingest", json={"title": "无内容"})
+check("ingest 无内容 422", r.status_code == 422)
+r = c.post("/api/v1/collections/demo/ingest", json={
+    "title": "不存在", "file_path": "/nonexistent/file.txt"})
+check("ingest 文件不存在 400", r.status_code == 400)
+r = c.post("/api/v1/collections/demo/search",
+           json={"query": "苹果 营收", "top_k": 10, "symbol": "AAPL"})
+check("symbol 过滤命中 AAPL", r.status_code == 200
+      and all(h["meta"].get("symbol") == "AAPL" for h in r.json()["hits"]), r.text[:200])
+r = c.post("/api/v1/collections/demo/search",
+           json={"query": "苹果 营收", "top_k": 10, "symbol": "MSFT"})
+check("symbol 过滤排除 AAPL", r.status_code == 200
+      and all(h["meta"].get("symbol") != "AAPL" for h in r.json()["hits"]), r.text[:200])
+r = c.post("/api/v1/collections/demo/search", json={"query": "云业务", "top_k": 5})
+check("不带 symbol 全量检索", r.status_code == 200
+      and any("微软" in h["text"] for h in r.json()["hits"]), r.text[:200])
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

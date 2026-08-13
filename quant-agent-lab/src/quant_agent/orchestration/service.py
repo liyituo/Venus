@@ -26,11 +26,14 @@ from quant_agent.infrastructure.clock import Clock, SystemClock
 from quant_agent.infrastructure.config import DemoConfig, load_demo_config
 from quant_agent.infrastructure.paths import ProjectPaths
 from quant_agent.infrastructure.store import SQLiteStore
+from quant_agent.llm.client import LlmClient
+from quant_agent.llm.rag_client import RagClient
 from quant_agent.portfolio.planner import PortfolioPlanner
 from quant_agent.reporting.narrative import DeterministicNarrativeProvider
 from quant_agent.reporting.renderer import write_report
 from quant_agent.research.service import ResearchService
 from quant_agent.risk.engine import RiskEngine
+from quant_agent.strategies.llm_fundamental import LlmFundamentalStrategy
 from quant_agent.strategies.moving_average import MovingAverageStrategy
 
 
@@ -54,11 +57,26 @@ class ApplicationService:
             self.store.set_kill_switch(
                 self.config.risk.kill_switch_default, "configured default", "system"
             )
-        self.provider = FileDataProvider(self.paths.data_dir)
-        self.strategy = MovingAverageStrategy(self.config.strategy)
+        # 行情源：file（默认）/ live（yfinance+akshare 自动拉取，失败回退缓存）
+        if self.config.market_data.source == "live":
+            from quant_agent.data.live_provider import LiveMarketDataProvider
+            self.provider = LiveMarketDataProvider(
+                self.paths.data_dir, market=self.config.market_data.market,
+                symbols=self.config.market_data.symbols)
+        else:
+            self.provider = FileDataProvider(self.paths.data_dir)
+        self.audit = AuditLogger(self.store, self.clock)
+        # 策略工厂：按 config.strategy.id 选择（默认 MA；llm-fundamental 走 LLM 决策层）
+        if self.config.strategy.strategy_id == "llm-fundamental":
+            self.strategy = LlmFundamentalStrategy(
+                self.config.llm, LlmClient(self.config.llm),
+                RagClient(self.config.llm.rag_url,
+                          self.config.llm.rag_collection),
+                audit=self.audit, clock=self.clock)
+        else:
+            self.strategy = MovingAverageStrategy(self.config.strategy)
         self.planner = PortfolioPlanner(self.config.portfolio)
         self.risk = RiskEngine(self.config.risk)
-        self.audit = AuditLogger(self.store, self.clock)
         self.approvals = ApprovalService(self.store, self.config, self.clock, self.audit)
         self.execution = ExecutionService(
             self.store,

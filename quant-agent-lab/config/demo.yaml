@@ -15,3 +15,19 @@ portfolio:
   approval_ttl_seconds: 3600
 paper_broker:
   default_fill_policy: full
+
+# ---- LLM 基本面信号（llm-fundamental 策略）----
+# key 从环境变量 QUANT_AGENT_LLM_API_KEY 读取（绝不写进本文件/日志/审计）
+llm:
+  api_url: ""
+  model: ""
+  api_key_env: QUANT_AGENT_LLM_API_KEY
+  timeout: 60
+  rag_url: http://127.0.0.1:8010
+  rag_collection: financial-reports
+
+# ---- 行情数据源：file（默认，本地 JSON）/ live（yfinance+akshare 自动拉取）----
+market_data:
+  source: file
+  market: us
+  symbols: []

@@ -94,9 +94,34 @@ class DocAdd(BaseModel):
     meta: dict | None = None
 
 
+class IngestReq(BaseModel):
+    """财报/文档摄入：文本直传 或 本地文件路径（txt/md/纯文本）。"""
+    title: str = Field(min_length=1, max_length=200)
+    text: str | None = None
+    file_path: str | None = None
+    meta: dict | None = None
+
+    def content(self) -> str:
+        """解析请求内容：文本优先；file_path 读本地纯文本文件（限大小）。"""
+        if self.text and self.text.strip():
+            return self.text
+        if self.file_path:
+            p = Path(self.file_path).expanduser()
+            if not p.is_file():
+                raise HTTPException(400, f"文件不存在：{self.file_path}")
+            if p.stat().st_size > 5_000_000:
+                raise HTTPException(400, "文件过大（≤5MB）")
+            try:
+                return p.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise HTTPException(400, f"读取文件失败：{exc}") from exc
+        raise HTTPException(422, "需要 text 或 file_path 之一")
+
+
 class SearchReq(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=50)
+    symbol: str | None = Field(default=None, description="按股票代码过滤（财报检索）")
 
 
 # ---------- 端点 ----------
@@ -150,6 +175,31 @@ async def add_document(name: str, req: DocAdd) -> dict:
     return {"ok": True, **doc, "embedding": vectors is not None}
 
 
+@app.post("/api/v1/collections/{name}/ingest")
+async def ingest(name: str, req: IngestReq) -> dict:
+    """财报/文档摄入：文本直传或本地 txt/md 文件；meta 存 symbol/report_date。"""
+    c = _get_collection(name)
+    content = req.content()
+    if not content.strip():
+        raise HTTPException(422, "摄入内容为空")
+    meta = dict(req.meta or {})
+    # symbol 归一化（美股/A股代码统一大写；含市场后缀时保留）
+    if meta.get("symbol"):
+        meta["symbol"] = str(meta["symbol"]).strip().upper()
+    try:
+        if embedder.available():
+            chunks = chunk_text(content)
+            vectors = embedder.embed(chunks)
+        else:
+            chunks, vectors = None, None
+        doc = c.add_document(req.title, content, meta, vectors, chunks)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    log.info("ingest %s +%s（%d 块，meta=%s）", name, req.title, doc["chunks"],
+             {k: v for k, v in meta.items() if k in ("symbol", "report_date", "market")})
+    return {"ok": True, **doc, "embedding": vectors is not None}
+
+
 @app.get("/api/v1/collections/{name}/documents")
 async def list_documents(name: str) -> dict:
     c = _get_collection(name)
@@ -174,8 +224,12 @@ async def collection_status(name: str) -> dict:
 async def search(name: str, req: SearchReq) -> dict:
     c = _get_collection(name)
     hits = _search(c, req.query, req.top_k)
-    return {"ok": True, "query": req.query, "embedding": embedder.available(),
-            "hits": hits}
+    if req.symbol:
+        sym = req.symbol.strip().upper()
+        hits = [h for h in hits
+                if str(((c.docs.get(h["doc_id"]) or {}).get("meta") or {}).get("symbol") or "").strip().upper() == sym]
+    return {"ok": True, "query": req.query, "symbol": req.symbol,
+            "embedding": embedder.available(), "hits": hits}
 
 
 def _search(c: Collection, query: str, top_k: int) -> list[dict]:
@@ -197,9 +251,12 @@ def _attach_meta(c: Collection, hits: list[dict], method: str) -> list[dict]:
     out = []
     for h in hits:
         doc = c.docs.get(h["doc_id"]) or {}
+        meta = doc.get("meta") or {}
         out.append({"doc_id": h["doc_id"], "title": doc.get("title", ""),
                     "text": h["text"], "score": round(h["score"], 4),
-                    "method": method})
+                    "method": method,
+                    "meta": {k: meta.get(k) for k in ("symbol", "report_date", "market")
+                             if meta.get(k)}})
     return out
 
 

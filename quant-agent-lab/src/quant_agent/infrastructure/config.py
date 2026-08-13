@@ -55,6 +55,25 @@ class PaperBrokerConfig:
 
 
 @dataclass(frozen=True)
+class LlmConfig:
+    """LLM 决策层配置（key 走环境变量，绝不进配置文件）。"""
+    api_url: str = ""
+    model: str = ""
+    api_key_env: str = "QUANT_AGENT_LLM_API_KEY"
+    timeout: int = 60
+    rag_url: str = "http://127.0.0.1:8010"
+    rag_collection: str = "financial-reports"
+
+
+@dataclass(frozen=True)
+class MarketDataConfig:
+    """行情数据源：file（本地 JSON/CSV，默认）/ live（自动拉取）。"""
+    source: str = "file"          # file | live
+    market: str = "us"            # us | cn | both
+    symbols: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DemoConfig:
     version: str = "demo-v1"
     local_timezone: str = "Asia/Shanghai"
@@ -62,6 +81,8 @@ class DemoConfig:
     portfolio: PortfolioConfig = PortfolioConfig()
     risk: RiskConfig = RiskConfig()
     paper_broker: PaperBrokerConfig = PaperBrokerConfig()
+    llm: LlmConfig = LlmConfig()
+    market_data: MarketDataConfig = MarketDataConfig()
 
 
 def _decimal(data: dict[str, Any], key: str, default: Decimal) -> Decimal:
@@ -118,6 +139,22 @@ def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
         ),
         paper_broker=PaperBrokerConfig(
             default_fill_policy=str(broker_data.get("default_fill_policy", "full"))
+        ),
+        llm=LlmConfig(
+            api_url=str(demo.get("llm", {}).get("api_url", "")),
+            model=str(demo.get("llm", {}).get("model", "")),
+            api_key_env=str(demo.get("llm", {}).get(
+                "api_key_env", "QUANT_AGENT_LLM_API_KEY")),
+            timeout=int(demo.get("llm", {}).get("timeout", 60)),
+            rag_url=str(demo.get("llm", {}).get(
+                "rag_url", "http://127.0.0.1:8010")),
+            rag_collection=str(demo.get("llm", {}).get(
+                "rag_collection", "financial-reports")),
+        ),
+        market_data=MarketDataConfig(
+            source=str(demo.get("market_data", {}).get("source", "file")),
+            market=str(demo.get("market_data", {}).get("market", "us")),
+            symbols=tuple(demo.get("market_data", {}).get("symbols", []) or []),
         ),
     )
 

@@ -3,7 +3,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-var/test-tmp/
+var/pytest-tmp/
 .coverage
 coverage.xml
 dist/
