@@ -172,21 +172,30 @@ def seed_account_data(data_dir: Path) -> AccountSnapshot:
     from quant_agent.domain.models import Position
 
     as_of = datetime.now(UTC).replace(microsecond=0)
+    positions = (
+        Position(
+            symbol="AAPL",
+            quantity=Decimal("5"),
+            average_price=Decimal("100"),
+            market_price=Decimal("100"),
+            currency="USD",
+        ),
+        Position(
+            symbol="MSFT",
+            quantity=Decimal("5"),
+            average_price=Decimal("195"),
+            market_price=Decimal("196"),
+            currency="USD",
+        ),
+    )
+    equity = Decimal("5000") + sum(p.quantity * p.market_price for p in positions)
     account = AccountSnapshot(
         account_id="paper-demo-account",
         as_of=as_of,
         cash=Decimal("5000"),
-        equity=Decimal("5980"),
+        equity=equity,
         currency="USD",
-        positions=(
-            Position(
-                symbol="MSFT",
-                quantity=Decimal("5"),
-                average_price=Decimal("195"),
-                market_price=Decimal("196"),
-                currency="USD",
-            ),
-        ),
+        positions=positions,
         status="VERIFIED",
         source="simulated-account",
     )
