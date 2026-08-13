@@ -25,3 +25,8 @@ var/research/debug/*.json
 !var/reports/.gitkeep
 !var/audit/.gitkeep
 !var/data/.gitkeep
+
+# 压力/模拟临时市场数据（不入库）
+var/stress-*/
+var/dbg-*/
+var/sim-*/
