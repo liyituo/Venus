@@ -35,8 +35,7 @@ _HISTORY_DAYS = 40
 class SimulatedMarketProvider(FileDataProvider):
     """确定性随机游走模拟市场。now_fn 可注入（测试/压力测试快进时钟）。"""
 
-    def __init__(self, data_dir: Path, symbols: tuple[str, ...] = (),
-                 now_fn=None):
+    def __init__(self, data_dir: Path, symbols: tuple[str, ...] = (), now_fn=None):
         super().__init__(data_dir)
         self.symbols = symbols
         self._now_fn = now_fn or (lambda: datetime.now(UTC).replace(microsecond=0))
@@ -55,7 +54,7 @@ class SimulatedMarketProvider(FileDataProvider):
             bars.extend(self._advance(symbol, history, now))
         snapshot = MarketSnapshot(
             snapshot_id=f"sim-{uuid.uuid4().hex[:8]}",
-            as_of=now,      # 真实当前时刻：永远新鲜且不晚于评估时钟
+            as_of=now,  # 真实当前时刻：永远新鲜且不晚于评估时钟
             source="simulated-market",
             bars=tuple(bars),
         )
@@ -64,12 +63,13 @@ class SimulatedMarketProvider(FileDataProvider):
 
     # ---- 内部 ----
     def _load_previous(self) -> dict[str, list[MarketBar]] | None:
-        from quant_agent.domain.codec import market_snapshot_from_dict
         import json
+
+        from quant_agent.domain.codec import market_snapshot_from_dict
+
         if not self.market_path.exists():
             return None
-        snap = market_snapshot_from_dict(
-            json.loads(self.market_path.read_text(encoding="utf-8")))
+        snap = market_snapshot_from_dict(json.loads(self.market_path.read_text(encoding="utf-8")))
         if snap.source == "simulated-market":
             out: dict[str, list[MarketBar]] = {}
             for b in snap.bars:
@@ -94,8 +94,7 @@ class SimulatedMarketProvider(FileDataProvider):
             bars.append(self._bar(symbol, day, price, currency, i))
         return bars
 
-    def _advance(self, symbol: str, history: list[MarketBar],
-                 now: datetime) -> list[MarketBar]:
+    def _advance(self, symbol: str, history: list[MarketBar], now: datetime) -> list[MarketBar]:
         """从历史最后一天推进到当前日期（bar 时间戳统一当日 00:00 UTC，
         保证 ≤ as_of=now，避免 DATA_TIME_IN_FUTURE）。"""
         if not history:
@@ -112,8 +111,11 @@ class SimulatedMarketProvider(FileDataProvider):
         while day <= target:
             drift = self._daily_return(symbol, day) * vol * price
             price = max(price + drift, base * Decimal("0.2"))
-            bars.append(self._bar(symbol, datetime(
-                day.year, day.month, day.day, tzinfo=UTC), price, currency, seq))
+            bars.append(
+                self._bar(
+                    symbol, datetime(day.year, day.month, day.day, tzinfo=UTC), price, currency, seq
+                )
+            )
             seq += 1
             day += timedelta(days=1)
         return bars
@@ -126,14 +128,19 @@ class SimulatedMarketProvider(FileDataProvider):
         return (Decimal(str(v)) * 2 - 1).quantize(Decimal("0.0001"))
 
     @staticmethod
-    def _bar(symbol: str, day: datetime, price: Decimal, currency: str,
-             seq: int) -> MarketBar:
+    def _bar(symbol: str, day: datetime, price: Decimal, currency: str, seq: int) -> MarketBar:
         return MarketBar(
-            symbol=symbol, timestamp=day,
-            open=price, high=price * (1 + Decimal("0.005")),
+            symbol=symbol,
+            timestamp=day,
+            open=price,
+            high=price * (1 + Decimal("0.005")),
             low=price * (1 - Decimal("0.005")),
-            close=price, volume=Decimal("100000") + seq * 1000,
-            currency=currency, timeframe="1d",
-            source="simulated-market", is_synthetic=True,
-            session="regular", snapshot_id="",
+            close=price,
+            volume=Decimal("100000") + seq * 1000,
+            currency=currency,
+            timeframe="1d",
+            source="simulated-market",
+            is_synthetic=True,
+            session="regular",
+            snapshot_id="",
         )

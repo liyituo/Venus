@@ -2,16 +2,17 @@
 
 全部假 LlmClient / 假 RagClient（不触网）。
 """
+
 from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-
 from quant_agent.domain.enums import SignalDirection
 from quant_agent.domain.models import MarketBar, MarketSnapshot
-from quant_agent.llm.client import LlmConfig, LlmUnavailable
+from quant_agent.infrastructure.config import LlmConfig
+from quant_agent.llm.client import LlmUnavailable
 from quant_agent.strategies.llm_fundamental import (
     LlmFundamentalStrategy,
     _parse_llm_json,
@@ -22,16 +23,24 @@ from quant_agent.strategies.llm_fundamental import (
 def _bar(symbol: str, day: int, close: str) -> MarketBar:
     day_dt = datetime(2026, 8, 1, tzinfo=UTC) + timedelta(days=day)
     return MarketBar(
-        symbol=symbol, timestamp=day_dt,
-        open=Decimal(close), high=Decimal(close), low=Decimal(close),
-        close=Decimal(close), volume=Decimal("1000"),
-        source="test-fixture", is_synthetic=True, snapshot_id="s1",
+        symbol=symbol,
+        timestamp=day_dt,
+        open=Decimal(close),
+        high=Decimal(close),
+        low=Decimal(close),
+        close=Decimal(close),
+        volume=Decimal("1000"),
+        source="test-fixture",
+        is_synthetic=True,
+        snapshot_id="s1",
     )
 
 
 def _snapshot(bars: list[MarketBar]) -> MarketSnapshot:
     return MarketSnapshot(
-        snapshot_id="s1", as_of=bars[-1].timestamp, source="test-fixture",
+        snapshot_id="s1",
+        as_of=bars[-1].timestamp,
+        source="test-fixture",
         bars=tuple(bars),
     )
 
@@ -79,15 +88,31 @@ def _make_strategy(llm, rag=None, audit=None):
 
 # ============ 1. 正常信号 ============
 def test_buy_signal_structure():
-    llm = FakeLlm(json.dumps({
-        "direction": "BUY", "strength": 0.8, "reason_code": "营收超预期",
-        "invalidation_conditions": ["跌破支撑位"],
-    }))
+    llm = FakeLlm(
+        json.dumps(
+            {
+                "direction": "BUY",
+                "strength": 0.8,
+                "reason_code": "营收超预期",
+                "invalidation_conditions": ["跌破支撑位"],
+            }
+        )
+    )
     bars = [_bar("AAPL", i, "100") for i in range(10)]
-    strat = _make_strategy(llm, FakeRag([
-        {"doc_id": "d1", "title": "AAPL 财报", "text": "营收增长 20%",
-         "score": 0.9, "meta": {"symbol": "AAPL", "report_date": "2026-08-01"}},
-    ]))
+    strat = _make_strategy(
+        llm,
+        FakeRag(
+            [
+                {
+                    "doc_id": "d1",
+                    "title": "AAPL 财报",
+                    "text": "营收增长 20%",
+                    "score": 0.9,
+                    "meta": {"symbol": "AAPL", "report_date": "2026-08-01"},
+                },
+            ]
+        ),
+    )
     signals = strat.generate(_snapshot(bars))
     assert len(signals) == 1
     s = signals[0]
@@ -99,7 +124,7 @@ def test_buy_signal_structure():
     # prompt 包含财报与行情
     prompt = llm.calls[0][1]
     assert "AAPL 财报" in prompt and "营收增长 20%" in prompt
-    assert "O=" in prompt    # 行情上下文
+    assert "O=" in prompt  # 行情上下文
 
 
 # ============ 2. 降级三态 ============
@@ -145,10 +170,12 @@ def test_fenced_json_parsed():
 # ============ 4. 防未来函数 ============
 def test_future_report_excluded():
     hits = [
-        {"title": "未来财报", "text": "Q3 预测",
-         "meta": {"report_date": "2026-09-15"}},    # 晚于 as_of(8月10日)
-        {"title": "当期财报", "text": "Q2 营收",
-         "meta": {"report_date": "2026-08-05"}},
+        {
+            "title": "未来财报",
+            "text": "Q3 预测",
+            "meta": {"report_date": "2026-09-15"},
+        },  # 晚于 as_of(8月10日)
+        {"title": "当期财报", "text": "Q2 营收", "meta": {"report_date": "2026-08-05"}},
     ]
     as_of = datetime(2026, 8, 10, tzinfo=UTC)
     ctx = _reports_context(hits, as_of)
@@ -159,12 +186,20 @@ def test_future_report_excluded():
 # ============ 5. 审计（无密钥）===========
 def test_audit_events_recorded_without_key():
     audit = FakeAudit()
-    strat = _make_strategy(FakeLlm(json.dumps({"direction": "BUY", "strength": 0.5,
-                                               "reason_code": "OK",
-                                               "invalidation_conditions": ["x"]})),
-                           FakeRag([{"title": "r", "text": "t", "score": 1,
-                                     "meta": {"symbol": "AAPL"}}]),
-                           audit=audit)
+    strat = _make_strategy(
+        FakeLlm(
+            json.dumps(
+                {
+                    "direction": "BUY",
+                    "strength": 0.5,
+                    "reason_code": "OK",
+                    "invalidation_conditions": ["x"],
+                }
+            )
+        ),
+        FakeRag([{"title": "r", "text": "t", "score": 1, "meta": {"symbol": "AAPL"}}]),
+        audit=audit,
+    )
     bars = [_bar("AAPL", i, "100") for i in range(10)]
     strat.generate(_snapshot(bars))
     assert audit.events, "审计事件未记录"
@@ -180,26 +215,52 @@ def test_rag_unavailable_prompt_has_no_reports():
     class DownRag:
         def search(self, query, **kw):
             return []
+
         def available(self):
             return False
 
-    strat = _make_strategy(FakeLlm(json.dumps({"direction": "HOLD", "strength": 0,
-                                               "reason_code": "NO_EVIDENCE",
-                                               "invalidation_conditions": ["x"]})),
-                           DownRag())
+    strat = _make_strategy(
+        FakeLlm(
+            json.dumps(
+                {
+                    "direction": "HOLD",
+                    "strength": 0,
+                    "reason_code": "NO_EVIDENCE",
+                    "invalidation_conditions": ["x"],
+                }
+            )
+        ),
+        DownRag(),
+    )
     bars = [_bar("AAPL", i, "100") for i in range(10)]
     # 断言 RAG 不可达时 prompt 不含财报片段
-    llm = FakeLlm(json.dumps({"direction": "HOLD", "strength": 0,
-                              "reason_code": "NO_EVIDENCE",
-                              "invalidation_conditions": ["x"]}))
+    llm = FakeLlm(
+        json.dumps(
+            {
+                "direction": "HOLD",
+                "strength": 0,
+                "reason_code": "NO_EVIDENCE",
+                "invalidation_conditions": ["x"],
+            }
+        )
+    )
     strat = _make_strategy(llm, DownRag())
     strat.generate(_snapshot(bars))
     prompt = llm.calls[0][1]
     assert "财报要点" not in prompt and "无财报上下文" in prompt
-    s = _make_strategy(FakeLlm(json.dumps({"direction": "HOLD", "strength": 0,
-                                           "reason_code": "NO_EVIDENCE",
-                                           "invalidation_conditions": ["x"]})),
-                       DownRag()).generate(_snapshot(bars))[0]
+    s = _make_strategy(
+        FakeLlm(
+            json.dumps(
+                {
+                    "direction": "HOLD",
+                    "strength": 0,
+                    "reason_code": "NO_EVIDENCE",
+                    "invalidation_conditions": ["x"],
+                }
+            )
+        ),
+        DownRag(),
+    ).generate(_snapshot(bars))[0]
     assert s.direction == SignalDirection.HOLD
 
 

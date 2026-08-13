@@ -11,24 +11,13 @@ import json
 import os
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
+
+from quant_agent.infrastructure.config import LlmConfig
 
 
 class LlmUnavailable(Exception):
     """LLM 不可用（网络/认证/上游错误），策略层据此降级为 HOLD。"""
-
-
-@dataclass(frozen=True)
-class LlmConfig:
-    api_url: str = ""            # 空 = 未配置（策略层直接降级）
-    model: str = ""
-    api_key_env: str = "QUANT_AGENT_LLM_API_KEY"
-    timeout: int = 60
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.api_url and self.model)
 
 
 class LlmClient:
@@ -73,8 +62,15 @@ class LlmClient:
             headers["Authorization"] = f"Bearer {self._key}"
         return headers
 
-    def complete(self, system: str, user: str, *, max_tokens: int = 800,
-                 temperature: float = 0.2, thinking_disabled: bool = False) -> str:
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 800,
+        temperature: float = 0.2,
+        thinking_disabled: bool = False,
+    ) -> str:
         """非流式调用，返回 content 文本；失败抛 LlmUnavailable（不含 key 信息）。
 
         thinking_disabled=True 时注入 thinking:{"type":"disabled"}：
@@ -97,7 +93,9 @@ class LlmClient:
         req = urllib.request.Request(
             self._url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=self._headers(), method="POST")
+            headers=self._headers(),
+            method="POST",
+        )
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))

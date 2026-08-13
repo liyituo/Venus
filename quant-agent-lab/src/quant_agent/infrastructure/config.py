@@ -57,6 +57,7 @@ class PaperBrokerConfig:
 @dataclass(frozen=True)
 class LlmConfig:
     """LLM 决策层配置（key 走环境变量，绝不进配置文件）。"""
+
     api_url: str = ""
     model: str = ""
     api_key_env: str = "QUANT_AGENT_LLM_API_KEY"
@@ -72,8 +73,9 @@ class LlmConfig:
 @dataclass(frozen=True)
 class MarketDataConfig:
     """行情数据源：file（本地 JSON/CSV，默认）/ live（自动拉取）。"""
-    source: str = "file"          # file | live
-    market: str = "us"            # us | cn | both
+
+    source: str = "file"  # file | live
+    market: str = "us"  # us | cn | both
     symbols: tuple[str, ...] = ()
 
 
@@ -147,13 +149,10 @@ def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
         llm=LlmConfig(
             api_url=str(demo.get("llm", {}).get("api_url", "")),
             model=str(demo.get("llm", {}).get("model", "")),
-            api_key_env=str(demo.get("llm", {}).get(
-                "api_key_env", "QUANT_AGENT_LLM_API_KEY")),
+            api_key_env=str(demo.get("llm", {}).get("api_key_env", "QUANT_AGENT_LLM_API_KEY")),
             timeout=int(demo.get("llm", {}).get("timeout", 60)),
-            rag_url=str(demo.get("llm", {}).get(
-                "rag_url", "http://127.0.0.1:8010")),
-            rag_collection=str(demo.get("llm", {}).get(
-                "rag_collection", "financial-reports")),
+            rag_url=str(demo.get("llm", {}).get("rag_url", "http://127.0.0.1:8010")),
+            rag_collection=str(demo.get("llm", {}).get("rag_collection", "financial-reports")),
         ),
         market_data=MarketDataConfig(
             source=str(demo.get("market_data", {}).get("source", "file")),

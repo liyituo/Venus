@@ -33,6 +33,7 @@ from quant_agent.reporting.narrative import DeterministicNarrativeProvider
 from quant_agent.reporting.renderer import write_report
 from quant_agent.research.service import ResearchService
 from quant_agent.risk.engine import RiskEngine
+from quant_agent.strategies.base import Strategy
 from quant_agent.strategies.llm_fundamental import LlmFundamentalStrategy
 from quant_agent.strategies.moving_average import MovingAverageStrategy
 
@@ -59,25 +60,34 @@ class ApplicationService:
             )
         # 行情源：file（默认）/ simulated（离线模拟市场，每日自动推进）/
         # live（yfinance+akshare 自动拉取，失败回退缓存）
+        self.provider: FileDataProvider
         if self.config.market_data.source == "live":
             from quant_agent.data.live_provider import LiveMarketDataProvider
+
             self.provider = LiveMarketDataProvider(
-                self.paths.data_dir, market=self.config.market_data.market,
-                symbols=self.config.market_data.symbols)
+                self.paths.data_dir,
+                market=self.config.market_data.market,
+                symbols=self.config.market_data.symbols,
+            )
         elif self.config.market_data.source == "simulated":
             from quant_agent.data.simulated_provider import SimulatedMarketProvider
+
             self.provider = SimulatedMarketProvider(
-                self.paths.data_dir, symbols=self.config.market_data.symbols)
+                self.paths.data_dir, symbols=self.config.market_data.symbols
+            )
         else:
             self.provider = FileDataProvider(self.paths.data_dir)
         self.audit = AuditLogger(self.store, self.clock)
         # 策略工厂：按 config.strategy.id 选择（默认 MA；llm-fundamental 走 LLM 决策层）
+        self.strategy: Strategy
         if self.config.strategy.strategy_id == "llm-fundamental":
             self.strategy = LlmFundamentalStrategy(
-                self.config.llm, LlmClient(self.config.llm),
-                RagClient(self.config.llm.rag_url,
-                          self.config.llm.rag_collection),
-                audit=self.audit, clock=self.clock)
+                self.config.llm,
+                LlmClient(self.config.llm),
+                RagClient(self.config.llm.rag_url, self.config.llm.rag_collection),
+                audit=self.audit,
+                clock=self.clock,
+            )
         else:
             self.strategy = MovingAverageStrategy(self.config.strategy)
         self.planner = PortfolioPlanner(self.config.portfolio)
@@ -119,6 +129,7 @@ class ApplicationService:
     def seed_account(self, *, reset_runtime: bool = False) -> dict[str, str]:
         """只写账户快照（simulated/live 行情模式用；行情由 provider 提供）。"""
         from quant_agent.data.providers import seed_account_data
+
         if reset_runtime:
             self.store.reset_runtime()
             self.store.set_kill_switch(False, "demo reset", "system")

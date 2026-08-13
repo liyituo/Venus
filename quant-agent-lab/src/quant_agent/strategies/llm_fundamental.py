@@ -20,7 +20,8 @@ from decimal import Decimal, InvalidOperation
 
 from quant_agent.domain.enums import SignalDirection
 from quant_agent.domain.models import MarketBar, MarketSnapshot, StrategySignal
-from quant_agent.llm.client import LlmClient, LlmConfig, LlmUnavailable
+from quant_agent.infrastructure.config import LlmConfig
+from quant_agent.llm.client import LlmClient, LlmUnavailable
 from quant_agent.llm.rag_client import RagClient
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
@@ -42,11 +43,14 @@ _SYSTEM_PROMPT = (
 
 def _market_context(bars: list[MarketBar], lookback: int = _PRICE_LOOKBACK) -> str:
     window = bars[-lookback:]
-    lines = [f"行情（{bars[0].timestamp.date() if bars else '?'} → "
-             f"{bars[-1].timestamp.date() if bars else '?'}，共 {len(window)} 日）："]
+    lines = [
+        f"行情（{bars[0].timestamp.date() if bars else '?'} → "
+        f"{bars[-1].timestamp.date() if bars else '?'}，共 {len(window)} 日）："
+    ]
     for b in window:
-        lines.append(f"{b.timestamp.date()} O={b.open} H={b.high} L={b.low} "
-                     f"C={b.close} V={b.volume}")
+        lines.append(
+            f"{b.timestamp.date()} O={b.open} H={b.high} L={b.low} C={b.close} V={b.volume}"
+        )
     return "\n".join(lines)
 
 
@@ -54,12 +58,12 @@ def _reports_context(hits: list[dict], as_of: datetime) -> str:
     """财报片段；防未来函数：report_date 晚于 as_of 的丢弃。"""
     kept = []
     for h in hits:
-        rd = ((h.get("meta") or {}).get("report_date") or "")
+        rd = (h.get("meta") or {}).get("report_date") or ""
         if rd:
             try:
                 report_dt = datetime.fromisoformat(str(rd)[:10])
                 if report_dt.date() > as_of.date():
-                    continue    # 未来财报不得进入 prompt
+                    continue  # 未来财报不得进入 prompt
             except ValueError:
                 pass
         kept.append(h)
@@ -94,12 +98,19 @@ class LlmFundamentalStrategy:
     strategy_id = "llm-fundamental"
     version = "1.0.0"
 
-    def __init__(self, llm_config: LlmConfig, llm: LlmClient, rag: RagClient,
-                 audit=None, clock=None, version: str = "1.0.0"):
+    def __init__(
+        self,
+        llm_config: LlmConfig,
+        llm: LlmClient,
+        rag: RagClient,
+        audit=None,
+        clock=None,
+        version: str = "1.0.0",
+    ):
         self.config = llm_config
         self.llm = llm
         self.rag = rag
-        self.audit = audit          # AuditLogger | None
+        self.audit = audit  # AuditLogger | None
         self.clock = clock
         self.version = version
 
@@ -110,20 +121,26 @@ class LlmFundamentalStrategy:
         return tuple(signals)
 
     # ---- 单 symbol 信号 ----
-    def _signal_for(self, symbol: str, bars: tuple[MarketBar, ...],
-                    market: MarketSnapshot) -> StrategySignal:
+    def _signal_for(
+        self, symbol: str, bars: tuple[MarketBar, ...], market: MarketSnapshot
+    ) -> StrategySignal:
         end = market.as_of
         start = bars[0].timestamp if bars else end
         ref_price = bars[-1].close if bars else Decimal("0")
 
         def _hold(reason: str, extra: str = "") -> StrategySignal:
             return StrategySignal(
-                symbol=symbol, direction=SignalDirection.HOLD,
-                strength=Decimal("0"), reason_code=reason,
-                input_start=start, input_end=end,
-                strategy_id=self.strategy_id, strategy_version=self.version,
+                symbol=symbol,
+                direction=SignalDirection.HOLD,
+                strength=Decimal("0"),
+                reason_code=reason,
+                input_start=start,
+                input_end=end,
+                strategy_id=self.strategy_id,
+                strategy_version=self.version,
                 invalidation_conditions=("新的有效行情或财报改变判断",),
-                reference_price=ref_price)
+                reference_price=ref_price,
+            )
 
         if len(bars) < 2 or ref_price <= 0:
             return _hold("INSUFFICIENT_DATA")
@@ -131,20 +148,21 @@ class LlmFundamentalStrategy:
             return _hold("LLM_NOT_CONFIGURED")
 
         market_ctx = _market_context(list(bars))
-        reports = self.rag.search(f"{symbol} 财报 营收 利润 基本面", top_k=5,
-                                  symbol=symbol)
+        reports = self.rag.search(f"{symbol} 财报 营收 利润 基本面", top_k=5, symbol=symbol)
         reports_ctx = _reports_context(reports, end)
-        user = f"股票：{symbol}\n\n{market_ctx}\n\n{reports_ctx or '（无财报上下文：仅基于行情判断）'}"
+        user = (
+            f"股票：{symbol}\n\n{market_ctx}\n\n{reports_ctx or '（无财报上下文：仅基于行情判断）'}"
+        )
         try:
             # 信号 JSON 很短（≤300 tokens）；关闭推理（flash 是推理模型，
             # 不关闭时 max_tokens 会被 reasoning 占满导致 content 空）
-            raw = self.llm.complete(_SYSTEM_PROMPT, user, max_tokens=400,
-                                    thinking_disabled=True)
+            raw = self.llm.complete(_SYSTEM_PROMPT, user, max_tokens=400, thinking_disabled=True)
             parsed = _parse_llm_json(raw)
             if parsed is None:
                 # 偶发坏输出：重试一次（截断/格式抖动），仍失败才降级
-                raw = self.llm.complete(_SYSTEM_PROMPT, user, max_tokens=400,
-                                        thinking_disabled=True)
+                raw = self.llm.complete(
+                    _SYSTEM_PROMPT, user, max_tokens=400, thinking_disabled=True
+                )
                 parsed = _parse_llm_json(raw)
         except LlmUnavailable as exc:
             if self.audit is not None:
@@ -171,21 +189,30 @@ class LlmFundamentalStrategy:
         if self.audit is not None:
             self._audit(symbol, user, f"{direction.value} {reason}", direction.value)
         return StrategySignal(
-            symbol=symbol, direction=direction, strength=strength,
-            reason_code=reason, input_start=start, input_end=end,
-            strategy_id=self.strategy_id, strategy_version=self.version,
-            invalidation_conditions=invalidation, reference_price=ref_price)
+            symbol=symbol,
+            direction=direction,
+            strength=strength,
+            reason_code=reason,
+            input_start=start,
+            input_end=end,
+            strategy_id=self.strategy_id,
+            strategy_version=self.version,
+            invalidation_conditions=invalidation,
+            reference_price=ref_price,
+        )
 
     def _audit(self, symbol: str, prompt: str, result: str, reason: str) -> None:
         """LLM 决策审计（不含 API key；摘要截断 500 字符）。"""
         try:
             self.audit.record(
-                "llm_signal.generated", actor="llm-fundamental",
+                "llm_signal.generated",
+                actor="llm-fundamental",
                 reason_code=reason,
                 input_summary=f"{symbol}: {prompt[:500]}",
-                result_summary=result[:500])
+                result_summary=result[:500],
+            )
         except Exception:
-            pass    # 审计失败不影响信号生成
+            pass  # 审计失败不影响信号生成
 
 
 def _safe_strength(value) -> Decimal:

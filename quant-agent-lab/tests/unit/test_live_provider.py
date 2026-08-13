@@ -2,6 +2,7 @@
 
 全部 mock yfinance/akshare 模块（不触网）。
 """
+
 from __future__ import annotations
 
 import json
@@ -48,8 +49,9 @@ def _fake_yfinance_df():
     start = datetime(2026, 7, 1, tzinfo=UTC)
     for i in range(5):
         ts = start + timedelta(days=i)
-        rows.append({"__ts": ts, "Open": 100.0, "High": 101.0,
-                     "Low": 99.0, "Close": 100.5, "Volume": 1000})
+        rows.append(
+            {"__ts": ts, "Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1000}
+        )
     return FakeDF(rows)
 
 
@@ -57,7 +59,7 @@ def _fake_yfinance_df():
 def test_cn_symbol_detection():
     assert _is_cn_symbol("600519")
     assert not _is_cn_symbol("AAPL")
-    assert not _is_cn_symbol("600519.SH")   # 带后缀按美股处理（调用方负责归一化）
+    assert not _is_cn_symbol("600519.SH")  # 带后缀按美股处理（调用方负责归一化）
 
 
 # ============ yfinance 转换 ============
@@ -81,19 +83,38 @@ def test_yfinance_conversion(tmp_path):
 
 # ============ akshare 转换 ============
 def test_akshare_conversion(tmp_path):
-    df = FakeDF([
-        {"日期": "2026-07-01", "开盘": 10.0, "最高": 11.0, "最低": 9.0,
-         "收盘": 10.5, "成交量": 500},
-        {"日期": "2026-07-02", "开盘": 10.0, "最高": 11.0, "最低": 9.0,
-         "收盘": 10.5, "成交量": 500},
-        {"日期": "2026-07-03", "开盘": 10.0, "最高": 11.0, "最低": 9.0,
-         "收盘": 10.5, "成交量": 500},
-    ])
+    df = FakeDF(
+        [
+            {
+                "日期": "2026-07-01",
+                "开盘": 10.0,
+                "最高": 11.0,
+                "最低": 9.0,
+                "收盘": 10.5,
+                "成交量": 500,
+            },
+            {
+                "日期": "2026-07-02",
+                "开盘": 10.0,
+                "最高": 11.0,
+                "最低": 9.0,
+                "收盘": 10.5,
+                "成交量": 500,
+            },
+            {
+                "日期": "2026-07-03",
+                "开盘": 10.0,
+                "最高": 11.0,
+                "最低": 9.0,
+                "收盘": 10.5,
+                "成交量": 500,
+            },
+        ]
+    )
     fake_ak = ModuleType("akshare")
     fake_ak.stock_zh_a_hist = mock.Mock(return_value=df)
     with mock.patch.dict(sys.modules, {"akshare": fake_ak}):
-        snap = LiveMarketDataProvider(
-            tmp_path, market="cn", symbols=("600519",)).load_market()
+        snap = LiveMarketDataProvider(tmp_path, market="cn", symbols=("600519",)).load_market()
     assert len(snap.bars) == 3
     assert snap.bars[0].currency == "CNY"
     assert snap.bars[0].source == "akshare"
