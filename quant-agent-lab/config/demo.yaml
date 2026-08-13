@@ -1,7 +1,7 @@
 version: demo-v1
 local_timezone: Asia/Shanghai
 strategy:
-  id: moving-average-demo
+  id: llm-fundamental
   version: 1.0.0
   fast_window: 3
   slow_window: 5
@@ -19,8 +19,8 @@ paper_broker:
 # ---- LLM 基本面信号（llm-fundamental 策略）----
 # key 从环境变量 QUANT_AGENT_LLM_API_KEY 读取（绝不写进本文件/日志/审计）
 llm:
-  api_url: ""
-  model: ""
+  api_url: "https://api.deepseek.com"
+  model: "deepseek-v4-flash"
   api_key_env: QUANT_AGENT_LLM_API_KEY
   timeout: 60
   rag_url: http://127.0.0.1:8010

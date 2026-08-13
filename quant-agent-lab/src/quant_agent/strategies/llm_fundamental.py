@@ -136,13 +136,21 @@ class LlmFundamentalStrategy:
         reports_ctx = _reports_context(reports, end)
         user = f"股票：{symbol}\n\n{market_ctx}\n\n{reports_ctx or '（无财报上下文：仅基于行情判断）'}"
         try:
-            raw = self.llm.complete(_SYSTEM_PROMPT, user)
+            # 信号 JSON 很短（≤300 tokens）；关闭推理（flash 是推理模型，
+            # 不关闭时 max_tokens 会被 reasoning 占满导致 content 空）
+            raw = self.llm.complete(_SYSTEM_PROMPT, user, max_tokens=400,
+                                    thinking_disabled=True)
+            parsed = _parse_llm_json(raw)
+            if parsed is None:
+                # 偶发坏输出：重试一次（截断/格式抖动），仍失败才降级
+                raw = self.llm.complete(_SYSTEM_PROMPT, user, max_tokens=400,
+                                        thinking_disabled=True)
+                parsed = _parse_llm_json(raw)
         except LlmUnavailable as exc:
             if self.audit is not None:
                 self._audit(symbol, user, f"LLM_UNAVAILABLE: {exc}", "HOLD")
             return _hold("LLM_UNAVAILABLE")
 
-        parsed = _parse_llm_json(raw)
         if parsed is None:
             if self.audit is not None:
                 self._audit(symbol, user, f"非法输出: {raw[:200]}", "HOLD")

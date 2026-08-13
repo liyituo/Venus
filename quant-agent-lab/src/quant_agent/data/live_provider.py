@@ -27,6 +27,28 @@ def _is_cn_symbol(symbol: str) -> bool:
     return symbol.isdigit()
 
 
+def _ensure_curl_ca() -> None:
+    """curl_cffi 无法加载含非 ASCII 字符路径的 CAfile（项目在中文路径下时
+    certifi 路径含中文 → SSL trust anchor 错误）。复制 CA 到纯 ASCII 路径并
+    设置 CURL_CA_BUNDLE（幂等：已存在则复用）。"""
+    import os
+    if os.environ.get("CURL_CA_BUNDLE"):
+        return
+    try:
+        import certifi
+        ca_src = certifi.where()
+        if all(ord(c) < 128 for c in ca_src):
+            os.environ["CURL_CA_BUNDLE"] = ca_src
+            return
+        ascii_ca = os.path.join(os.path.expanduser("~"), "cacert.pem")
+        if not os.path.exists(ascii_ca):
+            import shutil
+            shutil.copy(ca_src, ascii_ca)
+        os.environ["CURL_CA_BUNDLE"] = ascii_ca
+    except Exception:
+        pass    # 证书设置失败让 yfinance 自行报错（保持降级语义）
+
+
 class MarketDataUnavailable(Exception):
     """行情拉取失败且无缓存可回退。"""
 
@@ -94,6 +116,7 @@ class LiveMarketDataProvider(FileDataProvider):
         return self._fetch_yfinance(symbol)
 
     def _fetch_yfinance(self, symbol: str) -> list[MarketBar]:
+        _ensure_curl_ca()        # 中文路径 CA 修复（幂等）
         import yfinance as yf     # lazy：未安装才报错
         df = yf.download(symbol, period=_LOOKBACK_DAYS, interval="1d",
                          progress=False, auto_adjust=True)

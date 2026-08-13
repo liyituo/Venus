@@ -34,6 +34,20 @@ class LlmClient:
     def __init__(self, config: LlmConfig):
         self.config = config
         self._key = (os.environ.get(config.api_key_env) or "").strip()
+        self._url = self._normalize_url(config.api_url)
+
+    @staticmethod
+    def _normalize_url(raw: str) -> str:
+        """归一化为完整 /v1/chat/completions 端点（与主项目一致）：
+        base 域名 / 带 /v1 / 带 /chat/completions 任意填法均可。"""
+        url = (raw or "").strip().rstrip("/")
+        if not url:
+            return ""
+        if url.endswith("/chat/completions"):
+            return url
+        if url.endswith("/v1"):
+            return url + "/chat/completions"
+        return url + "/v1/chat/completions"
 
     def _headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -42,8 +56,13 @@ class LlmClient:
         return headers
 
     def complete(self, system: str, user: str, *, max_tokens: int = 800,
-                 temperature: float = 0.2) -> str:
-        """非流式调用，返回 content 文本；失败抛 LlmUnavailable（不含 key 信息）。"""
+                 temperature: float = 0.2, thinking_disabled: bool = False) -> str:
+        """非流式调用，返回 content 文本；失败抛 LlmUnavailable（不含 key 信息）。
+
+        thinking_disabled=True 时注入 thinking:{"type":"disabled"}：
+        DeepSeek 推理模型若不关闭推理，max_tokens 会被 reasoning 占满
+        导致 content 为空（结构化输出场景必须关闭）。
+        """
         if not self.config.enabled:
             raise LlmUnavailable("LLM 未配置（api_url/model 为空）")
         payload = {
@@ -55,8 +74,10 @@ class LlmClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if thinking_disabled:
+            payload["thinking"] = {"type": "disabled"}
         req = urllib.request.Request(
-            self.config.api_url,
+            self._url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=self._headers(), method="POST")
         try:
