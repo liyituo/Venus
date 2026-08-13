@@ -33,15 +33,17 @@ _HISTORY_DAYS = 40
 
 
 class SimulatedMarketProvider(FileDataProvider):
-    """确定性随机游走模拟市场。"""
+    """确定性随机游走模拟市场。now_fn 可注入（测试/压力测试快进时钟）。"""
 
-    def __init__(self, data_dir: Path, symbols: tuple[str, ...] = ()):
+    def __init__(self, data_dir: Path, symbols: tuple[str, ...] = (),
+                 now_fn=None):
         super().__init__(data_dir)
         self.symbols = symbols
+        self._now_fn = now_fn or (lambda: datetime.now(UTC).replace(microsecond=0))
 
     def load_market(self) -> MarketSnapshot:
         symbols = list(self.symbols) or ["AAPL", "MSFT"]
-        now = datetime.now(UTC).replace(microsecond=0)
+        now = self._now_fn()
         prev = self._load_previous()
 
         bars: list[MarketBar] = []
