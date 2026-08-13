@@ -12,6 +12,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class LlmUnavailable(Exception):
@@ -33,8 +34,25 @@ class LlmConfig:
 class LlmClient:
     def __init__(self, config: LlmConfig):
         self.config = config
-        self._key = (os.environ.get(config.api_key_env) or "").strip()
+        self._key = self._load_key(config.api_key_env)
         self._url = self._normalize_url(config.api_url)
+
+    @staticmethod
+    def _load_key(env_name: str) -> str:
+        """环境变量优先；否则读项目根 .env（轻量解析，不引 dotenv 依赖）。"""
+        val = (os.environ.get(env_name) or "").strip()
+        if val:
+            return val
+        # quant-agent-lab/.env（client.py → parents[3] = quant-agent-lab）
+        env_file = Path(__file__).resolve().parents[3] / ".env"
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{env_name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+        return ""
 
     @staticmethod
     def _normalize_url(raw: str) -> str:

@@ -162,3 +162,34 @@ def seed_demo_data(data_dir: Path) -> tuple[MarketSnapshot, AccountSnapshot]:
     provider.save_market(market)
     provider.save_account(account)
     return market, account
+
+
+def seed_account_data(data_dir: Path) -> AccountSnapshot:
+    """只写账户快照（行情由 provider 提供：simulated/live 模式用）。
+
+    as_of 用当前时刻——避免静态日期触发 DATA_STALE。
+    """
+    from quant_agent.domain.models import Position
+
+    as_of = datetime.now(UTC).replace(microsecond=0)
+    account = AccountSnapshot(
+        account_id="paper-demo-account",
+        as_of=as_of,
+        cash=Decimal("5000"),
+        equity=Decimal("5980"),
+        currency="USD",
+        positions=(
+            Position(
+                symbol="MSFT",
+                quantity=Decimal("5"),
+                average_price=Decimal("195"),
+                market_price=Decimal("196"),
+                currency="USD",
+            ),
+        ),
+        status="VERIFIED",
+        source="simulated-account",
+    )
+    provider = FileDataProvider(data_dir)
+    provider.save_account(account)
+    return account

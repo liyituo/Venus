@@ -28,6 +28,6 @@ llm:
 
 # ---- 行情数据源：file（默认，本地 JSON）/ live（yfinance+akshare 自动拉取）----
 market_data:
-  source: file
+  source: simulated
   market: us
   symbols: []

@@ -64,6 +64,10 @@ class LlmConfig:
     rag_url: str = "http://127.0.0.1:8010"
     rag_collection: str = "financial-reports"
 
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_url and self.model)
+
 
 @dataclass(frozen=True)
 class MarketDataConfig:

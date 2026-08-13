@@ -57,12 +57,17 @@ class ApplicationService:
             self.store.set_kill_switch(
                 self.config.risk.kill_switch_default, "configured default", "system"
             )
-        # 行情源：file（默认）/ live（yfinance+akshare 自动拉取，失败回退缓存）
+        # 行情源：file（默认）/ simulated（离线模拟市场，每日自动推进）/
+        # live（yfinance+akshare 自动拉取，失败回退缓存）
         if self.config.market_data.source == "live":
             from quant_agent.data.live_provider import LiveMarketDataProvider
             self.provider = LiveMarketDataProvider(
                 self.paths.data_dir, market=self.config.market_data.market,
                 symbols=self.config.market_data.symbols)
+        elif self.config.market_data.source == "simulated":
+            from quant_agent.data.simulated_provider import SimulatedMarketProvider
+            self.provider = SimulatedMarketProvider(
+                self.paths.data_dir, symbols=self.config.market_data.symbols)
         else:
             self.provider = FileDataProvider(self.paths.data_dir)
         self.audit = AuditLogger(self.store, self.clock)
@@ -110,6 +115,21 @@ class ApplicationService:
             "account_id": account.account_id,
             "data_dir": str(self.paths.data_dir),
         }
+
+    def seed_account(self, *, reset_runtime: bool = False) -> dict[str, str]:
+        """只写账户快照（simulated/live 行情模式用；行情由 provider 提供）。"""
+        from quant_agent.data.providers import seed_account_data
+        if reset_runtime:
+            self.store.reset_runtime()
+            self.store.set_kill_switch(False, "demo reset", "system")
+        account = seed_account_data(self.paths.data_dir)
+        self.audit.record(
+            "data.seeded",
+            reason_code="ACCOUNT_ONLY",
+            input_summary=f"account={account.account_id}",
+            result_summary="account data written; market left to provider",
+        )
+        return {"account_id": account.account_id, "data_dir": str(self.paths.data_dir)}
 
     def _blocked_decision(self, issues: tuple[ValidationIssue, ...]) -> RiskDecision:
         checks_list: list[RiskCheck] = []
@@ -411,7 +431,12 @@ class ApplicationService:
         }
 
     def demo(self, report_date: str | date | None = None) -> dict[str, object]:
-        self.seed_demo(reset_runtime=True)
+        # 行情源选择：file 用 seed 静态数据；simulated/live 由 provider 自己
+        # 提供新鲜行情（seed 只负责账户与运行时状态）
+        if self.config.market_data.source == "file":
+            self.seed_demo(reset_runtime=True)
+        else:
+            self.seed_account(reset_runtime=True)
         report = self.generate_report(report_date, request_id="demo")
         if not report.plan.risk_decision.allowed_order_ids:
             raise DataValidationError("demo report was blocked; see generated report")
