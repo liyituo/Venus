@@ -183,9 +183,12 @@ class LlmFundamentalStrategy:
             return _hold("LLM_BAD_OUTPUT")
         strength = _safe_strength(parsed.get("strength"))
         reason = str(parsed.get("reason_code") or "LLM_SIGNAL")[:_MAX_REASON]
-        invalidation = tuple(
-            str(c)[:120] for c in (parsed.get("invalidation_conditions") or [])
-        ) or ("新的有效行情或财报改变判断",)
+        raw_inv = parsed.get("invalidation_conditions")
+        if not isinstance(raw_inv, list):
+            raw_inv = []
+        invalidation = tuple(str(c).strip()[:120] for c in raw_inv if str(c).strip()) or (
+            "新的有效行情或财报改变判断",
+        )
         if self.audit is not None:
             self._audit(symbol, user, f"{direction.value} {reason}", direction.value)
         return StrategySignal(

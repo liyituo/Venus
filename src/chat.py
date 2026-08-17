@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import logging
+import uuid
 import tkinter as tk
 
 log = logging.getLogger("chat")
@@ -1880,7 +1881,7 @@ class ChatApp:
         def _do():
             code, data, _ = api_request(
                 self.llm_url, "POST", f"/api/v1/sessions/{sid}/messages",
-                {"messages": msgs, "request_id": f"chat-{sid}-{int(time.time() * 1000)}"},
+                {"messages": msgs, "request_id": f"chat-{sid}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:4]}"},
                 timeout=5)
             if code not in (200, 404):
                 detail = (data or {}).get("detail", f"HTTP {code}")
@@ -2059,7 +2060,7 @@ class ChatApp:
         sess = self._sessions.get(self._current_sid) or {}
         body = {"messages": snapshot, "agent": True,
                 "session_id": self._current_sid,
-                "request_id": f"chat-{task_id}",
+                "request_id": f"chat-{task_id}-{uuid.uuid4().hex[:6]}",
                 "workspace": str(load_config().get("workspace") or ""),
                 "session_version": int(sess.get("version") or 0)}
         req = urllib.request.Request(

@@ -828,7 +828,7 @@ def codegraph_impact(workspace_root, target: str, depth: int = 1) -> dict:
     # 目标自身符号集
     own_symbols = {s["name"] for s in files.get(target_key, {}).get("symbols", [])}
     for rel, f in files.items():
-        if rel == target_norm:
+        if rel.replace("\\", "/") == target_norm:
             continue
         calls = f.get("calls") or {}
         imported_aliases = {i.get("alias", "") for i in f.get("imports", [])}
@@ -874,7 +874,10 @@ _SECRET_RE = re.compile(r"(sk-[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|"
                         r"token\s*[:=]\s*['\"]?[A-Za-z0-9]{16,}|cookie\s*[:=])", re.I)
 
 _PREF_RE = re.compile(r"(?:我)?(?:喜欢|偏好|习惯|想要|希望|更愿意|倾向于)")
-_CONSTRAINT_RE = re.compile(r"(?:请|你要|你)?(?:不要|别|不能|禁止|必须|务必|记住|以后)")
+# "别" 单独匹配会误杀「区别/级别/特别/别人」等常见词：只匹配「别」后接动作动词
+_CONSTRAINT_RE = re.compile(
+    r"(?:请|你要|你)?(?:不要|别(?=[用做动改碰管提再说去来写删加放开搞尝试])|不能|禁止|必须|务必|记住|以后)"
+)
 _DECISION_RE = re.compile(r"(?:我们|我)?(?:决定|确定|定了|就用|选)")
 
 _RULE_TYPES = (

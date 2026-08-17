@@ -233,7 +233,10 @@ def reduce_tool_result(name: str, args: dict, result: str, ok: bool,
 
     result_id = None
     if store is not None:
-        result_id = new_result_id(name, result)
+        # 随机盐：result_id 不可预测（内容 hash 是确定性可计算的，
+        # 直接暴露会让其他会话/任务可猜测并取回完整结果——M3）
+        import uuid
+        result_id = f"{new_result_id(name, result)}-{uuid.uuid4().hex[:8]}"
         store.put(result_id, {"name": name, "ok": ok, "chars": orig_len}, result)
     reduced += (f"\n\n[完整结果 {orig_len} 字符/{n_lines} 行已省略，"
                 f"可用 fetch_result 按 id 查看：{result_id or '未存储'}]")

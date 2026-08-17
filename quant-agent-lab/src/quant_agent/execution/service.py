@@ -85,7 +85,8 @@ class ExecutionService:
             raise RiskBlockedError("kill switch is enabled")
         approval = self.approvals.validate(report, approval)
         account = self.provider.load_account()
-        market = self.provider.load_market()
+        loader = getattr(self.provider, "load_market_or_cache", None)
+        market = loader() if loader is not None else self.provider.load_market()
         validation_issues = validate_market(
             market,
             self.clock.now(),

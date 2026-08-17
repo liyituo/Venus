@@ -79,6 +79,8 @@ class LlmClient:
         """
         if not self.config.enabled:
             raise LlmUnavailable("LLM 未配置（api_url/model 为空）")
+        if not self._url:
+            raise LlmUnavailable("LLM 未配置（api_url 为空）")
         payload = {
             "model": self.config.model,
             "messages": [

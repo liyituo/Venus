@@ -2126,6 +2126,12 @@ def _call_upstream_raw(api_url: str, payload: dict, headers: dict) -> dict:
         with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         _record_usage(data.get("usage"))
+        # 结构校验：200 但形状异常（代理网关的错误包装/空 choices）必须在此
+        # 转为 LlmError，否则调用方 KeyError 会让 SSE 永久挂起（H1）
+        choices = data.get("choices")
+        msg = (choices or [{}])[0].get("message") if isinstance(choices, list) and choices else None
+        if not isinstance(msg, dict):
+            raise LlmError(502, "上游返回了异常结构（缺少 choices/message）")
         return data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
@@ -3616,7 +3622,8 @@ async def sessions_list(full: int = 0) -> dict:
                     "message_count": len(s.get("messages", [])),
                     "updated": s.get("updated", "")}
             if full:
-                item["messages"] = s.get("messages", [])
+                # 拷贝而非活引用：锁外序列化时其他请求可能在 append（L1）
+                item["messages"] = list(s.get("messages", []))
             items.append(item)
     return {"ok": True, "sessions": sorted(items, key=lambda s: s["id"])}
 
@@ -3653,9 +3660,10 @@ async def session_get(sid: int, limit: int = 0, offset: int = 0) -> dict:
             msgs = s.get("messages", [])
             start = max(0, len(msgs) - offset - limit)
             chunk = msgs[start:start + limit] if offset > 0 else msgs[-limit:]
-            return {"ok": True, "session": {**s, "messages": chunk,
+            return {"ok": True, "session": {**s, "messages": list(chunk),
                                             "total_messages": len(msgs)}}
-        return {"ok": True, "session": s}
+        # 拷贝而非活引用：锁外序列化时 session_append 可能正在 extend（L1）
+        return {"ok": True, "session": {**s, "messages": list(s.get("messages", []))}}
 
 
 @app.post("/api/v1/sessions/{sid}/messages", summary="向会话追加消息（增量；返回摘要而非完整历史）")
@@ -4306,8 +4314,8 @@ def _execute_tool(name: str, arguments: str,
                 return False, "提交信息不能为空"
             if len(message) > 200:
                 return False, "提交信息过长（≤200 字符）"
-            # 工作树快照校验：确认后工作树变化 → 拒绝（要求重新确认）
             global _pending_git_snapshot
+            # 工作树快照校验：确认后工作树变化 → 拒绝（要求重新确认）
             snap = _git_worktree_snapshot(root)
             if _pending_git_snapshot and snap != _pending_git_snapshot:
                 _pending_git_snapshot = ""
@@ -4579,7 +4587,13 @@ def _compact_early_rounds(early: list[dict]) -> str:
     """
     parts: list[str] = []
     for m in early:
-        if m.get("role") == "assistant":
+        role = m.get("role")
+        if role == "user":
+            # 轮次间的用户指令/约束不能静默丢弃（M4）：压缩进摘要
+            content = str(m.get("content") or "").strip()
+            if content and len(content) < 200:
+                parts.append(f"用户：{content[:120]}")
+        elif role == "assistant":
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 name = fn.get("name") or "?"
@@ -4717,6 +4731,7 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     started_at/tool_events/final_answer/status/finished_at（记忆系统用）。
     """
     global _current_agent_task_id
+    global _pending_git_snapshot
     if run_record is not None:
         run_record.setdefault("started_at", time.time())
         run_record.setdefault("tool_events", [])
@@ -4724,6 +4739,14 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     if depth == 0 and task_id:
         with _agent_task_lock:
             _current_agent_task_id = task_id
+    # 任务级隔离（M1/M2）：残留的 git 快照与本轮修改记录不得污染下一个任务。
+    # 入口清空快照（上一任务可能确认后中止留下过期快照）；修改文件记录
+    # 保存基线、退出时还原——子任务 A 未提交的修改不会被任务 B 误提交。
+    _modified_baseline: set[str] = set()
+    if depth == 0:
+        _pending_git_snapshot = ""
+        with _modified_lock:
+            _modified_baseline = set(_agent_modified_files)
     # 工作区 epoch：切换工作区后旧任务在下一检查点中止（不允许旧任务操作新工作区）
     ws_epoch = _workspace_epoch
     start = time.monotonic()
@@ -4745,313 +4768,336 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     # 跨轮只读结果缓存：{key: (ts, ok, result, {path: (mtime, size)})}
     read_cache: dict = {}
 
-    for step in range(1, step_limit + 1):
-        # 安全锁检查
-        if cancel.is_set():
-            if depth == 0:
-                q.put(("error", "已由用户中止"))
-            return "已由用户中止"
-        if _workspace_changed(ws_epoch):
-            if depth == 0:
-                q.put(("error", "工作区已切换，旧任务已中止（不允许操作新工作区）"))
-            return "工作区已切换，任务中止"
-        if time.monotonic() - start > _MAX_SECS:
-            if depth == 0:
-                q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
-            return f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"
-        if tool_calls_total >= MAX_TOOL_CALLS_TOTAL:
-            if depth == 0:
-                q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
-            return f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"
-
-        payload = {"model": model, "messages": _window_messages(messages),
-                   "temperature": temperature,
-                   "tools": _agent_tools()}
-        if tools_filter is not None:
-            # 子 agent：工具白名单（只保留声明的工具），优先于路由
-            payload["tools"] = [t for t in payload["tools"]
-                                if t["function"]["name"] in tools_filter]
-        elif depth == 0 and tools_filter is None and not (plan_mode and plan_submitted):
-            # 主循环：工具路由过滤（开关关/降级时 _route_tools 返回 None = 全量）
-            # plan 模式批准后跳过路由：计划内工具可能被路由过滤导致计划执行失败
-            routed = _route_tools(messages)
-            if routed is not None:
-                payload["tools"] = routed
-        _apply_reasoning(payload)
-        try:
-            data = _call_upstream_raw(api_url, payload, headers)
-        except LlmError as exc:
-            if depth == 0:
-                q.put(("error", exc.message))
-            return f"上游错误：{exc.message}"
-        msg = data["choices"][0]["message"]
-        tool_calls = msg.get("tool_calls")
-        if not tool_calls:
-            # 无工具调用：最终回复，模拟分块流式（前端打字机效果）
-            content = msg.get("content") or ""
-            for i in range(0, len(content), 4):
-                q.put(("delta", content[i:i + 4]))
-            if depth == 0:
-                q.put(("done", None))
-            log.info("agent done after %d step(s)", step)
-            if run_record is not None:
-                run_record["final_answer"] = content
-                run_record["status"] = "completed"
-                run_record["finished_at"] = time.time()
-                run_record.setdefault("verification_ok", any(
-                    e.get("verification") for e in run_record.get("tool_events", [])))
-            return content or "（模型未返回内容）"
-
-        # 模型要求调用工具
-        if cancel.is_set():
-            if depth == 0:
-                q.put(("error", "已由用户中止"))
-            return "已由用户中止"
-        # ---- 批次校验与限额（硬边界，绝不突破 MAX_TOOL_CALLS_TOTAL）----
-        # 1) 单轮上限：模型一次返回过多调用直接整批拒绝
-        if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
-            q.put(("error", f"模型单轮返回 {len(tool_calls)} 个工具调用，超过单轮上限 "
-                            f"{MAX_TOOL_CALLS_PER_ROUND}，任务已中止"))
-            return f"模型单轮工具调用超过上限 {MAX_TOOL_CALLS_PER_ROUND}"
-        # 2) 结构校验：缺少 id / function / name 或重复 id 的调用安全拒绝（跳过）
-        valid: list[dict] = []
-        seen_ids: set[str] = set()
-        for tc in tool_calls:
-            tc_id = tc.get("id")
-            fn = tc.get("function")
-            if (not isinstance(tc_id, str) or not tc_id
-                    or not isinstance(fn, dict) or not isinstance(fn.get("name"), str)
-                    or not fn["name"]):
-                continue
-            if tc_id in seen_ids:
-                continue
-            seen_ids.add(tc_id)
-            valid.append(tc)
-        if not valid:
-            q.put(("error", "模型返回的 tool_calls 全部无效（缺少 id/function 或重复），任务已中止"))
-            return "模型返回的 tool_calls 全部无效"
-        # 3) 剩余额度：只执行允许的数量，绝不突破总量上限
-        remaining = MAX_TOOL_CALLS_TOTAL - tool_calls_total
-        if len(valid) > remaining:
-            log.warning("tool_calls 请求 %d 个，剩余额度 %d，截断执行", len(valid), remaining)
-            valid = valid[:remaining]
-        tool_calls = valid
-        tool_calls_total += len(tool_calls)
-        names = ",".join((tc.get("function") or {}).get("name", "?") for tc in tool_calls)
-        log.info("agent step %d: [%s] (total %d)", step, names, tool_calls_total)
-        messages.append({"role": "assistant", "content": msg.get("content") or None,
-                         "tool_calls": tool_calls})
-        # 同轮重复检测：相同 (工具, 参数) 的调用直接复用本轮结果（依赖状态必然相同）
-        round_cache: dict[tuple[str, str], tuple[bool, str]] = {}
-        for tc in tool_calls:
+    try:
+        for step in range(1, step_limit + 1):
+            # 安全锁检查
             if cancel.is_set():
                 if depth == 0:
                     q.put(("error", "已由用户中止"))
                 return "已由用户中止"
-            fn = tc["function"]
+            if _workspace_changed(ws_epoch):
+                if depth == 0:
+                    q.put(("error", "工作区已切换，旧任务已中止（不允许操作新工作区）"))
+                return "工作区已切换，任务中止"
+            if time.monotonic() - start > _MAX_SECS:
+                if depth == 0:
+                    q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
+                return f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"
+            if tool_calls_total >= MAX_TOOL_CALLS_TOTAL:
+                if depth == 0:
+                    q.put(("error", f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"))
+                return f"工具调用总数超过上限 {MAX_TOOL_CALLS_TOTAL}，已自动中止"
+
+            payload = {"model": model, "messages": _window_messages(messages),
+                       "temperature": temperature,
+                       "tools": _agent_tools()}
+            if tools_filter is not None:
+                # 子 agent：工具白名单（只保留声明的工具），优先于路由
+                payload["tools"] = [t for t in payload["tools"]
+                                    if t["function"]["name"] in tools_filter]
+            elif depth == 0 and tools_filter is None and not (plan_mode and plan_submitted):
+                # 主循环：工具路由过滤（开关关/降级时 _route_tools 返回 None = 全量）
+                # plan 模式批准后跳过路由：计划内工具可能被路由过滤导致计划执行失败
+                routed = _route_tools(messages)
+                if routed is not None:
+                    payload["tools"] = routed
+            _apply_reasoning(payload)
             try:
-                args = json.loads(fn.get("arguments") or "{}")
-                if not isinstance(args, dict):
-                    raise ValueError("arguments 不是 JSON 对象")
-            except (json.JSONDecodeError, ValueError):
-                args = None
-            if args is None:
-                # 非法参数：安全拒绝，不执行工具
-                log.warning("tool %s 参数非法已拒绝：%.120s", fn.get("name"), fn.get("arguments") or "")
-                result = "工具参数不是合法 JSON，已安全拒绝（不执行）"
-                ok = False
-                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result}))
+                data = _call_upstream_raw(api_url, payload, headers)
+            except LlmError as exc:
+                if depth == 0:
+                    q.put(("error", exc.message))
+                return f"上游错误：{exc.message}"
+            msg = data["choices"][0]["message"]
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                # 无工具调用：最终回复，模拟分块流式（前端打字机效果）
+                content = msg.get("content") or ""
+                # 先写 run_record 再发 done：SSE 侧收到 done 立即提交记忆记录，
+                # 若字段后写，提取线程会看到 status="" 被记为 failed，已完成任务的
+                # 偏好/约束提取与 lesson 全部丢失（H2 竞态）
+                if run_record is not None:
+                    run_record["final_answer"] = content
+                    run_record["status"] = "completed"
+                    run_record["finished_at"] = time.time()
+                    run_record.setdefault("verification_ok", any(
+                        e.get("verification") for e in run_record.get("tool_events", [])))
+                for i in range(0, len(content), 4):
+                    q.put(("delta", content[i:i + 4]))
+                if depth == 0:
+                    q.put(("done", None))
+                log.info("agent done after %d step(s)", step)
+                return content or "（模型未返回内容）"
+
+            # 模型要求调用工具
+            if cancel.is_set():
+                if depth == 0:
+                    q.put(("error", "已由用户中止"))
+                return "已由用户中止"
+            # ---- 批次校验与限额（硬边界，绝不突破 MAX_TOOL_CALLS_TOTAL）----
+            # 1) 单轮上限：模型一次返回过多调用直接整批拒绝
+            if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
+                q.put(("error", f"模型单轮返回 {len(tool_calls)} 个工具调用，超过单轮上限 "
+                                f"{MAX_TOOL_CALLS_PER_ROUND}，任务已中止"))
+                return f"模型单轮工具调用超过上限 {MAX_TOOL_CALLS_PER_ROUND}"
+            # 2) 结构校验：缺少 id / function / name 或重复 id 的调用安全拒绝（跳过）
+            valid: list[dict] = []
+            seen_ids: set[str] = set()
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                fn = tc.get("function")
+                if (not isinstance(tc_id, str) or not tc_id
+                        or not isinstance(fn, dict) or not isinstance(fn.get("name"), str)
+                        or not fn["name"]):
+                    continue
+                if tc_id in seen_ids:
+                    continue
+                seen_ids.add(tc_id)
+                valid.append(tc)
+            if not valid:
+                q.put(("error", "模型返回的 tool_calls 全部无效（缺少 id/function 或重复），任务已中止"))
+                return "模型返回的 tool_calls 全部无效"
+            # 3) 剩余额度：只执行允许的数量，绝不突破总量上限
+            remaining = MAX_TOOL_CALLS_TOTAL - tool_calls_total
+            if len(valid) > remaining:
+                log.warning("tool_calls 请求 %d 个，剩余额度 %d，截断执行", len(valid), remaining)
+                valid = valid[:remaining]
+            tool_calls = valid
+            tool_calls_total += len(tool_calls)
+            names = ",".join((tc.get("function") or {}).get("name", "?") for tc in tool_calls)
+            log.info("agent step %d: [%s] (total %d)", step, names, tool_calls_total)
+            messages.append({"role": "assistant", "content": msg.get("content") or None,
+                             "tool_calls": tool_calls})
+            # 同轮重复检测：相同 (工具, 参数) 的调用直接复用本轮结果（依赖状态必然相同）
+            round_cache: dict[tuple[str, str], tuple[bool, str]] = {}
+            for tc in tool_calls:
+                if cancel.is_set():
+                    if depth == 0:
+                        q.put(("error", "已由用户中止"))
+                    return "已由用户中止"
+                fn = tc["function"]
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments 不是 JSON 对象")
+                except (json.JSONDecodeError, ValueError):
+                    args = None
+                if args is None:
+                    # 非法参数：安全拒绝，不执行工具
+                    log.warning("tool %s 参数非法已拒绝：%.120s", fn.get("name"), fn.get("arguments") or "")
+                    result = "工具参数不是合法 JSON，已安全拒绝（不执行）"
+                    ok = False
+                    q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result}))
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        q.put(("error", f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，"
+                                        f"熔断器已触发，任务自动中止"))
+                        return f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，熔断器已触发"
+                    continue
+                # 同轮重复调用：相同 (工具, 参数) 直接复用本轮结果（依赖状态必然相同，
+                # 防止模型重复调用同一只读工具 / 反复执行同一失败操作）
+                fp = (fn["name"], fn.get("arguments") or "")
+                if fp in round_cache:
+                    prev_ok, prev_result = round_cache[fp]
+                    result = prev_result + "\n（同轮重复调用同一工具与参数，已复用本次结果）"
+                    ok = prev_ok
+                    q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
+                                         "arguments": fn["arguments"],
+                                         "step": step, "max_steps": MAX_TOOL_STEPS}))
+                    q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                           "reused": True}))
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    continue
+                # 跨轮只读结果缓存：文件参数未变化时避免重复读取同一文件（30s TTL）
+                cache_hit = (None if fp in round_cache
+                             else _read_cache_hit(read_cache, fn["name"], args))
+                if cache_hit is not None:
+                    prev_ok, prev_result = cache_hit
+                    result = prev_result + "\n（文件未变化，已复用上次只读结果）"
+                    ok = prev_ok
+                    q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
+                                         "arguments": fn["arguments"],
+                                         "step": step, "max_steps": MAX_TOOL_STEPS}))
+                    q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                           "reused": True}))
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    continue
+                q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
+                                     "arguments": fn["arguments"],
+                                     "step": step, "max_steps": MAX_TOOL_STEPS}))
+                # 工具执行前检查总时长（覆盖上游等待/确认等待/MCP 调用累计耗时）
+                if time.monotonic() - start > _MAX_SECS:
+                    if depth == 0:
+                        q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
+                    return f"任务超过总时长上限 {_MAX_SECS}s"
+                # ---- 计划审批模式：先规划，批准后按计划执行 ----
+                if plan_mode and not plan_submitted:
+                    if fn["name"] == "create_plan":
+                        plan_steps = args.get("steps") or []
+                        if not isinstance(plan_steps, list) or not plan_steps:
+                            result = "计划无效：steps 必须是非空数组（每个步骤含 step/tools）"
+                            ok = False
+                        else:
+                            ask_id = _new_confirm_id(task_id)
+                            q.put(("ask", {"id": ask_id, "name": "create_plan",
+                                           "arguments": fn["arguments"],
+                                           "question": "任务计划需要你的批准：批准后按计划执行，"
+                                                       "计划内声明的范围（files/commands）内操作免确认；"
+                                                       "范围外参数、文件被外部修改会重新确认。",
+                                           "options": ["yes", "no"],
+                                           "plan": plan_steps}))
+                            choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
+                                                   task_id=task_id)
+                            if time.monotonic() - start > _MAX_SECS:
+                                # 确认等待也计入任务总时长
+                                q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                                return f"任务超过总时长上限 {_MAX_SECS}s"
+                            if choice == "yes":
+                                approved_specs = _plan_build_specs(plan_steps)
+                                approved_plan_steps = plan_steps
+                                plan_file_snapshot = _snapshot_plan_files(plan_steps)
+                                plan_submitted = True
+                                names = _plan_tool_names(approved_specs)
+                                result = (f"计划已批准（{len(plan_steps)} 步，"
+                                          f"授权工具：{', '.join(sorted(names)) or '无'}），"
+                                          f"开始按计划执行（范围外参数将重新确认）")
+                                ok = True
+                            else:
+                                result = "计划被用户拒绝，请停止执行并询问用户如何调整"
+                                ok = False
+                    elif _is_query_tool(fn["name"], args):
+                        # 只读操作（查询类工具/简单只读 shell/只读 MCP）天然无害：免规划直接执行
+                        ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
+                    else:
+                        result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
+                                  "（列出步骤与所需工具，用户批准后才可执行）")
+                        ok = False
+                # ---- 常规执行（或计划已批准）----
+                elif plan_mode and fn["name"] == "create_plan":
+                    # 计划已批准后重复规划：提示而非误导
+                    result = "计划已提交并批准，直接按计划执行即可，无需重复规划；如需调整请询问用户"
+                    ok = False
+                elif plan_mode and fn["name"] in _plan_tool_names(approved_specs):
+                    # 计划内工具：参数必须命中批准范围，且目标文件未被外部修改；
+                    # 不满足 → 重新确认（显示实际参数与原因），用户拒绝则不执行。
+                    authorized = _plan_authorized(approved_specs, fn["name"], args, workspace=_get_workspace())
+                    changed = _plan_files_changed(plan_file_snapshot) if authorized else []
+                    if authorized and not changed:
+                        ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                    api_url, headers, model, temperature, q, cancel, depth)
+                        if ok:
+                            # 免确认执行成功后刷新快照（agent 自己的修改不算外部变化）
+                            plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
+                    else:
+                        hint = (f"（文件已被外部修改：{', '.join(changed[:3])}）" if changed
+                                else "（参数超出计划批准的范围）")
+                        ask_id = _new_confirm_id(task_id)
+                        question = f"工具 `{fn['name']}` 需要重新确认{hint}"
+                        q.put(("ask", {"id": ask_id, "name": fn["name"],
+                                       "arguments": fn["arguments"],
+                                       "question": question,
+                                       "options": ["yes", "no"],
+                                       "diff": _confirm_question(fn["name"], args)[1]}))
+                        choice = _wait_confirm(ask_id, task_id=task_id)
+                        if time.monotonic() - start > _MAX_SECS:
+                            q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                            return f"任务超过总时长上限 {_MAX_SECS}s"
+                        if choice == "yes":
+                            ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                        api_url, headers, model, temperature, q, cancel, depth)
+                            if ok:
+                                plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
+                        else:
+                            log.info("plan tool %s re-confirm rejected by user", fn["name"])
+                            result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+                            ok = False
+                else:
+                    # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
+                    policy = _confirm_policy(fn["name"], args)
+                    if policy == "deny":
+                        ok = False
+                        result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
+                                  f"如需执行请先切换到其他问询模式")
+                    elif policy == "ask":
+                        ask_id = _new_confirm_id(task_id)
+                        question, diff = _confirm_question(fn["name"], args)
+                        q.put(("ask", {"id": ask_id, "name": fn["name"],
+                                       "arguments": fn["arguments"],
+                                       "question": question,
+                                       "options": ["yes", "no"], "diff": diff}))
+                        choice = _wait_confirm(ask_id, task_id=task_id)
+                        if time.monotonic() - start > _MAX_SECS:
+                            q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
+                            return f"任务超过总时长上限 {_MAX_SECS}s"
+                        if choice == "yes":
+                            if fn["name"] == "git_commit":
+                                # 批准时记录工作树快照：执行前变化则要求重新确认
+                                ws_root = _find_git_root(_get_workspace(), args.get("path", ""))
+                                _pending_git_snapshot = (_git_worktree_snapshot(ws_root)
+                                                         if ws_root is not None else "")
+                            ok, result = _timed_execute(fn["name"], fn["arguments"],
+                                                        api_url, headers, model, temperature, q, cancel, depth, task_id)
+                        else:
+                            log.info("tool %s rejected by user (%s)", fn["name"], choice)
+                            result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
+                            ok = False
+                    else:
+                        ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
+                # 工具结果压缩：完整原文存本地（result_id 引用，模型可 fetch_result 取回），
+                # 发送给模型的是 head/error/tail 分区保留的摘要（错误绝不丢）
+                if len(result) > MAX_TOOL_RESULT_CHARS:
+                    result, _rmeta = reduce_tool_result(
+                        fn["name"], args, result, ok,
+                        max_chars=MAX_TOOL_RESULT_CHARS, store=_result_store)
+                    log.info("tool %s 结果 %d 字符 → 压缩为 %d（可 fetch_result 取回 %s）",
+                             fn["name"], _rmeta["original_chars"], _rmeta["reduced_chars"],
+                             _rmeta["result_id"])
+                else:
+                    _rmeta = None
+                round_cache[fp] = (ok, result)
+                _read_cache_put(read_cache, fn["name"], args, ok, result)
+                if run_record is not None:
+                    run_record["tool_events"].append({
+                        "name": fn["name"],
+                        "args_preview": (fn.get("arguments") or "")[:200],
+                        "ok": ok,
+                        "verification": _is_verification_result(fn["name"], result),
+                    })
+                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
+                                       **({"reduced": True, "result_id": _rmeta["result_id"]}
+                                          if _rmeta and _rmeta.get("result_id") else {})}))
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-                consecutive_failures += 1
+                # 任务清单变化：推送 todo_update 事件（前端刷新任务面板）
+                if fn["name"] in ("create_todo", "update_todo"):
+                    q.put(("todo_update", _todos_snapshot()))
+                # 连续失败熔断
+                consecutive_failures = 0 if ok else consecutive_failures + 1
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     q.put(("error", f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，"
                                     f"熔断器已触发，任务自动中止"))
                     return f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，熔断器已触发"
-                continue
-            # 同轮重复调用：相同 (工具, 参数) 直接复用本轮结果（依赖状态必然相同，
-            # 防止模型重复调用同一只读工具 / 反复执行同一失败操作）
-            fp = (fn["name"], fn.get("arguments") or "")
-            if fp in round_cache:
-                prev_ok, prev_result = round_cache[fp]
-                result = prev_result + "\n（同轮重复调用同一工具与参数，已复用本次结果）"
-                ok = prev_ok
-                q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
-                                     "arguments": fn["arguments"],
-                                     "step": step, "max_steps": MAX_TOOL_STEPS}))
-                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
-                                       "reused": True}))
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-                continue
-            # 跨轮只读结果缓存：文件参数未变化时避免重复读取同一文件（30s TTL）
-            if fp not in round_cache and _read_cache_hit(read_cache, fn["name"], args) is not None:
-                prev_ok, prev_result = _read_cache_hit(read_cache, fn["name"], args)
-                result = prev_result + "\n（文件未变化，已复用上次只读结果）"
-                ok = prev_ok
-                q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
-                                     "arguments": fn["arguments"],
-                                     "step": step, "max_steps": MAX_TOOL_STEPS}))
-                q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
-                                       "reused": True}))
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-                continue
-            q.put(("tool_call", {"id": tc["id"], "name": fn["name"],
-                                 "arguments": fn["arguments"],
-                                 "step": step, "max_steps": MAX_TOOL_STEPS}))
-            # 工具执行前检查总时长（覆盖上游等待/确认等待/MCP 调用累计耗时）
-            if time.monotonic() - start > _MAX_SECS:
-                if depth == 0:
-                    q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s，已自动中止"))
-                return f"任务超过总时长上限 {_MAX_SECS}s"
-            # ---- 计划审批模式：先规划，批准后按计划执行 ----
-            if plan_mode and not plan_submitted:
-                if fn["name"] == "create_plan":
-                    plan_steps = args.get("steps") or []
-                    if not isinstance(plan_steps, list) or not plan_steps:
-                        result = "计划无效：steps 必须是非空数组（每个步骤含 step/tools）"
-                        ok = False
-                    else:
-                        ask_id = _new_confirm_id(task_id)
-                        q.put(("ask", {"id": ask_id, "name": "create_plan",
-                                       "arguments": fn["arguments"],
-                                       "question": "任务计划需要你的批准：批准后按计划执行，"
-                                                   "计划内声明的范围（files/commands）内操作免确认；"
-                                                   "范围外参数、文件被外部修改会重新确认。",
-                                       "options": ["yes", "no"],
-                                       "plan": plan_steps}))
-                        choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
-                                               task_id=task_id)
-                        if time.monotonic() - start > _MAX_SECS:
-                            # 确认等待也计入任务总时长
-                            q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
-                            return f"任务超过总时长上限 {_MAX_SECS}s"
-                        if choice == "yes":
-                            approved_specs = _plan_build_specs(plan_steps)
-                            approved_plan_steps = plan_steps
-                            plan_file_snapshot = _snapshot_plan_files(plan_steps)
-                            plan_submitted = True
-                            names = _plan_tool_names(approved_specs)
-                            result = (f"计划已批准（{len(plan_steps)} 步，"
-                                      f"授权工具：{', '.join(sorted(names)) or '无'}），"
-                                      f"开始按计划执行（范围外参数将重新确认）")
-                            ok = True
-                        else:
-                            result = "计划被用户拒绝，请停止执行并询问用户如何调整"
-                            ok = False
-                elif _is_query_tool(fn["name"], args):
-                    # 只读操作（查询类工具/简单只读 shell/只读 MCP）天然无害：免规划直接执行
-                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
-                else:
-                    result = ("计划审批模式下，写操作执行前必须先用 create_plan 提交计划"
-                              "（列出步骤与所需工具，用户批准后才可执行）")
-                    ok = False
-            # ---- 常规执行（或计划已批准）----
-            elif plan_mode and fn["name"] == "create_plan":
-                # 计划已批准后重复规划：提示而非误导
-                result = "计划已提交并批准，直接按计划执行即可，无需重复规划；如需调整请询问用户"
-                ok = False
-            elif plan_mode and fn["name"] in _plan_tool_names(approved_specs):
-                # 计划内工具：参数必须命中批准范围，且目标文件未被外部修改；
-                # 不满足 → 重新确认（显示实际参数与原因），用户拒绝则不执行。
-                authorized = _plan_authorized(approved_specs, fn["name"], args, workspace=_get_workspace())
-                changed = _plan_files_changed(plan_file_snapshot) if authorized else []
-                if authorized and not changed:
-                    ok, result = _timed_execute(fn["name"], fn["arguments"],
-                                                api_url, headers, model, temperature, q, cancel, depth)
-                    if ok:
-                        # 免确认执行成功后刷新快照（agent 自己的修改不算外部变化）
-                        plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
-                else:
-                    hint = (f"（文件已被外部修改：{', '.join(changed[:3])}）" if changed
-                            else "（参数超出计划批准的范围）")
-                    ask_id = _new_confirm_id(task_id)
-                    question = f"工具 `{fn['name']}` 需要重新确认{hint}"
-                    q.put(("ask", {"id": ask_id, "name": fn["name"],
-                                   "arguments": fn["arguments"],
-                                   "question": question,
-                                   "options": ["yes", "no"],
-                                   "diff": _confirm_question(fn["name"], args)[1]}))
-                    choice = _wait_confirm(ask_id, task_id=task_id)
-                    if time.monotonic() - start > _MAX_SECS:
-                        q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
-                        return f"任务超过总时长上限 {_MAX_SECS}s"
-                    if choice == "yes":
-                        ok, result = _timed_execute(fn["name"], fn["arguments"],
-                                                    api_url, headers, model, temperature, q, cancel, depth)
-                        if ok:
-                            plan_file_snapshot = _snapshot_plan_files(approved_plan_steps)
-                    else:
-                        log.info("plan tool %s re-confirm rejected by user", fn["name"])
-                        result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
-                        ok = False
-            else:
-                # ---- 按问询模式决定处理方式：allow 直接执行 / ask 确认 / deny 拒绝 ----
-                policy = _confirm_policy(fn["name"], args)
-                if policy == "deny":
-                    ok = False
-                    result = (f"当前为只读模式（query），操作 {fn['name']} 已被拒绝；"
-                              f"如需执行请先切换到其他问询模式")
-                elif policy == "ask":
-                    ask_id = _new_confirm_id(task_id)
-                    question, diff = _confirm_question(fn["name"], args)
-                    q.put(("ask", {"id": ask_id, "name": fn["name"],
-                                   "arguments": fn["arguments"],
-                                   "question": question,
-                                   "options": ["yes", "no"], "diff": diff}))
-                    choice = _wait_confirm(ask_id, task_id=task_id)
-                    if time.monotonic() - start > _MAX_SECS:
-                        q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
-                        return f"任务超过总时长上限 {_MAX_SECS}s"
-                    if choice == "yes":
-                        if fn["name"] == "git_commit":
-                            # 批准时记录工作树快照：执行前变化则要求重新确认
-                            global _pending_git_snapshot
-                            ws_root = _find_git_root(_get_workspace(), args.get("path", ""))
-                            _pending_git_snapshot = (_git_worktree_snapshot(ws_root)
-                                                     if ws_root is not None else "")
-                        ok, result = _timed_execute(fn["name"], fn["arguments"],
-                                                    api_url, headers, model, temperature, q, cancel, depth, task_id)
-                    else:
-                        log.info("tool %s rejected by user (%s)", fn["name"], choice)
-                        result = "用户拒绝了该操作，请勿执行；可询问用户或改用其他方式"
-                        ok = False
-                else:
-                    ok, result = _timed_execute(fn["name"], fn["arguments"], api_url, headers, model, temperature, q, cancel, depth, task_id)
-            # 工具结果压缩：完整原文存本地（result_id 引用，模型可 fetch_result 取回），
-            # 发送给模型的是 head/error/tail 分区保留的摘要（错误绝不丢）
-            if len(result) > MAX_TOOL_RESULT_CHARS:
-                result, _rmeta = reduce_tool_result(
-                    fn["name"], args, result, ok,
-                    max_chars=MAX_TOOL_RESULT_CHARS, store=_result_store)
-                log.info("tool %s 结果 %d 字符 → 压缩为 %d（可 fetch_result 取回 %s）",
-                         fn["name"], _rmeta["original_chars"], _rmeta["reduced_chars"],
-                         _rmeta["result_id"])
-            else:
-                _rmeta = None
-            round_cache[fp] = (ok, result)
-            _read_cache_put(read_cache, fn["name"], args, ok, result)
-            if run_record is not None:
-                run_record["tool_events"].append({
-                    "name": fn["name"],
-                    "args_preview": (fn.get("arguments") or "")[:200],
-                    "ok": ok,
-                    "verification": _is_verification_result(fn["name"], result),
-                })
-            q.put(("tool_result", {"id": tc["id"], "ok": ok, "result": result,
-                                   **({"reduced": True, "result_id": _rmeta["result_id"]}
-                                      if _rmeta and _rmeta.get("result_id") else {})}))
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-            # 任务清单变化：推送 todo_update 事件（前端刷新任务面板）
-            if fn["name"] in ("create_todo", "update_todo"):
-                q.put(("todo_update", _todos_snapshot()))
-            # 连续失败熔断
-            consecutive_failures = 0 if ok else consecutive_failures + 1
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                q.put(("error", f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，"
-                                f"熔断器已触发，任务自动中止"))
-                return f"连续 {MAX_CONSECUTIVE_FAILURES} 次工具调用失败，熔断器已触发"
-    q.put(("error", f"工具调用超过 {step_limit} 轮上限，已自动中止"))
-    return f"工具调用超过 {step_limit} 轮上限，已自动中止"
+        q.put(("error", f"工具调用超过 {step_limit} 轮上限，已自动中止"))
+        return f"工具调用超过 {step_limit} 轮上限，已自动中止"
 
+
+    except Exception as exc:
+        # H1 兜底：循环内任何未捕获异常都必须转成 error 事件，
+        # 否则 SSE 生成器在 q.get 上永久阻塞、全局 agent 锁泄漏
+        log.exception("agent 循环未捕获异常，任务已安全终止")
+        if depth == 0:
+            q.put(("error", f"任务内部错误已自动中止：{type(exc).__name__}"))
+        if run_record is not None and not run_record.get("status"):
+            run_record["status"] = "failed"
+            run_record["finished_at"] = time.time()
+        return f"任务内部错误：{type(exc).__name__}"
+    finally:
+        # 任务级隔离（M1/M2）：退出时清空快照、还原修改记录基线
+        if depth == 0:
+            _pending_git_snapshot = ""
+            with _modified_lock:
+                _agent_modified_files.clear()
+                _agent_modified_files.update(_modified_baseline)
 
 def _agent_limits() -> tuple[int, int]:
     """工具轮数/任务时长上限：优先配置（设置界面保存后实时生效），否则默认常量。"""
@@ -5139,7 +5185,24 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
 
     try:
         while True:
-            kind, data = await loop.run_in_executor(None, q.get)
+            # 超时轮询：worker 异常退出（未发事件）时 fut 完成，据此终止而不是
+            # 在 q.get 上永久阻塞（否则客户端挂起、全局 agent 锁无法释放）
+            try:
+                kind, data = await loop.run_in_executor(
+                    None, lambda: q.get(timeout=5))
+            except queue.Empty:
+                if fut.done():
+                    exc = fut.exception()
+                    log.warning("agent worker 异常退出（%r），SSE 终止",
+                                exc if exc is not None else "无异常信息")
+                    await _agent_cleanup()
+                    _submit_memory_record(run_record,
+                                          status="cancelled" if cancel.is_set() else "failed")
+                    detail = (f"任务执行异常终止：{type(exc).__name__}"
+                              if exc is not None else "任务已终止（worker 未返回）")
+                    yield f"event: error\ndata: {json.dumps({'detail': detail}, ensure_ascii=False)}\n\n"
+                    break
+                continue
             if kind == "done":
                 await _agent_cleanup()   # 显式清理：async generator 的 finally 依赖 aclose
                 _submit_memory_record(run_record, status=None)  # 状态由 loop 填充
@@ -5201,7 +5264,13 @@ async def chat_stream(req: ChatRequest):
                   if m.get("role") == "user"), ""),
             workspace=str(req.workspace or ""))
         if dyn:
-            messages.insert(0, {"role": "system", "content": dyn})
+            # 插到静态 system 之后、用户消息之前：静态前缀（system+工具定义）
+            # 保持字节级稳定才能命中 provider 前缀缓存；动态记忆放最前会让
+            # 每次请求的第一个 token 就不同 → 整个前缀缓存全部失效（H3）
+            insert_at = 0
+            while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+                insert_at += 1
+            messages.insert(insert_at, {"role": "system", "content": dyn})
         appended = False
         for m in messages:
             if m.get("role") != "system":

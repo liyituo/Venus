@@ -175,7 +175,10 @@ class ApplicationService:
         now = self.clock.now()
         expires_at = now + timedelta(seconds=self.config.portfolio.approval_ttl_seconds)
         try:
-            market = self.provider.load_market()
+            # live 模式优先走 load_market_or_cache：拉取失败回退上次缓存（离线可用）；
+            # file/simulated 无此方法时直接 load_market
+            loader = getattr(self.provider, "load_market_or_cache", None)
+            market = loader() if loader is not None else self.provider.load_market()
             account = self.provider.load_account()
         except FileNotFoundError as exc:
             self.audit.record(

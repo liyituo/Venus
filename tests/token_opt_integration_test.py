@@ -108,7 +108,7 @@ check("TTL 过期 → 失效", L._read_cache_hit(cache, "read_file", {"path": "a
 
 # ============ 3. fetch_result ============
 print("== 3. fetch_result ==")
-rid = L._result_store.put.__self__.put  # noqa: 占位（避免误用）
+rid = L._result_store.put.__self__.put
 from tool_result_reducer import new_result_id
 rid = new_result_id("run_shell", "FULL DATA " * 300)
 L._result_store.put(rid, {"name": "run_shell"}, "FULL DATA " * 300)
