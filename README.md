@@ -35,6 +35,15 @@
 
 运行量化中心需要 Python 3.12+、主项目依赖，以及本机可用的 Node.js。按钮只启动绑定在 `127.0.0.1` 的本地服务；重复点击会复用已有健康进程。
 
+### 本地 AI 额度桌面组件
+
+仓库内 [`local-quota-widget`](local-quota-widget/README.md) 是一个 **Windows 专用**透明浮窗，分别显示 **Cursor** 与 **Codex** 剩余额度（只读，不消耗 token）：
+
+- 启动：双击 `local-quota-widget/start.bat`（复用根目录 `.venv`，需 `Pillow`）
+- Cursor 需在菜单里粘贴一次 `WorkosCursorSessionToken`（DPAPI 加密存 `.local/`，不入库）
+- Codex 自动读 `%USERPROFILE%\.codex\auth.json`；透明区域点击穿透，不挡桌面操作
+- 单实例运行；典型内存约 25–50 MB
+
 ## WSL / Linux（隔离测试环境）
 
 配好 Python 3.13 环境后：
@@ -288,6 +297,7 @@ src/agent_memory.py            记忆系统（L0-L3 分层 + 动态 Skill + Code
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
 quant-agent-lab/    隔离的量化研究、策略调试、回测、MCP Apps GUI 与 Paper Trading 子项目
+local-quota-widget/ Windows 透明桌面组件：Cursor + Codex 剩余额度（凭据在 .local/，不入库）
 skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
 tests/              三十套自动测试 + 评测入口（含记忆系统 L0-L3/Skill/CodeGraph）
 .github/workflows/  CI（主 Agent 双平台 + RAG + 量化子项目独立验证）

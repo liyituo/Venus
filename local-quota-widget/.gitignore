@@ -1,0 +1,6 @@
+# 本机状态与凭据（DPAPI 加密 token、窗口位置），严禁入库
+.local/
+
+__pycache__/
+*.pyc
+*.log
