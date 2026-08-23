@@ -98,7 +98,7 @@ jobs:
           node-version: "24"
 
       - name: 安装量化子项目开发依赖
-        run: pip install --quiet -e "./quant-agent-lab[dev]"
+        run: pip install --quiet -e "./quant-agent-lab[dev,ml]"
 
       - name: 后端编译、格式、静态检查与测试
         working-directory: quant-agent-lab

@@ -36,7 +36,6 @@ from quant_agent.risk.engine import RiskEngine
 from quant_agent.strategies.base import Strategy
 from quant_agent.strategies.llm_fundamental import LlmFundamentalStrategy
 from quant_agent.strategies.moving_average import MovingAverageStrategy
-from quant_agent.strategies.tiny_moe_ranker import TinyMoeRankerStrategy
 
 
 class ApplicationService:
@@ -90,6 +89,8 @@ class ApplicationService:
                 clock=self.clock,
             )
         elif self.config.strategy.strategy_id == "tiny-moe-ranker":
+            from quant_agent.strategies.tiny_moe_ranker import TinyMoeRankerStrategy
+
             self.strategy = TinyMoeRankerStrategy(
                 self.config.tiny_moe,
                 project_root=self.paths.root,

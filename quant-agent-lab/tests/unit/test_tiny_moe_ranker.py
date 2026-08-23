@@ -7,6 +7,11 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+pytest.importorskip("numpy")
+pytest.importorskip("torch")
+
 from quant_agent.infrastructure.config import TinyMoeConfig, _load_symbols, load_demo_config
 from quant_agent.strategies.tiny_moe_ranker import (
     TinyMoeRankerStrategy,
