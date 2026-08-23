@@ -1,23 +1,33 @@
 version: demo-v1
 local_timezone: Asia/Shanghai
 strategy:
-  id: llm-fundamental
-  version: 1.0.0
-  fast_window: 3
-  slow_window: 5
-  minimum_strength: "0.001"
+  id: tiny-moe-ranker
+  version: 2.0.0
 portfolio:
-  target_notional_per_signal: "1000"
-  lot_size: "1"
+  target_notional_per_signal: "10000"
+  lot_size: "100"
   fee_bps: "5"
   slippage_bps: "10"
-  currency: USD
+  currency: CNY
   approval_ttl_seconds: 3600
 paper_broker:
   default_fill_policy: full
 
-# ---- LLM 基本面信号（llm-fundamental 策略）----
-# key 从环境变量 QUANT_AGENT_LLM_API_KEY 读取（绝不写进本文件/日志/审计）
+# ---- Tiny-MoE 横截面排序（A4_tiny_moe_v2 权重）----
+tiny_moe:
+  checkpoint_path: var/models/A4_tiny_moe_v2/best_model.pt
+  top_k: 20
+  min_stocks_per_day: 50
+  lookback: 60
+  device: cpu
+
+# ---- 行情：A 股 CSI300 成分（live 拉取，失败回退缓存）----
+market_data:
+  source: live
+  market: cn
+  symbols_file: config/csi300_symbols.txt
+
+# llm-fundamental 保留配置段（切换 strategy.id 即可恢复）
 llm:
   api_url: "https://api.deepseek.com"
   model: "deepseek-v4-flash"
@@ -25,9 +35,3 @@ llm:
   timeout: 60
   rag_url: http://127.0.0.1:8010
   rag_collection: financial-reports
-
-# ---- 行情数据源：file（默认，本地 JSON）/ live（yfinance+akshare 自动拉取）----
-market_data:
-  source: simulated
-  market: us
-  symbols: []

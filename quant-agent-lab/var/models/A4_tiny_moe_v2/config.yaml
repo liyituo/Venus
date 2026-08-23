@@ -1,0 +1,66 @@
+seed: 42
+data:
+  source: qlib
+  instruments: csi300
+  benchmark_symbol: SH000300
+  warmup_start: '2014-01-01'
+  raw_end: '2024-12-31'
+  lookback: 0
+  horizon: 5
+  min_stocks_per_day: 50
+  out_dir: data/csi300
+splits:
+  train:
+    start: '2015-01-01'
+    end: '2021-12-31'
+  valid:
+    start: '2022-01-01'
+    end: '2022-12-31'
+  test:
+    start: '2023-01-01'
+    end: '2024-12-31'
+model:
+  version: v2
+  factor_hidden_dim: 128
+  embedding_dim: 64
+  market_hidden_dim: 32
+  market_embedding_dim: 16
+  expert_hidden_dim: 32
+  num_experts: 3
+  dropout: 0.1
+  use_moe: true
+  use_market_gate: true
+  use_balance_loss: true
+  use_base_head: true
+  use_cross_section_gate: true
+  learnable_moe_scale: true
+  moe_scale_init: 0.1
+  gate_temperature: 1.0
+loss:
+  ranking_type: top_heavy
+  top_weight_mode: continuous
+  top_weight_strength: 2.0
+  top_weight_power: 3.0
+training:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 1
+  lambda_rank: 1.0
+  lambda_mse: 0.1
+  lambda_balance: 0.005
+  pair_margin: 0.1
+  max_pairs_per_day: 4096
+  early_stopping_patience: 10
+  max_grad_norm: 1.0
+  use_scheduler: true
+preprocessing:
+  winsorize: true
+  lower_quantile: 0.01
+  upper_quantile: 0.99
+  standardize: true
+backtest:
+  top_k: 20
+  rebalance_days: 5
+  transaction_cost_bps: 10
+output_dir: outputs_real

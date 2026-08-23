@@ -1,0 +1,79 @@
+# Tiny-MoE Quant Ranker 默认配置（V1 行为：A3 与此保持一致）
+seed: 42
+
+data:
+  lookback: 60          # 至少需要的历史交易日数（FeatureBuilder 路径）
+  horizon: 5            # 预测未来 5 个交易日收益
+  min_stocks_per_day: 50  # 股票数少于该值的交易日直接跳过
+
+# 严格时间切分: train < valid < test，不做随机打乱
+splits:
+  train:
+    start: "2015-01-01"
+    end: "2021-12-31"
+  valid:
+    start: "2022-01-01"
+    end: "2022-12-31"
+  test:
+    start: "2023-01-01"
+    end: "2024-12-31"
+
+model:
+  factor_hidden_dim: 128
+  embedding_dim: 64
+  market_hidden_dim: 32
+  market_embedding_dim: 16
+  expert_hidden_dim: 32
+  num_experts: 3
+  dropout: 0.1
+
+  version: v1
+
+  use_moe: true          # false -> MLP Ranker (Baseline A1)
+  use_market_gate: true  # false -> Gate 为固定可学习参数 (Baseline A2)
+  use_balance_loss: true # false -> 消融 w/o Balance Loss
+
+  # ---- V2 开关（A4）----
+  use_base_head: false           # true -> score = base + moe_scale * moe
+  use_cross_section_gate: false  # true -> Gate 输入 = market + 横截面状态
+  learnable_moe_scale: true      # moe_scale 可学习
+  moe_scale_init: 0.1            # 初始 0.1，避免训练初期 residual 破坏 Base Head
+  gate_temperature: 1.0          # softmax(logits / T)
+
+loss:
+  ranking_type: normal      # normal / top_heavy
+  top_weight_mode: continuous  # discrete / continuous（top_heavy 时生效）
+  top_weight_strength: 2.0
+  top_weight_power: 3.0
+
+training:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 1          # 一个 batch = 一个交易日的完整横截面
+
+  lambda_rank: 1.0
+  lambda_mse: 0.2
+  lambda_balance: 0.01
+
+  pair_margin: 0.1       # 只保留 |label_i - label_j| > pair_margin 的 pair
+  max_pairs_per_day: 4096
+
+  early_stopping_patience: 10
+
+  # ---- V2 训练稳定性 ----
+  max_grad_norm: 1.0     # gradient clipping
+  use_scheduler: false   # ReduceLROnPlateau（监控 validation RankIC）
+
+preprocessing:
+  winsorize: false       # true -> 用 train 的 1%/99% 分位数裁剪
+  lower_quantile: 0.01
+  upper_quantile: 0.99
+  standardize: true
+
+backtest:
+  top_k: 20
+  rebalance_days: 5
+  transaction_cost_bps: 10
+
+output_dir: outputs

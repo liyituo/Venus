@@ -36,6 +36,7 @@ from quant_agent.risk.engine import RiskEngine
 from quant_agent.strategies.base import Strategy
 from quant_agent.strategies.llm_fundamental import LlmFundamentalStrategy
 from quant_agent.strategies.moving_average import MovingAverageStrategy
+from quant_agent.strategies.tiny_moe_ranker import TinyMoeRankerStrategy
 
 
 class ApplicationService:
@@ -78,7 +79,7 @@ class ApplicationService:
         else:
             self.provider = FileDataProvider(self.paths.data_dir)
         self.audit = AuditLogger(self.store, self.clock)
-        # 策略工厂：按 config.strategy.id 选择（默认 MA；llm-fundamental 走 LLM 决策层）
+        # 策略工厂：llm-fundamental / tiny-moe-ranker / 默认均线演示
         self.strategy: Strategy
         if self.config.strategy.strategy_id == "llm-fundamental":
             self.strategy = LlmFundamentalStrategy(
@@ -87,6 +88,13 @@ class ApplicationService:
                 RagClient(self.config.llm.rag_url, self.config.llm.rag_collection),
                 audit=self.audit,
                 clock=self.clock,
+            )
+        elif self.config.strategy.strategy_id == "tiny-moe-ranker":
+            self.strategy = TinyMoeRankerStrategy(
+                self.config.tiny_moe,
+                project_root=self.paths.root,
+                audit=self.audit,
+                version=self.config.strategy.version,
             )
         else:
             self.strategy = MovingAverageStrategy(self.config.strategy)

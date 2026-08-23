@@ -71,12 +71,24 @@ class LlmConfig:
 
 
 @dataclass(frozen=True)
-class MarketDataConfig:
-    """行情数据源：file（本地 JSON/CSV，默认）/ live（自动拉取）。"""
+class TinyMoeConfig:
+    """Tiny-MoE 横截面排序策略配置。"""
 
-    source: str = "file"  # file | live
+    checkpoint_path: str = "var/models/A4_tiny_moe_v2/best_model.pt"
+    top_k: int = 20
+    min_stocks_per_day: int = 50
+    lookback: int = 60
+    device: str = "cpu"
+
+
+@dataclass(frozen=True)
+class MarketDataConfig:
+    """行情数据源：file（本地 JSON/CSV，默认）/ live / simulated。"""
+
+    source: str = "file"  # file | live | simulated
     market: str = "us"  # us | cn | both
     symbols: tuple[str, ...] = ()
+    symbols_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,7 @@ class DemoConfig:
     risk: RiskConfig = RiskConfig()
     paper_broker: PaperBrokerConfig = PaperBrokerConfig()
     llm: LlmConfig = LlmConfig()
+    tiny_moe: TinyMoeConfig = TinyMoeConfig()
     market_data: MarketDataConfig = MarketDataConfig()
 
 
@@ -104,13 +117,44 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _normalize_symbol(raw: str) -> str:
+    text = str(raw).strip()
+    if text.isdigit():
+        return text.zfill(6)
+    return text
+
+
+def _load_symbols(project_root: Path, market_data: dict[str, Any]) -> tuple[str, ...]:
+    explicit = market_data.get("symbols") or []
+    if explicit:
+        return tuple(_normalize_symbol(item) for item in explicit)
+    symbols_file = str(market_data.get("symbols_file", "") or "").strip()
+    if not symbols_file:
+        return ()
+    path = Path(symbols_file)
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.exists():
+        return ()
+    symbols: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        item = line.strip().lstrip("\ufeff")
+        if item and not item.startswith("#"):
+            symbols.append(_normalize_symbol(item))
+    return tuple(symbols)
+
+
 def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
     directory = config_dir or (Path(__file__).resolve().parents[3] / "config")
+    project_root = directory.parent
     demo = _load_yaml(directory / "demo.yaml")
     risk = _load_yaml(directory / "risk.demo.yaml")
     strategy_data = demo.get("strategy", {})
     portfolio_data = demo.get("portfolio", {})
     broker_data = demo.get("paper_broker", {})
+    tiny_moe_data = demo.get("tiny_moe", {})
+    market_data_yaml = demo.get("market_data", {})
+    symbols = _load_symbols(project_root, market_data_yaml)
     return DemoConfig(
         version=str(demo.get("version", "demo-v1")),
         local_timezone=str(demo.get("local_timezone", "Asia/Shanghai")),
@@ -154,10 +198,20 @@ def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
             rag_url=str(demo.get("llm", {}).get("rag_url", "http://127.0.0.1:8010")),
             rag_collection=str(demo.get("llm", {}).get("rag_collection", "financial-reports")),
         ),
+        tiny_moe=TinyMoeConfig(
+            checkpoint_path=str(
+                tiny_moe_data.get("checkpoint_path", "var/models/A4_tiny_moe_v2/best_model.pt")
+            ),
+            top_k=int(tiny_moe_data.get("top_k", 20)),
+            min_stocks_per_day=int(tiny_moe_data.get("min_stocks_per_day", 50)),
+            lookback=int(tiny_moe_data.get("lookback", 60)),
+            device=str(tiny_moe_data.get("device", "cpu")),
+        ),
         market_data=MarketDataConfig(
-            source=str(demo.get("market_data", {}).get("source", "file")),
-            market=str(demo.get("market_data", {}).get("market", "us")),
-            symbols=tuple(demo.get("market_data", {}).get("symbols", []) or []),
+            source=str(market_data_yaml.get("source", "file")),
+            market=str(market_data_yaml.get("market", "us")),
+            symbols=symbols,
+            symbols_file=str(market_data_yaml.get("symbols_file", "") or ""),
         ),
     )
 

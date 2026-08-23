@@ -153,23 +153,39 @@ class LiveMarketDataProvider(FileDataProvider):
     def _fetch_akshare(self, symbol: str) -> list[MarketBar]:
         import akshare as ak  # lazy：未安装才报错
 
-        df = ak.stock_zh_a_hist(
-            symbol=symbol, period="daily", start_date="", end_date="", adjust="qfq"
-        )
+        code = symbol.zfill(6) if symbol.isdigit() else symbol
+        df = self._fetch_akshare_daily(ak, code)
         if df is None or df.empty:
             raise ValueError("akshare 返回空数据")
         bars = []
-        for _, row in df.tail(90).iterrows():
-            dt = datetime.strptime(str(row["日期"]), "%Y-%m-%d").replace(tzinfo=UTC)
+        for _, row in df.tail(120).iterrows():
+            if "date" in row:
+                dt = datetime.strptime(str(row["date"]), "%Y-%m-%d").replace(tzinfo=UTC)
+                open_, high, low, close, volume = (
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                )
+            else:
+                dt = datetime.strptime(str(row["日期"]), "%Y-%m-%d").replace(tzinfo=UTC)
+                open_, high, low, close, volume = (
+                    row["开盘"],
+                    row["最高"],
+                    row["最低"],
+                    row["收盘"],
+                    row["成交量"],
+                )
             bars.append(
                 MarketBar(
-                    symbol=symbol,
+                    symbol=code,
                     timestamp=dt,
-                    open=_dec(row["开盘"]),
-                    high=_dec(row["最高"]),
-                    low=_dec(row["最低"]),
-                    close=_dec(row["收盘"]),
-                    volume=_dec(row["成交量"]),
+                    open=_dec(open_),
+                    high=_dec(high),
+                    low=_dec(low),
+                    close=_dec(close),
+                    volume=_dec(volume),
                     currency="CNY",
                     timeframe="1d",
                     source="akshare",
@@ -179,6 +195,29 @@ class LiveMarketDataProvider(FileDataProvider):
                 )
             )
         return bars
+
+    @staticmethod
+    def _fetch_akshare_daily(ak, code: str):
+        """新浪 -> 腾讯 -> 东财，与 tiny_moe_quant fetch 脚本一致。"""
+        sina = ("sh" if code.startswith("6") else "sz") + code
+        tx = sina
+        for attempt, fetch in enumerate(
+            (
+                lambda: ak.stock_zh_a_daily(symbol=sina, adjust="qfq"),
+                lambda: ak.stock_zh_a_hist_tx(symbol=tx),
+                lambda: ak.stock_zh_a_hist(
+                    symbol=code, period="daily", start_date="", end_date="", adjust="qfq"
+                ),
+            )
+        ):
+            try:
+                df = fetch()
+                if df is not None and not df.empty:
+                    return df
+            except Exception as exc:  # noqa: BLE001 — 尝试下一数据源
+                if attempt == 2:
+                    raise exc
+        return None
 
 
 def _dec(value) -> Decimal:

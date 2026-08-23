@@ -86,33 +86,35 @@ def test_akshare_conversion(tmp_path):
     df = FakeDF(
         [
             {
-                "日期": "2026-07-01",
-                "开盘": 10.0,
-                "最高": 11.0,
-                "最低": 9.0,
-                "收盘": 10.5,
-                "成交量": 500,
+                "date": "2026-07-01",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 500,
             },
             {
-                "日期": "2026-07-02",
-                "开盘": 10.0,
-                "最高": 11.0,
-                "最低": 9.0,
-                "收盘": 10.5,
-                "成交量": 500,
+                "date": "2026-07-02",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 500,
             },
             {
-                "日期": "2026-07-03",
-                "开盘": 10.0,
-                "最高": 11.0,
-                "最低": 9.0,
-                "收盘": 10.5,
-                "成交量": 500,
+                "date": "2026-07-03",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 500,
             },
         ]
     )
     fake_ak = ModuleType("akshare")
-    fake_ak.stock_zh_a_hist = mock.Mock(return_value=df)
+    fake_ak.stock_zh_a_daily = mock.Mock(return_value=df)
+    fake_ak.stock_zh_a_hist_tx = mock.Mock(return_value=FakeDF([]))
+    fake_ak.stock_zh_a_hist = mock.Mock(return_value=FakeDF([]))
     with mock.patch.dict(sys.modules, {"akshare": fake_ak}):
         snap = LiveMarketDataProvider(tmp_path, market="cn", symbols=("600519",)).load_market()
     assert len(snap.bars) == 3

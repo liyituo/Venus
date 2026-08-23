@@ -27,6 +27,12 @@ live-data = [
   "akshare>=1.14",
   "pandas>=2.0",
 ]
+ml = [
+  "torch>=2.0",
+  "numpy>=1.23",
+  "pandas>=2.0",
+  "scikit-learn>=1.2",
+]
 
 [project.scripts]
 quant-agent = "quant_agent.cli.main:main"

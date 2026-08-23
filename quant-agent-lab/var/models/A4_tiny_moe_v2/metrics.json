@@ -1,0 +1,120 @@
+{
+  "experiment": "A4_tiny_moe_v2",
+  "version": "v2",
+  "model": "TinyMoE",
+  "params": {
+    "total": 29144,
+    "trainable": 29144,
+    "size_mb": 0.116576
+  },
+  "ic": {
+    "n_days": 479,
+    "mean_ic": 0.017658025051729923,
+    "std_ic": 0.18939546737139387,
+    "icir": 0.09323362008981077,
+    "mean_rank_ic": 0.03438437553846343,
+    "std_rank_ic": 0.14229966085430096,
+    "rank_icir": 0.24163357334651397
+  },
+  "top_excess_return": {
+    "top_5pct_excess": 0.005677005407025303,
+    "top_10pct_excess": 0.004819191223429949,
+    "top_20_excess": 0.005252542695807177
+  },
+  "backtest": {
+    "0": {
+      "cum_return": 0.7756858167205656,
+      "annual_return": 0.34845126666670123,
+      "annual_volatility": 0.2001959635826161,
+      "sharpe": 1.5934754504323378,
+      "max_drawdown": -0.09944794421460745,
+      "calmar": 3.5038559059073924,
+      "turnover": 0.9005154639175257,
+      "n_rebalances": 97,
+      "benchmark_cum_return": 0.3667409772600636,
+      "benchmark_annual_return": 0.17664794853944166,
+      "n_days": 484,
+      "top_k": 20,
+      "rebalance_days": 5,
+      "transaction_cost_bps": 0.0
+    },
+    "5": {
+      "cum_return": 0.6998227916608017,
+      "annual_return": 0.3181420965154873,
+      "annual_volatility": 0.20028974477563619,
+      "sharpe": 1.4791944417582594,
+      "max_drawdown": -0.10269792510358722,
+      "calmar": 3.097843468547104,
+      "turnover": 0.9005154639175257,
+      "n_rebalances": 97,
+      "benchmark_cum_return": 0.3667409772600636,
+      "benchmark_annual_return": 0.17664794853944166,
+      "n_days": 484,
+      "top_k": 20,
+      "rebalance_days": 5,
+      "transaction_cost_bps": 5.0
+    },
+    "10": {
+      "cum_return": 0.6271685938470943,
+      "annual_return": 0.28850087506645594,
+      "annual_volatility": 0.20042487212330273,
+      "sharpe": 1.3647388085336256,
+      "max_drawdown": -0.10593765231239494,
+      "calmar": 2.723308179566867,
+      "turnover": 0.9005154639175257,
+      "n_rebalances": 97,
+      "benchmark_cum_return": 0.3667409772600636,
+      "benchmark_annual_return": 0.17664794853944166,
+      "n_days": 484,
+      "top_k": 20,
+      "rebalance_days": 5,
+      "transaction_cost_bps": 10.0
+    },
+    "20": {
+      "cum_return": 0.4909548116678384,
+      "annual_return": 0.23116487701640098,
+      "annual_volatility": 0.2008188058919136,
+      "sharpe": 1.1355901062489349,
+      "max_drawdown": -0.11238645644263179,
+      "calmar": 2.0568748613797627,
+      "turnover": 0.9005154639175257,
+      "n_rebalances": 97,
+      "benchmark_cum_return": 0.3667409772600636,
+      "benchmark_annual_return": 0.17664794853944166,
+      "n_days": 484,
+      "top_k": 20,
+      "rebalance_days": 5,
+      "transaction_cost_bps": 20.0
+    }
+  },
+  "best_valid_rank_ic": 0.0702307156369025,
+  "best_epoch": 4,
+  "label_definition": "close_t_to_close_t+5",
+  "benchmark_type": "csi300_index",
+  "splits": {
+    "train": {
+      "start": "2015-01-01",
+      "end": "2021-12-31"
+    },
+    "valid": {
+      "start": "2022-01-01",
+      "end": "2022-12-31"
+    },
+    "test": {
+      "start": "2023-01-01",
+      "end": "2024-12-31"
+    }
+  },
+  "quantile_returns": {
+    "Q1": 0.004484969975592073,
+    "Q2": 0.0023607833379823925,
+    "Q3": 0.0031311904137833373,
+    "Q4": 0.003538333794782193,
+    "Q5": 0.0031605905082305683,
+    "Q6": 0.004099840690882179,
+    "Q7": 0.004223646698130453,
+    "Q8": 0.003630221442122634,
+    "Q9": 0.004030026082019075,
+    "Q10": 0.005291340300280067
+  }
+}

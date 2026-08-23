@@ -1,0 +1,23 @@
+{
+  "model_version": "v2",
+  "model_name": "TinyMoE",
+  "train_start": "2015-01-01",
+  "train_end": "2021-12-31",
+  "valid_start": "2022-01-01",
+  "valid_end": "2022-12-31",
+  "test_start": "2023-01-01",
+  "test_end": "2024-12-31",
+  "feature_count": 14,
+  "label_definition": "close_t_to_close_t+5",
+  "benchmark_type": "csi300_index",
+  "best_epoch": 4,
+  "best_valid_rankic": 0.0702307156369025,
+  "params": {
+    "total": 29144,
+    "trainable": 29144,
+    "size_mb": 0.116576
+  },
+  "torch_version": "2.3.0+cu121",
+  "cuda_available": true,
+  "device_name": "cuda"
+}

@@ -1,0 +1,27 @@
+{
+  "feature_names": [
+    "return_1d",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "volatility_5d",
+    "volatility_20d",
+    "ma5_ratio",
+    "ma10_ratio",
+    "ma20_ratio",
+    "rsi",
+    "momentum_5d",
+    "momentum_20d",
+    "volume_ratio",
+    "high_low_range"
+  ],
+  "market_feature_names": [
+    "market_return_1d",
+    "market_return_5d",
+    "market_return_20d",
+    "market_volatility_5d",
+    "market_volatility_20d",
+    "advance_ratio",
+    "cross_section_dispersion"
+  ]
+}
