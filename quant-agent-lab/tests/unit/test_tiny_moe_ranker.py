@@ -1,4 +1,5 @@
 """Tiny-MoE 策略：排序映射 / 配置加载 / 推理集成。"""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -15,9 +16,10 @@ from quant_agent.strategies.tiny_moe_ranker import (
 
 
 def test_map_rank_to_direction_top_and_bottom():
-    assert map_rank_to_direction(1, 100, 20) == __import__(
-        "quant_agent.domain.enums", fromlist=["SignalDirection"]
-    ).SignalDirection.BUY
+    assert (
+        map_rank_to_direction(1, 100, 20)
+        == __import__("quant_agent.domain.enums", fromlist=["SignalDirection"]).SignalDirection.BUY
+    )
     assert map_rank_to_direction(20, 100, 20).value == "BUY"
     assert map_rank_to_direction(81, 100, 20).value == "SELL"
     assert map_rank_to_direction(50, 100, 20).value == "HOLD"

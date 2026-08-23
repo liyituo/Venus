@@ -1,4 +1,5 @@
 """Tiny-MoE 横截面排序策略：Top-K 买入 / 尾部卖出，接入 Paper 交易链路。"""
+
 from __future__ import annotations
 
 from datetime import datetime

@@ -1,4 +1,5 @@
 """MarketSnapshot → Tiny-MoE 特征矩阵。"""
+
 from __future__ import annotations
 
 from decimal import Decimal

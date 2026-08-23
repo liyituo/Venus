@@ -1,4 +1,5 @@
 """从 MarketSnapshot OHLCV 构建 Tiny-MoE 训练同款特征（只用 t 日及之前数据）。"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -66,7 +67,8 @@ class FeatureBuilder:
                 "ma20_ratio": close / self._grp_rolling(df, close, 20, "mean") - 1.0,
                 "rsi": self._rsi(df, close, window=14),
                 "momentum_5d": self._grp_shift(df, close, 1) / self._grp_shift(df, close, 6) - 1.0,
-                "momentum_20d": self._grp_shift(df, close, 1) / self._grp_shift(df, close, 21) - 1.0,
+                "momentum_20d": self._grp_shift(df, close, 1) / self._grp_shift(df, close, 21)
+                - 1.0,
             }
         )
         if has_volume:
