@@ -30,6 +30,7 @@
 - 手动启动后端：`cd quant-agent-lab; $env:PYTHONPATH='src'; python -m uvicorn quant_agent.api.app:app --host 127.0.0.1 --port 8014`
 - 手动启动 GUI：`cd quant-agent-lab\plugins\quant-agent-dashboard; node scripts\build.mjs; node standalone\server.mjs`
 - Dashboard 包含 K 线与信号、策略实验室、回测、风控、审批和审计；当前仅允许 Paper Trading，`LiveBroker` 保持禁用
+- **Tiny-MoE 横截面排序**（默认 `strategy.id: tiny-moe-ranker`）：对 CSI300 成分股日级排序，Top-20 买入信号；权重已入库（`var/models/A4_tiny_moe_v2/`），CPU 推理，详见 [`quant-agent-lab/README.md`](quant-agent-lab/README.md)
 - **LLM 基本面信号**（`strategy.id: llm-fundamental`）：DeepSeek 每天读取 RAG 财报 + 自动拉取的行情（美股 yfinance / A股 akshare），输出日级 BUY/SELL/HOLD 信号——风险/审批/执行链不绕过，失败降级 HOLD 不伪造信号。财报经 `RAG` 服务的 ingest 入库（`financial-reports` 集合，meta 含 symbol/report_date，防未来函数）。配置与决策记录见 [`quant-agent-lab/docs/llm-fundamental.md`](quant-agent-lab/docs/llm-fundamental.md)
 - 接入边界、端口、进程生命周期和验证记录见 [`docs/quant-integration.md`](docs/quant-integration.md)
 

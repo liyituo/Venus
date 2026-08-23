@@ -1,9 +1,6 @@
 """从 MarketSnapshot OHLCV 构建 Tiny-MoE 训练同款特征（只用 t 日及之前数据）。"""
 from __future__ import annotations
 
-from typing import List, Tuple
-
-import numpy as np
 import pandas as pd
 
 EPS = 1e-8
@@ -42,7 +39,7 @@ class FeatureBuilder:
     def __init__(self, lookback: int = 60) -> None:
         self.lookback = lookback
 
-    def build_stock_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    def build_stock_features(self, df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
         has_high_low = {"high", "low"}.issubset(df.columns)
         has_volume = "volume" in df.columns
@@ -92,7 +89,7 @@ class FeatureBuilder:
         feature_names = [c for c in STOCK_FEATURE_NAMES if c in feat.columns]
         return feat, feature_names
 
-    def build_market_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    def build_market_features(self, df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         df = df.sort_values(["date", "symbol"]).reset_index(drop=True)
         ret_1d = df.groupby("symbol", sort=False)["close"].pct_change(1)
         mkt_close = df.groupby("date", sort=True)["close"].mean()
@@ -116,7 +113,7 @@ class FeatureBuilder:
         mkt = mkt.dropna(subset=feature_names).reset_index(drop=True)
         return mkt, feature_names
 
-    def build(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+    def build(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
         stock_feat, feature_names = self.build_stock_features(df)
         market_feat, market_feature_names = self.build_market_features(df)
         valid_dates = set(stock_feat["date"].unique())

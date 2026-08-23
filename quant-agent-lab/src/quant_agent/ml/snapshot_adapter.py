@@ -1,7 +1,6 @@
 """MarketSnapshot → Tiny-MoE 特征矩阵。"""
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
 
 import numpy as np
