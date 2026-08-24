@@ -1,14 +1,47 @@
 # Venus
 
-把 LLM 接到你的电脑上，让它能看屏幕、点鼠标、敲键盘、读写文件、跑命令、管 Git、查代码。
+**个人 Agent 调度台** — 派活即走，本地可控。把 LLM 接到你的电脑上，让它能读写文件、跑命令、管 Git、操作屏幕；长任务后台异步执行，跨会话记住你的偏好。
+
+> **v0.10.0** — 后端平台第一阶段已冻结（异步任务台 + 记忆 API + 智能派发 + 统一定时任务）。桌面 Chat UI 重构中，CLI 可完整验证后端能力。
 
 ## 架构
+
+```
+┌──────────── 入口 ────────────┐
+│ chat.py · cli.py · telegram  │
+└──────────────┬───────────────┘
+               │ HTTP :8001
+┌──────────────▼───────────────┐
+│ llm_server.py（中枢 Harness） │
+│ · Agent 工具循环              │
+│ · 异步任务台 agent_jobs       │
+│ · 记忆 L0-L3 · 子 Agent 委派  │
+│ · 智能派发 · 定时调度         │
+└──────────────┬───────────────┘
+               │
+     ┌─────────┴─────────┐
+     ▼                   ▼
+ app.py :8000        .venus/ 本地数据
+ 屏幕 daemon         sessions · jobs · memory
+```
 
 三个进程 + 任意 OpenAI 兼容 LLM：
 
 - `src/app.py` — 屏幕控制 daemon，鼠标键盘操作在单线程队列里排队执行
-- `src/llm_server.py` — 中枢：接 LLM，把模型的工具调用转成实际动作，同时负责确认/计划审批/上下文压缩/会话存储/MCP
+- `src/llm_server.py` — 中枢：Agent 循环、异步任务、记忆、确认流、MCP、会话
 - 前端（任选其一）— `chat.py` 聊天窗 / `cli.py` 终端 / `gui.py` 屏幕面板 / `telegram_bot.py` 手机遥控 / `static/index.html` 网页
+
+### 后端模块（v0.10 冻结）
+
+| 模块 | 文件 | 职责 |
+| --- | --- | --- |
+| 任务台 | `agent_jobs.py` | 异步 Job 队列、持久化、事件流 |
+| 派发路由 | `dispatch_router.py` | 同步 / 异步执行建议 |
+| 定时任务 | `schedule_store.py` | 统一定时任务存储 + 到点创建 Job |
+| 记忆 | `agent_memory.py` | L0-L3 + Skill + CodeGraph |
+| 子 Agent | `subagent_router.py` + `agents/` | 轻异构委派 |
+
+**后端冻结范围（v0.10）**：不再新增后端能力，仅修 bug / 安全；前端按 API 对接。暂缓：多 Job 并行、`llm_server` 拆模块、Telegram 改调 Schedule API。
 
 ## 快速开始（Windows）
 
@@ -84,6 +117,51 @@ bot 命令：`/status` `/stats` `/sessions` `/switch N` `/send <路径>`（把�
 ```
 
 CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认模式，`/reasoning` 切推理强度，`/stats` 看 token 用量。
+
+**异步任务台（CLI 已对接，推荐验证后端）**：
+
+```
+/dispatch 跑一下 tests 并写报告    # 后台派活，立即返回
+!整理下载文件夹                    # 快捷派活
+/jobs                              # 任务列表
+/job watch job_xxx                 # 跟踪进度（含确认交互）
+/job cancel job_xxx                # 取消
+```
+
+脚本：`python src/cli.py --dispatch "任务描述"` 派活并跟踪到完成。
+
+### 异步任务台 API
+
+| 端点 | 作用 |
+| --- | --- |
+| `POST /api/v1/dispatch/analyze` | 分析应同步还是异步 |
+| `POST /api/v1/dispatch` | 智能派发（async 自动建 Job） |
+| `POST /api/v1/jobs` | 直接创建后台任务 |
+| `GET /api/v1/jobs` | 任务列表 |
+| `GET /api/v1/jobs/{id}` | 任务详情 |
+| `GET /api/v1/jobs/{id}/events` | 任务进度 SSE |
+| `POST /api/v1/jobs/{id}/cancel` | 取消 |
+
+任务数据在 `.venus/jobs/`；完成后自动写回来源会话（若指定 `session_id`）。
+
+### 记忆 API
+
+| 端点 | 作用 |
+| --- | --- |
+| `GET /api/v1/memory` | L1 列表 + L3 画像 |
+| `GET /api/v1/memory/inject-preview?query=` | 预览将注入的记忆 |
+| `PUT /api/v1/memory/profile` | 更新画像偏好 |
+| `PUT /api/v1/memory/{id}` | 纠正单条记忆 |
+| `DELETE /api/v1/memory/{id}` | 删除记忆 |
+
+### 定时任务 API
+
+| 端点 | 作用 |
+| --- | --- |
+| `GET/POST /api/v1/schedules` | 列表 / 创建 |
+| `PATCH/DELETE /api/v1/schedules/{id}` | 更新 / 删除 |
+
+到点由 `llm_server` 内置调度器创建异步 Job（与 Telegram `/schedule` 共用 `.venus/schedules.json`）。
 
 ## 用法：对话就是操作
 
@@ -297,6 +375,7 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 - **安全**：单 MemoryWorker + 有界队列，失败静默不影响聊天；会话删除同步遗忘来源记忆（pinned 显式记忆保留）；记忆文件全部在 `.venus/`（已 gitignore）
 - **工具**：`remember`（主动写入）/ `recall_memory`（查记忆/场景正文/画像）/ `codegraph_query`（符号调用关系/影响分析）；均进工具路由核心集（路由开启仍可见），isolated 模式保留
 - **注入**：每轮对话在独立动态 system 消息中注入「画像 + 相关记忆」（≤300 字符，与对话冲突时以本轮为准），不破坏稳定前缀提示词缓存
+- **API**：`GET /api/v1/memory`、`/memory/inject-preview`、`PUT /memory/profile`、`PUT/DELETE /memory/{id}`（见上节）
 - **会话身份**：Chat GUI 流式请求携带 session_id/request_id/workspace/session_version，记忆可溯源到会话与工作区
 
 ## 会话与数据
@@ -304,7 +383,7 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 - 会话历史自动保存到项目根 `.venus/sessions.json`（含聊天记录，**已 gitignore，不会入库**）；重启自动恢复，chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
 - 记忆数据在 `.venus/memory/`（见上节）；文件修改自动备份到 `.venus/backups/`（`undo` 回滚用，50 条上限）
 - 运行日志写入 `.venus/server.log` 与 `.venus/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
-- 任务清单存在工作区 `.venus/todos.json`（跟随机器）；定时任务存 `.venus/schedules.json`
+- 任务清单存在工作区 `.venus/todos.json`（跟随机器）；定时任务存 `.venus/schedules.json`；异步任务存 `.venus/jobs/`
 - 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
 
 **从 PC Agent 升级（`.pcagent` → `.venus`）**：v0.9.1 起数据目录改名为 `.venus/`。首次启动会自动迁移；也可手动执行：

@@ -19,7 +19,9 @@ Venus CLI — 在 Linux 虚拟机 / 任意终端使用 Venus（零依赖，纯�
   /help       显示帮助          /new        新会话
   /sessions   列出会话          /switch N   切换会话
   /clear      清空当前会话历史   /quit       退出
-  其他输入                      发送给 Agent
+  /dispatch   后台派活（异步）    /jobs       任务台
+  !<描述>     快捷派活
+  其他输入    同步 Agent 对话
 """
 
 from __future__ import annotations
@@ -338,8 +340,25 @@ class AgentClient:
             return {"ok": False, "detail": f"HTTP {e.code}"}
         except Exception as e:
             return {"ok": False, "detail": str(e)}
-        except Exception as e:
-            return {"ok": False, "detail": str(e)}
+
+    def create_job(self, messages: List[dict], session_id: int | None = None,
+                   title: str | None = None, workspace: str | None = None):
+        payload = {"messages": messages, "session_id": session_id, "title": title}
+        if workspace:
+            payload["workspace"] = workspace
+        return self.api("POST", "/api/v1/jobs", payload, timeout=15)
+
+    def list_jobs(self, status: str | None = None, limit: int = 20):
+        path = f"/api/v1/jobs?limit={limit}"
+        if status:
+            path += f"&status={status}"
+        return self.api("GET", path, timeout=10)
+
+    def get_job(self, job_id: str):
+        return self.api("GET", f"/api/v1/jobs/{job_id}", timeout=10)
+
+    def cancel_job(self, job_id: str):
+        return self.api("POST", f"/api/v1/jobs/{job_id}/cancel", timeout=10)
 
     def set_confirm_mode(self, mode: str):
         body = json.dumps({"mode": mode}).encode("utf-8")
@@ -493,6 +512,37 @@ def _fmt_args(arguments: str, limit: int = 70) -> str:
             parts.append(f"{k}={s[:40]}")
     text = ", ".join(parts)
     return text[:limit] + (" …" if len(text) > limit else "")
+
+
+def _fmt_time(ts) -> str:
+    if not ts:
+        return "—"
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return "—"
+
+
+def _job_status_style(status: str) -> str:
+    return {
+        "queued": "yellow",
+        "running": "cyan",
+        "waiting_confirm": "yellow",
+        "completed": "green",
+        "failed": "red",
+        "cancelled": "dim",
+    }.get(status, "reset")
+
+
+def _job_status_icon(status: str) -> str:
+    return {
+        "queued": "⏳",
+        "running": "▶",
+        "waiting_confirm": "⚠",
+        "completed": "✓",
+        "failed": "✗",
+        "cancelled": "⊘",
+    }.get(status, "·")
 
 
 # ======================================================================
@@ -672,6 +722,147 @@ class Cli:
         self.client.api("POST", f"/api/v1/sessions/{self.current}/messages",
                         {"messages": persist}, timeout=5)
 
+    def dispatch(self, text: str) -> None:
+        """异步派活：立即返回，后台执行 Agent 任务。"""
+        if not text.strip():
+            print(color("用法：/dispatch <任务描述>  或  !任务描述", "yellow"))
+            return
+        self._ensure_loaded(self.current)
+        sess = self.sessions[self.current]
+        messages = list(sess["messages"]) + [{"role": "user", "content": text}]
+        code, data = self.client.create_job(
+            messages, session_id=self.current, title=text[:80])
+        if code != 200 or not data.get("ok"):
+            detail = data.get("detail") or data
+            print(color(f"✗ 派活失败：{detail}", "red"))
+            return
+        job = data.get("job") or {}
+        jid = job.get("id", "?")
+        print(color(f"✓ 任务已派发  {color(jid, 'cyan')}", "green"))
+        print(color(f"  {job.get('title', text)[:100]}", "dim"))
+        print(color(f"  查看 /jobs  ·  跟踪 /job watch {jid}", "dim"))
+
+    def show_jobs(self, status: str | None = None) -> None:
+        code, data = self.client.list_jobs(status=status)
+        if code != 200:
+            print(color(f"✗ 获取任务列表失败：{data.get('detail', code)}", "red"))
+            return
+        jobs = data.get("jobs") or []
+        active = data.get("active_count", 0)
+        print(color(f"=== 任务台 ({len(jobs)} 条，活跃 {active}) ===", "bold"))
+        if not jobs:
+            print(color("  （暂无任务）", "dim"))
+            return
+        for j in jobs:
+            st = j.get("status") or "?"
+            icon = _job_status_icon(st)
+            prog = j.get("progress") or {}
+            extra = ""
+            if prog.get("tool_calls"):
+                extra = f"  ·  {prog['tool_calls']} 次工具"
+                if prog.get("last_tool"):
+                    extra += f"（{prog['last_tool']}）"
+            print(color(
+                f"  {icon} {color(j.get('id', '?'), 'cyan')}  "
+                f"[{color(st, _job_status_style(st))}]  "
+                f"{(j.get('title') or '')[:50]}{extra}",
+                "reset"))
+            print(color(f"      {_fmt_time(j.get('created_at'))}", "dim"))
+
+    def show_job(self, job_id: str) -> None:
+        code, data = self.client.get_job(job_id)
+        if code != 200:
+            print(color(f"✗ {data.get('detail', '任务不存在')}", "red"))
+            return
+        j = data.get("job") or {}
+        st = j.get("status") or "?"
+        print(color(f"=== 任务 {j.get('id')} ===", "bold"))
+        print(color(f"  状态    {_job_status_icon(st)} {st}", _job_status_style(st)))
+        print(color(f"  标题    {j.get('title') or '—'}", "reset"))
+        print(color(f"  创建    {_fmt_time(j.get('created_at'))}", "dim"))
+        print(color(f"  开始    {_fmt_time(j.get('started_at'))}", "dim"))
+        print(color(f"  结束    {_fmt_time(j.get('finished_at'))}", "dim"))
+        prog = j.get("progress") or {}
+        if prog:
+            print(color(f"  进度    {prog.get('tool_calls', 0)} 次工具"
+                          f"{(' · ' + str(prog.get('last_tool'))) if prog.get('last_tool') else ''}",
+                          "cyan"))
+        if j.get("result_summary"):
+            print(color("  ── 结果摘要 ──", "green"))
+            for line in str(j["result_summary"]).splitlines()[:20]:
+                print(color(f"  {line}", "reset"))
+        if j.get("error"):
+            print(color(f"  错误    {j['error']}", "red"))
+        if st == "waiting_confirm":
+            print(color(f"  提示    /job watch {job_id}  处理确认", "yellow"))
+
+    def watch_job(self, job_id: str) -> None:
+        """轮询任务直到结束；waiting_confirm 时交互确认。"""
+        print(color(f"跟踪任务 {job_id} …（Ctrl+C 退出跟踪，任务继续后台跑）", "dim"))
+        try:
+            while True:
+                code, data = self.client.get_job(job_id)
+                if code != 200:
+                    print(color(f"✗ {data.get('detail', '?')}", "red"))
+                    return
+                j = data.get("job") or {}
+                st = j.get("status") or "?"
+                prog = j.get("progress") or {}
+                hint = f"[{st}]"
+                if prog.get("tool_calls"):
+                    hint += f" · {prog['tool_calls']} tools"
+                    if prog.get("last_tool"):
+                        hint += f" · {prog['last_tool']}"
+                print(color(f"  {_fmt_time(time.time())}  {hint}", "cyan"), end="\r", flush=True)
+
+                if st == "waiting_confirm":
+                    print()
+                    ask = j.get("pending_ask") or {}
+                    if ask:
+                        choice = self.on_event("ask", ask)
+                        if choice:
+                            rid = ask.get("id") or j.get("confirm_request_id")
+                            if rid:
+                                self.client._send_respond(rid, choice)
+                    else:
+                        rid = j.get("confirm_request_id")
+                        if rid:
+                            self.client._send_respond(rid, "yes")
+                    time.sleep(1.0)
+                    continue
+
+                if st in ("completed", "failed", "cancelled"):
+                    print()
+                    self.show_job(job_id)
+                    if st == "completed" and j.get("session_id") == self.current:
+                        print(color("  （结果已写回当前会话）", "green"))
+                    return
+                time.sleep(2.0)
+        except KeyboardInterrupt:
+            print()
+            print(color("已停止跟踪（任务仍在后台运行）", "yellow"))
+
+    def handle_job(self, args: List[str]) -> None:
+        if not args:
+            self.show_jobs()
+            return
+        sub = args[0].lower()
+        if sub in ("list", "ls"):
+            st = args[1] if len(args) > 1 else None
+            self.show_jobs(status=st)
+        elif sub == "watch" and len(args) > 1:
+            self.watch_job(args[1])
+        elif sub == "cancel" and len(args) > 1:
+            code, data = self.client.cancel_job(args[1])
+            if code == 200:
+                print(color(f"✓ {data.get('message', '已取消')}", "green"))
+            else:
+                print(color(f"✗ {data.get('detail', code)}", "red"))
+        elif args[0].startswith("job_"):
+            self.show_job(args[0])
+        else:
+            print(color("用法：/jobs | /job <id> | /job watch <id> | /job cancel <id>", "yellow"))
+
     # ---- 交互 ----
     def repl(self) -> None:
         while True:
@@ -686,6 +877,10 @@ class Cli:
             if line.startswith("/"):
                 if self.handle_command(line):
                     return
+            elif line.startswith("!"):
+                text = line[1:].strip()
+                if text:
+                    self.dispatch(text)
             else:
                 self.send(line)
 
@@ -730,6 +925,10 @@ class Cli:
             self.handle_agents()
         elif cmd == "/project":
             self.handle_project(parts[1:])
+        elif cmd in ("/jobs", "/job"):
+            self.handle_job(parts[1:])
+        elif cmd == "/dispatch":
+            self.dispatch(" ".join(parts[1:]))
         elif cmd == "/config":
             self.handle_config(parts[1:])
         else:
@@ -1018,6 +1217,14 @@ class Cli:
         print(color("  /agents           子 agent 列表（视觉分析等，自动委派）", "reset"))
         print(color("  /project          长任务项目：list / status / switch / clear", "reset"))
         print()
+        print(color("== 异步任务台 ==", "cyan"))
+        print(color("  /dispatch <描述>  后台派活（立即返回）", "reset"))
+        print(color("  !<描述>           同上（快捷写法）", "reset"))
+        print(color("  /jobs             任务列表", "reset"))
+        print(color("  /job <id>         任务详情", "reset"))
+        print(color("  /job watch <id>   跟踪任务（含确认交互）", "reset"))
+        print(color("  /job cancel <id>  取消任务", "reset"))
+        print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.venus.json（host/port/token）", "reset"))
         print(color("  /help             显示本帮助", "reset"))
@@ -1053,6 +1260,8 @@ def main() -> int:
     parser.add_argument("--once", default=None, help="单次模式：发送一条消息后退出（脚本用）")
     parser.add_argument("--workspace", default=None,
                         help="切换工作区（绝对路径，须存在；持久化保存）")
+    parser.add_argument("--dispatch", default=None,
+                        help="派活模式：创建后台任务并跟踪到完成（脚本用）")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -1084,6 +1293,16 @@ def main() -> int:
             else:
                 print(color(f"✗ 工作区切换失败：{data.get('detail', '?')}", "red"))
                 return 1
+
+    if args.dispatch:
+        cli.dispatch(args.dispatch)
+        job_id = None
+        code, data = cli.client.list_jobs(limit=1)
+        if code == 200 and data.get("jobs"):
+            job_id = data["jobs"][0].get("id")
+        if job_id:
+            cli.watch_job(job_id)
+        return 0
 
     if args.once:
         cli._last_content = ""

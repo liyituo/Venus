@@ -330,6 +330,71 @@ def retract_memory(memory_id: str) -> bool:
     return forget_memory(memory_id)
 
 
+def list_memories(*, status: str = "active", limit: int = 100,
+                  workspace_id: str = "") -> list[dict]:
+    """列出 L1 记忆（API 用；默认仅 active）。"""
+    limit = max(1, min(int(limit or 100), 500))
+    with _mem_lock:
+        data = load_l1()
+        items = data.get("items") or []
+        out = []
+        for e in reversed(items):
+            if status and e.get("status") != status:
+                continue
+            if workspace_id and e.get("scope") == "workspace":
+                if (e.get("workspace_id") or "") != workspace_id:
+                    continue
+            out.append({
+                "id": e.get("id"),
+                "type": e.get("type"),
+                "content": e.get("content"),
+                "scope": e.get("scope"),
+                "confidence": e.get("confidence"),
+                "explicit": e.get("explicit"),
+                "pinned": e.get("pinned"),
+                "status": e.get("status"),
+                "created_at": e.get("created_at"),
+                "updated_at": e.get("updated_at"),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
+
+def save_profile_preferences(preferences: list[dict]) -> dict:
+    """手动更新 L3 画像偏好列表（API 用）。"""
+    with _mem_lock:
+        profile = load_profile()
+        cleaned = []
+        for p in preferences:
+            if not isinstance(p, dict):
+                continue
+            content = str(p.get("content") or "").strip()
+            if not content:
+                continue
+            cleaned.append({
+                "content": content[:500],
+                "confidence": float(p.get("confidence") or 1.0),
+                "explicit": bool(p.get("explicit", True)),
+            })
+        profile["preferences"] = cleaned[:50]
+        profile["updated"] = _now()
+        _atomic_write_json(_memory_file("profile.json"), profile)
+    return profile
+
+
+def inject_preview(query: str, workspace: str = "") -> dict:
+    """派活/对话前预览将注入的记忆上下文。"""
+    profile_text = profile_inject_text()
+    hits = recall_memories(query, top_k=RECALL_DEFAULT_K, workspace_id=workspace)
+    return {
+        "profile": profile_text,
+        "profile_preferences": len((load_profile().get("preferences") or [])),
+        "recalled": hits,
+        "recalled_count": len(hits),
+    }
+
+
 # ======================================================================
 # L2 场景派生（从现有压缩摘要旁路写入，不改变压缩流程）
 # ======================================================================

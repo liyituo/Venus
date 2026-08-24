@@ -68,7 +68,10 @@ from brand import APP_VERSION, SYSTEM_IDENTITY, env_is_set
 from data_paths import workspace_data_dir
 import browser_tools as _browser  # noqa: E402
 import sandbox_runner as _sandbox  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse
+import agent_jobs as _agent_jobs  # noqa: E402
+import schedule_store as _schedules  # noqa: E402
+from dispatch_router import analyze_dispatch  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -820,6 +823,55 @@ class ChatRequest(BaseModel):
     project_id: str | None = Field(default=None, description="绑定的长任务项目 ID")
 
 
+class JobCreateRequest(BaseModel):
+    messages: list[dict] = Field(..., description="OpenAI 格式消息（通常含 user 任务描述）")
+    title: str | None = Field(default=None, description="任务标题（默认从首条 user 消息截取）")
+    session_id: int | None = Field(default=None, description="来源会话 ID（完成后可写回）")
+    request_id: str | None = Field(default=None, description="幂等请求 ID")
+    workspace: str | None = Field(default=None, description="工作区路径")
+    session_version: int | None = Field(default=None, description="会话版本")
+    project_id: str | None = Field(default=None, description="绑定的长任务项目 ID")
+    model: str | None = Field(default=None, description="覆盖配置中的模型")
+    temperature: float = Field(default=0.7, ge=0, le=2)
+
+
+class DispatchAnalyzeRequest(BaseModel):
+    text: str = Field(..., description="用户输入")
+    history_turns: int = Field(default=0, ge=0, description="已有对话轮数")
+
+
+class DispatchRequest(BaseModel):
+    text: str = Field(..., description="任务描述")
+    messages: list[dict] | None = Field(default=None, description="完整上下文（省略则仅 user 消息）")
+    session_id: int | None = None
+    workspace: str | None = None
+    force_mode: str | None = Field(default=None, description="sync / async 强制模式")
+
+
+class MemoryCorrectRequest(BaseModel):
+    content: str = Field(..., description="纠正后的内容")
+
+
+class ProfileUpdateRequest(BaseModel):
+    preferences: list[dict] = Field(default_factory=list, description="画像偏好列表")
+
+
+class ScheduleCreateRequest(BaseModel):
+    time: str = Field(..., description="HH:MM（24h）")
+    prompt: str = Field(..., description="到点执行的任务描述")
+    channel: str = Field(default="api")
+    chat_id: int | None = None
+    session_id: int | None = None
+    enabled: bool = True
+
+
+class ScheduleUpdateRequest(BaseModel):
+    time: str | None = None
+    prompt: str | None = None
+    enabled: bool | None = None
+    session_id: int | None = None
+
+
 class ProjectActiveUpdate(BaseModel):
     project_id: str = Field(default="", description="设为活跃项目；空字符串表示清除")
 
@@ -856,10 +908,24 @@ class LlmError(Exception):
 
 app = FastAPI(title="LLM Backend", version=APP_VERSION)
 
+# 晨星 Web UI：由 llm_server 同源伺服（same-origin → 免 CORS；
+# 仍受 host_guard 回环限制与可选 token 鉴权保护，不暴露到局域网）
+_WEB_UI_PATH = BASE_DIR.parent / "static" / "venus.html"
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/venus", include_in_schema=False)
+async def venus_ui() -> FileResponse:
+    if not _WEB_UI_PATH.is_file():
+        raise HTTPException(404, "static/venus.html 不存在")
+    return FileResponse(_WEB_UI_PATH)
+
 
 @app.on_event("startup")
 async def _warmup_mcp() -> None:
     """启动时后台预连接 MCP server：首个请求不等待连接（懒加载兜底仍在）。"""
+    _agent_jobs.start_job_worker()
+    threading.Thread(target=_schedule_loop, daemon=True, name="schedule-runner").start()
     if env_is_set(("VENUS_DISABLE_MCP", "PCAGENT_DISABLE_MCP")):
         return
     threading.Thread(target=_ensure_mcp, daemon=True, name="mcp-warmup").start()
@@ -1385,6 +1451,207 @@ async def api_sandbox_default(req: SandboxDefaultUpdate) -> dict:
     return {"ok": True, "message": msg, "default_mode": req.mode}
 
 
+@app.post("/api/v1/jobs", summary="创建异步 Agent 任务（排队后台执行）")
+async def api_create_job(req: JobCreateRequest) -> dict:
+    if not req.messages:
+        raise HTTPException(422, "messages 不能为空")
+    try:
+        job = _agent_jobs.create_job(
+            messages=req.messages,
+            title=req.title,
+            session_id=req.session_id,
+            workspace=req.workspace or str(_get_workspace()),
+            project_id=req.project_id,
+            session_version=req.session_version,
+            model=req.model,
+            temperature=req.temperature,
+            request_id=req.request_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    _agent_jobs.enqueue_job(job["id"])
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/v1/jobs", summary="异步任务列表")
+async def api_list_jobs(status: str | None = None, limit: int = 50) -> dict:
+    if status and status not in _agent_jobs.JOB_STATUSES:
+        raise HTTPException(422, f"无效 status：{status}")
+    jobs = _agent_jobs.list_jobs(status=status, limit=limit)
+    active = sum(1 for j in jobs if j.get("status") in ("queued", "running", "waiting_confirm"))
+    return {"ok": True, "jobs": jobs, "active_count": active}
+
+
+@app.get("/api/v1/jobs/{job_id}", summary="读取单个异步任务")
+async def api_get_job(job_id: str) -> dict:
+    job = _agent_jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel", summary="取消排队中或运行中的任务")
+async def api_cancel_job(job_id: str) -> dict:
+    ok, msg = _agent_jobs.cancel_job(job_id)
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "message": msg, "job": _agent_jobs.get_job(job_id)}
+
+
+@app.get("/api/v1/jobs/{job_id}/events", summary="任务事件 SSE（进度流）")
+async def api_job_events(job_id: str):
+    job = _agent_jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+
+    async def _stream():
+        seen = 0
+        terminal = _agent_jobs.JOB_STATUSES - {"queued", "running", "waiting_confirm"}
+        while True:
+            j = _agent_jobs.get_job(job_id) or {}
+            events = j.get("events") or []
+            for ev in events[seen:]:
+                seen += 1
+                yield (f"event: {ev.get('kind', 'message')}\n"
+                       f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+            st = j.get("status")
+            if st in terminal:
+                yield f"event: done\ndata: {json.dumps({'status': st}, ensure_ascii=False)}\n\n"
+                break
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/v1/dispatch/analyze", summary="分析输入应同步还是异步执行")
+async def api_dispatch_analyze(req: DispatchAnalyzeRequest) -> dict:
+    result = analyze_dispatch(req.text, history_turns=req.history_turns)
+    return {"ok": True, **result}
+
+
+@app.post("/api/v1/dispatch", summary="智能派发：分析后创建 Job 或返回同步建议")
+async def api_dispatch(req: DispatchRequest) -> dict:
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(422, "text 不能为空")
+    hist = 0
+    if req.messages:
+        hist = sum(1 for m in req.messages if m.get("role") == "user")
+    analysis = analyze_dispatch(text, history_turns=max(0, hist - 1))
+    mode = req.force_mode or analysis["mode"]
+    if mode not in ("sync", "async"):
+        raise HTTPException(422, "force_mode 须为 sync 或 async")
+    if mode == "sync":
+        return {"ok": True, "mode": "sync", "analysis": analysis,
+                "hint": "请调用 POST /api/v1/chat/stream（agent=true）"}
+    messages = req.messages or [{"role": "user", "content": text}]
+    job = _agent_jobs.create_job(
+        messages=messages,
+        title=text[:80],
+        session_id=req.session_id,
+        workspace=req.workspace or str(_get_workspace()),
+    )
+    _agent_jobs.enqueue_job(job["id"])
+    return {"ok": True, "mode": "async", "analysis": analysis, "job": job}
+
+
+@app.get("/api/v1/memory", summary="L1 记忆列表 + L3 画像摘要")
+async def api_memory_list(status: str = "active", limit: int = 50,
+                          workspace: str | None = None) -> dict:
+    if not _memory_enabled():
+        return {"ok": True, "enabled": False, "memories": [], "profile": {}}
+    ws = workspace or str(_get_workspace())
+    memories = _agent_memory.list_memories(status=status, limit=limit, workspace_id=ws)
+    profile = _agent_memory.load_profile()
+    return {
+        "ok": True,
+        "enabled": True,
+        "memories": memories,
+        "profile": {
+            "preferences": profile.get("preferences") or [],
+            "work_patterns": profile.get("work_patterns") or [],
+            "updated": profile.get("updated"),
+            "inject_preview": _agent_memory.profile_inject_text(profile),
+        },
+    }
+
+
+@app.get("/api/v1/memory/inject-preview", summary="预览本次将注入的记忆")
+async def api_memory_inject_preview(query: str = "", workspace: str | None = None) -> dict:
+    if not _memory_enabled():
+        return {"ok": True, "enabled": False}
+    preview = _agent_memory.inject_preview(query, workspace=workspace or str(_get_workspace()))
+    return {"ok": True, "enabled": True, **preview}
+
+
+@app.put("/api/v1/memory/profile", summary="更新 L3 画像偏好")
+async def api_memory_profile(req: ProfileUpdateRequest) -> dict:
+    if not _memory_enabled():
+        raise HTTPException(503, "记忆系统已关闭")
+    profile = _agent_memory.save_profile_preferences(req.preferences)
+    return {"ok": True, "profile": profile}
+
+
+@app.delete("/api/v1/memory/{memory_id}", summary="删除（撤销）单条 L1 记忆")
+async def api_memory_delete(memory_id: str) -> dict:
+    if not _memory_enabled():
+        raise HTTPException(503, "记忆系统已关闭")
+    ok = _agent_memory.forget_memory(memory_id)
+    if not ok:
+        raise HTTPException(404, "记忆不存在")
+    return {"ok": True, "deleted": memory_id}
+
+
+@app.put("/api/v1/memory/{memory_id}", summary="纠正单条 L1 记忆")
+async def api_memory_correct(memory_id: str, req: MemoryCorrectRequest) -> dict:
+    if not _memory_enabled():
+        raise HTTPException(503, "记忆系统已关闭")
+    ok = _agent_memory.correct_memory(memory_id, req.content.strip())
+    if not ok:
+        raise HTTPException(404, "记忆不存在")
+    return {"ok": True, "memory_id": memory_id}
+
+
+@app.get("/api/v1/schedules", summary="定时任务列表")
+async def api_schedules_list() -> dict:
+    return {"ok": True, "schedules": _schedules.list_schedules()}
+
+
+@app.post("/api/v1/schedules", summary="创建定时任务（到点创建 Job）")
+async def api_schedules_create(req: ScheduleCreateRequest) -> dict:
+    try:
+        row = _schedules.add_schedule(
+            time_hhmm=req.time, prompt=req.prompt, channel=req.channel,
+            chat_id=req.chat_id, session_id=req.session_id, enabled=req.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"ok": True, "schedule": row}
+
+
+@app.patch("/api/v1/schedules/{schedule_id}", summary="更新定时任务")
+async def api_schedules_update(schedule_id: str, req: ScheduleUpdateRequest) -> dict:
+    fields = {k: v for k, v in req.model_dump().items() if v is not None}
+    try:
+        row = _schedules.update_schedule(schedule_id, **fields)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not row:
+        raise HTTPException(404, "定时任务不存在")
+    return {"ok": True, "schedule": row}
+
+
+@app.delete("/api/v1/schedules/{schedule_id}", summary="删除定时任务")
+async def api_schedules_delete(schedule_id: str) -> dict:
+    if not _schedules.delete_schedule(schedule_id):
+        raise HTTPException(404, "定时任务不存在")
+    return {"ok": True, "deleted": schedule_id}
+
+
 @app.get("/api/v1/workspace", summary="查看当前工作区")
 async def get_workspace() -> dict:
     ws = _get_workspace()
@@ -1435,7 +1702,24 @@ async def health() -> dict:
         "tools": tools,
         "usage": _usage_summary(),
         "memory_stats": _memory_stats(),
+        "jobs": _jobs_stats(),
     }
+
+
+def _jobs_stats() -> dict:
+    try:
+        jobs = _agent_jobs.list_jobs(limit=200)
+        by_status: dict[str, int] = {}
+        for j in jobs:
+            st = str(j.get("status") or "unknown")
+            by_status[st] = by_status.get(st, 0) + 1
+        return {
+            "total": len(jobs),
+            "by_status": by_status,
+            "active": sum(by_status.get(s, 0) for s in ("queued", "running", "waiting_confirm")),
+        }
+    except Exception:
+        return {"total": 0, "by_status": {}, "active": 0}
 
 
 def _memory_stats() -> dict:
@@ -3810,6 +4094,7 @@ async def agent_respond(req: AskResponse) -> dict:
     拿不到 choice，HTTP 返回 200 但 Agent 仍按拒绝/超时处理）。
     重复响应幂等：已消费的确认不再改变结果。
     """
+    task_id_for_job = ""
     with _confirm_lock:
         entry = _confirm_table.get(req.request_id)
         if entry is None:
@@ -3824,7 +4109,11 @@ async def agent_respond(req: AskResponse) -> dict:
             # 已消费（重复点击/并发响应）：幂等返回，不改变最终结果
             return {"ok": True, "choice": entry["choice"], "already_processed": True}
         entry["choice"] = req.choice
+        task_id_for_job = entry.get("task_id") or ""
         entry["event"].set()
+    job = _agent_jobs.find_job_by_task_id(task_id_for_job)
+    if job and job.get("status") == "waiting_confirm":
+        _agent_jobs.update_job(job["id"], status="running", pending_ask=None)
     log.info("confirm %s -> %s", req.request_id, req.choice)
     return {"ok": True, "choice": req.choice}
 
@@ -3834,6 +4123,57 @@ class SessionAppend(BaseModel):
     title: str | None = Field(default=None, description="可选：自定义标题（省略则自动取首条用户消息）")
     request_id: str | None = Field(default=None, description="可选：幂等键（重复请求不重复追加）")
     expected_version: int | None = Field(default=None, description="可选：乐观锁（不匹配返回 409）")
+
+
+def _session_append_internal(sid: int, messages: list[dict],
+                             request_id: str | None = None) -> bool:
+    """后台任务完成时写回会话（无 HTTP；失败静默）。"""
+    if not messages:
+        return False
+    _ensure_sessions()
+    try:
+        with _session_lock:
+            s = _sessions.get(sid)
+            if s is None:
+                return False
+            seen_rids = s.setdefault("request_ids", [])
+            if request_id and request_id in seen_rids:
+                return True
+            validated = []
+            for m in messages:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    content = str(m["content"])
+                    if len(content) > SESSION_MSG_MAX_CHARS:
+                        content = content[:SESSION_MSG_MAX_CHARS]
+                    validated.append({"role": m["role"], "content": content})
+            if not validated:
+                return False
+            if request_id:
+                seen_rids.append(request_id)
+                if len(seen_rids) > 100:
+                    del seen_rids[:-100]
+            msgs = s.setdefault("messages", [])
+            msgs.extend(validated)
+            if len(msgs) > SESSION_MAX_MESSAGES:
+                del msgs[:len(msgs) - SESSION_MAX_MESSAGES]
+            total_chars = sum(len(m.get("content") or "") for m in msgs)
+            while msgs and total_chars > SESSION_TOTAL_MAX_CHARS:
+                dropped = msgs.pop(0)
+                total_chars -= len(dropped.get("content") or "")
+            if not s.get("title"):
+                for m in msgs:
+                    if m.get("role") == "user":
+                        s["title"] = (m.get("content") or "").strip().replace("\n", " ")[:SESSION_TITLE_CHARS]
+                        break
+            s["updated"] = time.strftime("%m-%d %H:%M")
+            s["version"] = s.get("version", 1) + 1
+            import copy as _copy
+            snapshot = _copy.deepcopy(s)
+            _persist_sessions_or_rollback(lambda: _rollback_session_state(s, snapshot))
+        return True
+    except Exception:
+        log.debug("job 会话写回失败", exc_info=True)
+        return False
 
 
 @app.get("/api/v1/sessions", summary="会话列表（默认仅摘要；full=1 时含完整消息）")
@@ -5438,6 +5778,225 @@ def _new_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _build_agent_messages(messages: list[dict], *, workspace: str = "",
+                          project_id: str | None = None) -> list[dict]:
+    """组装 Agent 模式消息：记忆注入 + system 后缀 + 任务/项目/技能/子 agent 清单。"""
+    messages = [dict(m) for m in _trim_messages(messages)]
+    last_user = next((str(m.get("content") or "") for m in reversed(messages)
+                      if m.get("role") == "user"), "")
+    dyn = _dynamic_memory_message(last_user, workspace=workspace)
+    if dyn:
+        insert_at = 0
+        while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+            insert_at += 1
+        messages.insert(insert_at, {"role": "system", "content": dyn})
+    appended = False
+    for m in messages:
+        if m.get("role") != "system":
+            continue
+        if "（动态记忆上下文" in (m.get("content") or ""):
+            continue
+        m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
+        todo_note = _todos_system_note()
+        if todo_note:
+            m["content"] += todo_note
+        project_note = _projects.project_system_note(project_id)
+        if project_note:
+            m["content"] += project_note
+        m["content"] += _skill_catalog_text()
+        m["content"] += _agent_catalog_text()
+        if _current_confirm_mode() == "plan":
+            m["content"] += (
+                "\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
+                "列出步骤与所需工具；用户批准前不要执行任何工具。"
+                "批准后按计划执行，计划内操作免确认。）")
+        appended = True
+        break
+    if not appended:
+        messages.insert(0, {"role": "system",
+                            "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
+                            + _projects.project_system_note(project_id)
+                            + _skill_catalog_text() + _agent_catalog_text()})
+    return messages
+
+
+def _schedule_loop() -> None:
+    """每分钟检查定时任务，到点创建异步 Job。"""
+    while True:
+        try:
+            for s in _schedules.due_schedules():
+                prompt = str(s.get("prompt") or "").strip()
+                if not prompt:
+                    continue
+                job = _agent_jobs.create_job(
+                    messages=[{"role": "user", "content": prompt}],
+                    title=prompt[:80],
+                    session_id=s.get("session_id"),
+                    request_id=f"schedule-{s.get('id')}",
+                )
+                _agent_jobs.enqueue_job(job["id"])
+                _schedules.mark_ran(s["id"])
+                log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
+        except Exception:
+            log.debug("schedule loop 异常", exc_info=True)
+        time.sleep(30)
+
+
+def _execute_agent_job(job_id: str) -> None:
+    """AgentJobWorker 回调：在后台线程中执行单个异步任务。"""
+    job = _agent_jobs.get_job(job_id)
+    if not job or job.get("status") != "queued":
+        return
+
+    cfg = load_config()
+    api_url = normalize_url(cfg.get("api_url"))
+    api_key = (cfg.get("api_key") or "").strip()
+    model = job.get("model") or cfg.get("model") or ""
+    if not api_url or not api_key:
+        _agent_jobs.update_job(job_id, status="failed", finished_at=time.time(),
+                               error="API 未配置")
+        return
+    if not model:
+        _agent_jobs.update_job(job_id, status="failed", finished_at=time.time(),
+                               error="未指定模型")
+        return
+
+    cancel = _agent_jobs.bind_cancel_event(job_id)
+    _agent_jobs.update_job(job_id, status="running", started_at=time.time())
+    _agent_jobs.append_event(job_id, "status", {"status": "running"})
+
+    if not _agent_lock.acquire(blocking=True, timeout=3600):
+        _agent_jobs.update_job(job_id, status="failed", finished_at=time.time(),
+                               error="等待 Agent 执行锁超时")
+        _agent_jobs.clear_cancel_event(job_id)
+        return
+
+    task_id = _new_task_id()
+    q: queue.Queue = queue.Queue()
+    run_record = {
+        "session_id": job.get("session_id"),
+        "request_id": job.get("request_id") or task_id,
+        "workspace": job.get("workspace") or "",
+        "session_version": job.get("session_version"),
+        "input_messages": [dict(m) for m in job.get("messages") or []],
+        "status": "", "final_answer": "", "tool_events": [],
+        "started_at": 0, "finished_at": 0,
+    }
+    _agent_jobs.update_job(job_id, task_id=task_id)
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    messages = _build_agent_messages(
+        job.get("messages") or [],
+        workspace=str(job.get("workspace") or ""),
+        project_id=job.get("project_id") or None,
+    )
+    temperature = float(job.get("temperature") or 0.7)
+    content_parts: list[str] = []
+    tool_calls = 0
+    final_status = "failed"
+    error_msg = ""
+
+    def _worker() -> None:
+        _agent_loop(api_url, headers, messages, model, temperature, q, cancel,
+                    0, None, None, task_id, run_record)
+
+    t = threading.Thread(target=_worker, daemon=True, name=f"agent-job-{job_id}")
+    t.start()
+
+    _lim_steps, lim_secs = _agent_limits()
+    deadline = time.monotonic() + lim_secs + 180
+
+    try:
+        while t.is_alive() or not q.empty():
+            if time.monotonic() > deadline:
+                cancel.set()
+                error_msg = f"任务超过时限（>{lim_secs}s）"
+                final_status = "failed"
+                break
+            try:
+                kind, data = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if kind == "delta" and data:
+                content_parts.append(str(data))
+            elif kind == "tool_call" and isinstance(data, dict):
+                tool_calls += 1
+                _agent_jobs.append_event(job_id, "tool_call", {
+                    "name": data.get("name"), "step": data.get("step")})
+                _agent_jobs.update_job(
+                    job_id,
+                    status="running",
+                    progress={"tool_calls": tool_calls,
+                              "last_tool": str(data.get("name") or "")},
+                )
+            elif kind == "ask" and isinstance(data, dict):
+                _agent_jobs.append_event(job_id, "ask", {"id": data.get("id"),
+                                                         "name": data.get("name")})
+                _agent_jobs.update_job(
+                    job_id,
+                    status="waiting_confirm",
+                    confirm_request_id=str(data.get("id") or ""),
+                    pending_ask=data,
+                )
+            elif kind == "done":
+                final_status = "completed"
+                _agent_jobs.append_event(job_id, "done", {"status": "completed"})
+                break
+            elif kind == "error":
+                error_msg = str(data or "任务失败")
+                final_status = "cancelled" if cancel.is_set() else "failed"
+                _agent_jobs.append_event(job_id, "error", {"detail": error_msg})
+                break
+        if t.is_alive():
+            t.join(timeout=60)
+    finally:
+        global _current_agent_task_id
+        with _agent_task_lock:
+            _current_agent_task_id = ""
+        try:
+            _agent_lock.release()
+        except RuntimeError:
+            pass
+        _agent_jobs.clear_cancel_event(job_id)
+
+    if cancel.is_set() and final_status != "completed":
+        final_status = "cancelled"
+        if not error_msg:
+            error_msg = "用户取消"
+
+    if final_status != "completed" and run_record.get("status") == "completed":
+        final_status = "completed"
+    elif final_status == "failed" and not error_msg:
+        error_msg = "任务异常结束（未收到完成信号）"
+
+    summary = (run_record.get("final_answer") or "".join(content_parts) or "").strip()
+    if len(summary) > 2000:
+        summary = summary[:1997] + "..."
+
+    _agent_jobs.update_job(
+        job_id,
+        status=final_status,
+        finished_at=time.time(),
+        result_summary=summary if final_status == "completed" else "",
+        error=error_msg if final_status != "completed" else "",
+        pending_ask=None,
+        confirm_request_id="",
+    )
+    mem_status = None if final_status == "completed" else final_status
+    _submit_memory_record(run_record, status=mem_status)
+    if final_status == "completed" and job.get("session_id"):
+        last_user = next((str(m.get("content") or "") for m in reversed(job.get("messages") or [])
+                          if m.get("role") == "user"), "")
+        if last_user and summary:
+            _session_append_internal(
+                int(job["session_id"]),
+                [{"role": "user", "content": last_user},
+                 {"role": "assistant", "content": summary}],
+                request_id=f"job-{job_id}",
+            )
+    log.info("agent job %s -> %s", job_id, final_status)
+
+
 async def _release_lock_when_done(fut) -> None:
     """后台 watcher：worker 最终结束后释放全局 agent 锁（防锁永久泄漏，幂等）。"""
     try:
@@ -5580,52 +6139,11 @@ async def chat_stream(req: ChatRequest):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     if req.agent:
-        # Agent 模式：附加工具说明到 system 消息，走工具调用循环
-        messages = [dict(m) for m in _trim_messages(req.messages)]
-        # R4：动态记忆上下文作为独立 system 消息插入（不拼进稳定前缀，
-        # 避免破坏提示词缓存；L3 注入版 + 去重后的 L1 召回）
-        dyn = _dynamic_memory_message(
-            next((str(m.get("content") or "") for m in reversed(messages)
-                  if m.get("role") == "user"), ""),
-            workspace=str(req.workspace or ""))
-        if dyn:
-            # 插到静态 system 之后、用户消息之前：静态前缀（system+工具定义）
-            # 保持字节级稳定才能命中 provider 前缀缓存；动态记忆放最前会让
-            # 每次请求的第一个 token 就不同 → 整个前缀缓存全部失效（H3）
-            insert_at = 0
-            while insert_at < len(messages) and messages[insert_at].get("role") == "system":
-                insert_at += 1
-            messages.insert(insert_at, {"role": "system", "content": dyn})
-        appended = False
-        for m in messages:
-            if m.get("role") != "system":
-                continue
-            if "（动态记忆上下文" in (m.get("content") or ""):
-                continue    # 动态记忆消息保持独立：SUFFIX 加到原 system
-            m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
-            # 注入当前任务清单：中断后模型能感知进度（半恢复）
-            todo_note = _todos_system_note()
-            if todo_note:
-                m["content"] += todo_note
-            project_note = _projects.project_system_note(req.project_id)
-            if project_note:
-                m["content"] += project_note
-            # 注入可用技能包清单（只注入清单，全文按需 load_skill）
-            m["content"] += _skill_catalog_text()
-            # 注入可用子 agent 清单（delegate 委派）
-            m["content"] += _agent_catalog_text()
-            # 计划审批模式：提示先规划
-            if _current_confirm_mode() == "plan":
-                m["content"] += ("\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
-                                 "列出步骤与所需工具；用户批准前不要执行任何工具。"
-                                 "批准后按计划执行，计划内操作免确认。）")
-            appended = True
-            break
-        if not appended:
-            messages.insert(0, {"role": "system",
-                                "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
-                                + _projects.project_system_note(req.project_id)
-                                + _skill_catalog_text() + _agent_catalog_text()})
+        messages = _build_agent_messages(
+            [dict(m) for m in req.messages],
+            workspace=str(req.workspace or ""),
+            project_id=req.project_id,
+        )
         return StreamingResponse(
             _agent_stream_events(api_url, headers, messages, model, req.temperature,
                                  session_id=req.session_id, request_id=req.request_id,
@@ -5769,6 +6287,9 @@ def _extract_reply(data: dict) -> str:
         raise LlmError(502, "模型只返回了推理内容、没有正式回答（reasoning_content 非空）——"
                             "若为连接测试请重试；若使用纯 reasoner 模型（如 deepseek-reasoner）请改用对话模型")
     raise LlmError(502, f"上游返回了空内容：{json.dumps(msg, ensure_ascii=False)[:200]}")
+
+
+_agent_jobs.set_job_handler(_execute_agent_job)
 
 
 if __name__ == "__main__":
