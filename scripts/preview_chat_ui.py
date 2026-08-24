@@ -21,7 +21,7 @@ from PIL import ImageGrab  # noqa: E402
 
 import chat  # noqa: E402
 
-OUT = ROOT / ".pcagent" / "ui-preview"
+OUT = ROOT / ".venus" / "ui-preview"
 OUT.mkdir(parents=True, exist_ok=True)
 
 

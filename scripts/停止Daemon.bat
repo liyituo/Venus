@@ -13,7 +13,7 @@ rem  the script does NOT report success.
 rem ============================================================
 
 set "ROOT=%~dp0.."
-set "PIDFILE=%ROOT%\.pcagent\daemon.pid"
+set "PIDFILE=%ROOT%\.venus\daemon.pid"
 
 if not exist "%PIDFILE%" (
     echo 未找到 PID metadata 文件（%PIDFILE%）。

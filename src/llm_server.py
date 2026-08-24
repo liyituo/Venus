@@ -65,6 +65,7 @@ import agent_memory as _agent_memory
 import extension_registry as _extensions
 import project_store as _projects  # noqa: E402
 from brand import APP_VERSION, SYSTEM_IDENTITY, env_is_set
+from data_paths import workspace_data_dir
 import browser_tools as _browser  # noqa: E402
 import sandbox_runner as _sandbox  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -376,7 +377,7 @@ REPO_MAP_TTL = 30                # repo_map 缓存秒数
 REPO_MAP_MAX_ENTRIES = 300
 REPO_MAP_MAX_DEPTH = 5
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
-             ".pcagent", ".idea", ".vscode", ".mypy_cache", ".pytest_cache"}
+             ".venus", ".pcagent", ".idea", ".vscode", ".mypy_cache", ".pytest_cache"}
 
 # ---- Token 用量优化 ----
 MAX_HISTORY_MESSAGES = 20    # 发送给上游的消息数上限（保留 system + 最近 N 条）
@@ -2922,7 +2923,7 @@ _todos_loaded = False
 
 
 def _todo_file() -> Path:
-    return _get_workspace() / ".pcagent" / "todos.json"
+    return workspace_data_dir(_get_workspace()) / "todos.json"
 
 
 def _load_todos() -> None:
@@ -2997,7 +2998,7 @@ def _todos_system_note() -> str:
     return note
 
 
-# ---- 会话持久化（权威存储在项目目录 .pcagent/，跟随程序 / U 盘移动，已 gitignore）----
+# ---- 会话持久化（权威存储在数据目录 sessions.json，跟随程序 / U 盘移动，已 gitignore）----
 SESSION_MAX = 50               # 会话数上限
 SESSION_MAX_MESSAGES = 200     # 单会话消息数上限（超出丢弃最早，防无限膨胀）
 SESSION_MSG_MAX_CHARS = 20_000      # 单条消息字符上限（超限拒绝）
@@ -3012,7 +3013,7 @@ _session_load_warning = ""     # 损坏恢复提示（向用户报告）
 
 
 def _session_file() -> Path:
-    """会话文件位置：数据目录 sessions.json（PCAGENT_DATA_DIR 可重定向）。"""
+    """会话文件位置：数据目录 sessions.json（VENUS_DATA_DIR 可重定向）。"""
     from data_paths import data_file
     return data_file("sessions.json")
 
@@ -3153,7 +3154,7 @@ _backup_lock = threading.Lock()
 
 def _backup_dir() -> Path:
     """备份目录绑定当前工作区（切换工作区后备份跟随，旧工作区数据不动）。"""
-    return _get_workspace() / ".pcagent" / "backups"
+    return workspace_data_dir(_get_workspace()) / "backups"
 
 
 def _backup_index() -> list[dict]:
@@ -4162,7 +4163,7 @@ def _execute_tool(name: str, arguments: str,
             existed = target.exists()
             if existed:
                 if not _take_backup(workspace, target, op="overwrite"):
-                    return False, "备份失败，已中止覆盖写入（请检查 .pcagent/backups 权限）"
+                    return False, "备份失败，已中止覆盖写入（请检查 .venus/backups 权限）"
             else:
                 # 新建也记录（undo 可删除新建文件）；无内容可备份，仅登记
                 if not _take_backup(workspace, target, op="create"):
@@ -4432,7 +4433,7 @@ def _execute_tool(name: str, arguments: str,
             if len(diff) > REPLACE_DIFF_CHARS:
                 diff = diff[:REPLACE_DIFF_CHARS] + "\n...(diff 过长已截断)"
             if not _take_backup(workspace, target):   # 备份失败：中止修改（安全方向）
-                return False, "备份失败，已中止修改（请检查 .pcagent/backups 权限）"
+                return False, "备份失败，已中止修改（请检查 .venus/backups 权限）"
             _atomic_write_text(target, new_text)
             _record_modified(target.relative_to(workspace).as_posix())
             return True, json.dumps({"file": args.get("file"), "occurrence": occ,

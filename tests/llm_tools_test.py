@@ -276,7 +276,7 @@ data = ok_json(res)
 check("list_todos 列表", ok and len(data.get("todos", [])) == 1, res)
 
 # 持久化 + 半恢复注入
-todo_file = WS / ".pcagent" / "todos.json"
+todo_file = WS / ".venus" / "todos.json"
 check("todo 持久化文件", todo_file.exists(), str(todo_file))
 note = L._todos_system_note()
 check("todo 注入 system", note and "修复登录 bug" in note, note[:100])

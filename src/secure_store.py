@@ -1,7 +1,7 @@
 """
 密钥安全存储 — API Key / Token 等敏感凭据不进明文配置文件。
 
-- Windows：DPAPI（CryptProtectData，当前用户级加密），密文 base64 存 .pcagent/secrets.json；
+- Windows：DPAPI（CryptProtectData，当前用户级加密），密文 base64 存 .venus/secrets.json；
 - 其他平台：明文写入权限受限文件（0600），并返回警告（不静默降级）；
 - 配置文件只保存占位符（"__secure__"），真实凭据在安全存储中；
 - 提供旧明文配置迁移入口（_migrate_plaintext）。
@@ -204,4 +204,4 @@ def platform_warning() -> str:
     if sys.platform == "win32":
         return ""
     return ("注意：当前平台无法使用 Windows DPAPI，密钥以受限权限文件"
-            "（0600）存储于 .pcagent/secrets.json，请确保磁盘与备份安全。")
+            "（0600）存储于 .venus/secrets.json，请确保磁盘与备份安全。")

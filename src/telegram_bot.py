@@ -48,7 +48,7 @@ log = logging.getLogger("telegram-bot")
 
 
 def _setup_file_logging() -> None:
-    """统一运行日志：写入项目根 .pcagent/bot.log（1MB 轮转，保留 3 份）。"""
+    """统一运行日志：写入数据目录 bot.log（1MB 轮转，保留 3 份）。"""
     try:
         from logging.handlers import RotatingFileHandler
         from data_paths import data_dir

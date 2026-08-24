@@ -10,7 +10,7 @@ Venus CLI — 在 Linux 虚拟机 / 任意终端使用 Venus（零依赖，纯�
   - --once 单次模式（脚本/自动化调用）
 
 用法：
-  python cli.py                                  # 读取 ~/.pcagent.json 或默认 127.0.0.1:8001
+  python cli.py                                  # 读取 ~/.venus.json 或默认 127.0.0.1:8001
   python cli.py --host 192.168.1.10 --port 8001 --token abc123
   python cli.py --once "屏幕分辨率是多少"        # 单次模式
   python cli.py /config host=192.168.1.10 token=abc123   # 保存连接配置
@@ -35,8 +35,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from brand import PRODUCT_NAME, PRODUCT_NAME_UPPER, TAGLINE
+from data_paths import cli_config_path
 
-CONFIG_PATH = Path.home() / ".pcagent.json"
+CONFIG_PATH = cli_config_path()
 
 # ---- 上下文容量与压缩 ----
 COMPRESS_THRESHOLD = 0.6      # 估算用量达到窗口的 60% 时触发压缩
@@ -994,7 +995,7 @@ class Cli:
             k, v = a.split("=", 1)
             cfg[k.strip()] = v.strip()
         save_config(cfg)
-        print(color("配置已保存到 ~/.pcagent.json（重启后生效）", "cyan"))
+        print(color("配置已保存到 ~/.venus.json（重启后生效）", "cyan"))
 
     def print_help(self) -> None:
         print(color(f"{PRODUCT_NAME} CLI — 通过 llm_server 控制电脑", "bold"))
@@ -1018,7 +1019,7 @@ class Cli:
         print(color("  /project          长任务项目：list / status / switch / clear", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
-        print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))
+        print(color("  /config k=v       保存连接配置到 ~/.venus.json（host/port/token）", "reset"))
         print(color("  /help             显示本帮助", "reset"))
         print(color("  /quit             退出", "reset"))
         print()
@@ -1046,7 +1047,7 @@ class Cli:
 def main() -> int:
     _setup_utf8_stdio()
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} CLI（Linux/终端使用）")
-    parser.add_argument("--host", default=None, help="llm_server 地址（默认读 ~/.pcagent.json 或 127.0.0.1）")
+    parser.add_argument("--host", default=None, help="llm_server 地址（默认读 ~/.venus.json 或 127.0.0.1）")
     parser.add_argument("--port", type=int, default=None, help="llm_server 端口（默认 8001）")
     parser.add_argument("--token", default=None, help="鉴权 token（llm_server --token 启用时必填）")
     parser.add_argument("--once", default=None, help="单次模式：发送一条消息后退出（脚本用）")

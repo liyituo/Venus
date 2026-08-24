@@ -73,7 +73,7 @@ wsl -d Debian -- bash -c "cd ~ && nohup .venv/bin/python telegram_bot.py &"
 
 bot 命令：`/status` `/stats` `/sessions` `/switch N` `/send <路径>`（把工作区文件发到你手机）`/schedule`（定时任务，见下）。
 
-**定时任务（`/schedule`）**：`/schedule add 08:00 搜索今日科技新闻并总结` 添加，到点自动执行并把结果推送到手机；`/schedule` 查看，`/schedule del <id>` 删除，`/schedule off|on <id>` 暂停/恢复。任务存 `.pcagent/schedules.json`，重启不丢。
+**定时任务（`/schedule`）**：`/schedule add 08:00 搜索今日科技新闻并总结` 添加，到点自动执行并把结果推送到手机；`/schedule` 查看，`/schedule del <id>` 删除，`/schedule off|on <id>` 暂停/恢复。任务存 `.venus/schedules.json`，重启不丢。
 
 ## 命令行
 
@@ -112,7 +112,7 @@ curl -X POST http://127.0.0.1:8001/api/v1/extensions/enable -H "Content-Type: ap
 
 ### 长任务项目模式
 
-跨天、跨会话的复杂任务可建 **项目**（目标 + 里程碑 + 检查点），数据在 `.pcagent/projects/`：
+跨天、跨会话的复杂任务可建 **项目**（目标 + 里程碑 + 检查点），数据在 `.venus/projects/`：
 
 | 工具 | 作用 |
 | --- | --- |
@@ -141,7 +141,7 @@ curl -X POST http://127.0.0.1:8001/api/v1/browser/enable
 
 ### 执行沙箱（阶段 3）
 
-不可信命令可用 `run_sandboxed_shell` / `run_sandboxed_code`（默认 `workspace` 档位、默认禁网、审计写入 `.pcagent/sandbox_audit.jsonl`）。`run_shell` 也可传 `sandbox: true`。
+不可信命令可用 `run_sandboxed_shell` / `run_sandboxed_code`（默认 `workspace` 档位、默认禁网、审计写入 `.venus/sandbox_audit.jsonl`）。`run_shell` 也可传 `sandbox: true`。
 
 ```powershell
 curl http://127.0.0.1:8001/api/v1/sandbox/status
@@ -284,28 +284,36 @@ MCP 工具多了之后，每次请求全量发送工具定义会挤爆上下文�
 
 | 层 | 机制 | 存储 |
 | --- | --- | --- |
-| **L0** 原文归档 | 每次任务的消息只追加归档（会话裁剪/清空不丢原文） | `.pcagent/memory/l0_events.jsonl`（10MB 轮转） |
-| **L1** 原子记忆 | 自动提取用户明确表达的偏好/约束/决定/事实；带来源溯源、可纠正可遗忘（superseded/retracted）；幂等游标防重复 | `.pcagent/memory/l1_memories.json`（版本信封） |
-| **L2** 场景归纳 | 上下文压缩成功时旁路派生场景（同目标聚合）；注入只给路径，正文按需加载 | `.pcagent/memory/l2_scenarios.json` |
-| **L3** 长期画像 | 显式偏好一次即入；推断模式需 ≥2 个独立会话；矛盾取最新表达；每条可反查 L1 来源 | `.pcagent/memory/profile.json` |
-| **动态 Skill** | 跑通的任务提炼 SOP 候选 → 2 次独立成功复用（或用户批准）才激活；`dynamic:` 命名空间不覆盖静态 skill | `.pcagent/memory/skills_dynamic.json` |
-| **CodeGraph** | Python 用 ast（其他语言正则回退）提取符号/调用/import；按工作区隔离、增量更新；改代码前影响分析 | `.pcagent/memory/codegraph.json` |
+| **L0** 原文归档 | 每次任务的消息只追加归档（会话裁剪/清空不丢原文） | `.venus/memory/l0_events.jsonl`（10MB 轮转） |
+| **L1** 原子记忆 | 自动提取用户明确表达的偏好/约束/决定/事实；带来源溯源、可纠正可遗忘（superseded/retracted）；幂等游标防重复 | `.venus/memory/l1_memories.json`（版本信封） |
+| **L2** 场景归纳 | 上下文压缩成功时旁路派生场景（同目标聚合）；注入只给路径，正文按需加载 | `.venus/memory/l2_scenarios.json` |
+| **L3** 长期画像 | 显式偏好一次即入；推断模式需 ≥2 个独立会话；矛盾取最新表达；每条可反查 L1 来源 | `.venus/memory/profile.json` |
+| **动态 Skill** | 跑通的任务提炼 SOP 候选 → 2 次独立成功复用（或用户批准）才激活；`dynamic:` 命名空间不覆盖静态 skill | `.venus/memory/skills_dynamic.json` |
+| **CodeGraph** | Python 用 ast（其他语言正则回退）提取符号/调用/import；按工作区隔离、增量更新；改代码前影响分析 | `.venus/memory/codegraph.json` |
 
 关键设计：
 
 - **保守提取**：只处理用户消息，排除代码块/疑问句/假设句/密钥/提示注入；规则候选优先，LLM 兜底默认关闭（配置 `llm_memory_extract: true` 开启）；只保存可追溯到用户明确陈述的内容，绝不存隐藏推理
-- **安全**：单 MemoryWorker + 有界队列，失败静默不影响聊天；会话删除同步遗忘来源记忆（pinned 显式记忆保留）；记忆文件全部在 `.pcagent/`（已 gitignore）
+- **安全**：单 MemoryWorker + 有界队列，失败静默不影响聊天；会话删除同步遗忘来源记忆（pinned 显式记忆保留）；记忆文件全部在 `.venus/`（已 gitignore）
 - **工具**：`remember`（主动写入）/ `recall_memory`（查记忆/场景正文/画像）/ `codegraph_query`（符号调用关系/影响分析）；均进工具路由核心集（路由开启仍可见），isolated 模式保留
 - **注入**：每轮对话在独立动态 system 消息中注入「画像 + 相关记忆」（≤300 字符，与对话冲突时以本轮为准），不破坏稳定前缀提示词缓存
 - **会话身份**：Chat GUI 流式请求携带 session_id/request_id/workspace/session_version，记忆可溯源到会话与工作区
 
 ## 会话与数据
 
-- 会话历史自动保存到项目根 `.pcagent/sessions.json`（含聊天记录，**已 gitignore，不会入库**）；重启自动恢复，chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
-- 记忆数据在 `.pcagent/memory/`（见上节）；文件修改自动备份到 `.pcagent/backups/`（`undo` 回滚用，50 条上限）
-- 运行日志写入 `.pcagent/server.log` 与 `.pcagent/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
-- 任务清单存在工作区 `.pcagent/todos.json`（跟随机器）；定时任务存 `.pcagent/schedules.json`
+- 会话历史自动保存到项目根 `.venus/sessions.json`（含聊天记录，**已 gitignore，不会入库**）；重启自动恢复，chat / cli / 网页 / Telegram 共享同一份历史（后端权威存储）
+- 记忆数据在 `.venus/memory/`（见上节）；文件修改自动备份到 `.venus/backups/`（`undo` 回滚用，50 条上限）
+- 运行日志写入 `.venus/server.log` 与 `.venus/bot.log`（1MB 轮转保留 3 份，排查问题看这里）
+- 任务清单存在工作区 `.venus/todos.json`（跟随机器）；定时任务存 `.venus/schedules.json`
 - 整个项目文件夹拷到 U 盘即可随身携带历史（`.venv` 需在每台机器重建，不进 U 盘）
+
+**从 PC Agent 升级（`.pcagent` → `.venus`）**：v0.9.1 起数据目录改名为 `.venus/`。首次启动会自动迁移；也可手动执行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\migrate_pcagent_to_venus.py
+```
+
+环境变量 `VENUS_DATA_DIR` 优先（兼容 `PCAGENT_DATA_DIR`）；CLI 配置迁移到 `~/.venus.json`（保留旧 `~/.pcagent.json`）。
 
 ## 进程守护（Linux）
 
@@ -342,7 +350,7 @@ mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_c
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
 telegram_config.json  bot 配置（含 token，已 gitignore，别提交）
 mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
-.pcagent/           会话历史 / 修改备份 / 运行日志 / 密钥库（gitignore，不入库）
+.venus/           会话历史 / 修改备份 / 运行日志 / 密钥库（gitignore，不入库）
 ```
 
 ## 开发与测试

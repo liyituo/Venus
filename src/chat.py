@@ -40,7 +40,8 @@ from PIL import Image, ImageEnhance, ImageTk, ImageOps
 # R3：Token 预算（动态压缩阈值）与历史检索（压缩后按需取回原文）
 from token_budget import plan_budget
 from history_index import HistoryIndex, find_keys
-from brand import PRODUCT_NAME, PRODUCT_NAME_UPPER, DAEMON_NAME
+from brand import DATA_DIR_NAME, PRODUCT_NAME, PRODUCT_NAME_UPPER, DAEMON_NAME
+from data_paths import data_file
 from quant_integration import (
     QuantIntegrationConfig,
     QuantLaunchError,
@@ -58,8 +59,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-# 统一日志目录（与 llm_server/gui 一致）：Daemon stderr 写入 .pcagent/daemon.err.log
-from data_paths import data_file
+# 统一日志目录（与 llm_server/gui 一致）：Daemon stderr 写入 .venus/daemon.err.log
 
 DAEMON_ERR_LOG = data_file("daemon.err.log")
 DAEMON_ERR_LOG_MAX = 1_000_000   # 轮转阈值（1MB → 重命名为 .log.1）
@@ -657,7 +657,7 @@ class SettingsWindow:
         if str(self.config.get("daemon_token") or "") == "__secure__":
             ent_daemon.delete(0, "end")
             ent_daemon.insert(0, self._TOKEN_PLACEHOLDER)
-        tk.Label(tab, text="数据目录：.pcagent/（会话/备份/日志，自动轮转与损坏恢复）",
+        tk.Label(tab, text=f"数据目录：{DATA_DIR_NAME}/（会话/备份/日志，自动轮转与损坏恢复）",
                  bg=BG, fg=TEXT_DIM, font=(self._ui_family, 8)).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=18, pady=(12, 0))
 

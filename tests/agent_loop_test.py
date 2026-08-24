@@ -168,7 +168,7 @@ check("todo_update 事件", "todo_update" in kinds, str(kinds))
 tu = next((p for k, p in events if k == "todo_update"), None)
 check("todo_update 内容", tu is not None and any(t.get("title") == "写单元测试" for t in tu.get("todos", [])),
       str(tu)[:150])
-check("todo 持久化", (WS / ".pcagent" / "todos.json").exists(), "")
+check("todo 持久化", (WS / ".venus" / "todos.json").exists(), "")
 
 # 下一次全新请求：system 应注入任务清单（半恢复）
 events2 = collect_events(client, {"agent": True, "messages": [

@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from data_paths import data_dir
+from data_paths import data_dir, workspace_data_dir
 
 log = logging.getLogger("sandbox_runner")
 
@@ -297,7 +297,7 @@ class SandboxRunner:
         if not source:
             return False, "没有可执行的代码（请提供 code 或 file）"
 
-        sandbox_dir = self.workspace / ".pcagent" / "sandbox_tmp"
+        sandbox_dir = workspace_data_dir(self.workspace) / "sandbox_tmp"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",

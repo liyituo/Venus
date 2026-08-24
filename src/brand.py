@@ -5,13 +5,15 @@ from __future__ import annotations
 PRODUCT_NAME = "Venus"
 PRODUCT_NAME_UPPER = "VENUS"
 PRODUCT_SLUG = "venus"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 TAGLINE = "桌面智能体 · 通过指令控制电脑"
 DAEMON_NAME = "Venus Daemon"
 
-# 数据目录名（v1 保留 legacy，避免迁移）
-DATA_DIR_NAME = ".pcagent"
+# 数据目录与 CLI 配置
+DATA_DIR_NAME = ".venus"
 LEGACY_DATA_DIR_NAME = ".pcagent"
+CLI_CONFIG_NAME = ".venus.json"
+LEGACY_CLI_CONFIG_NAME = ".pcagent.json"
 
 # 环境变量：新名优先，旧名兼容
 ENV_DATA_DIR = ("VENUS_DATA_DIR", "PCAGENT_DATA_DIR")

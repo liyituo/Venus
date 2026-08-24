@@ -37,7 +37,7 @@ from brand import DAEMON_NAME, PRODUCT_NAME
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-# 统一日志目录（与 llm_server/chat 一致）：Daemon stderr 写入 .pcagent/daemon.err.log
+# 统一日志目录（与 llm_server/chat 一致）：Daemon stderr 写入 .venus/daemon.err.log
 from data_paths import data_file
 
 DAEMON_ERR_LOG = data_file("daemon.err.log")
