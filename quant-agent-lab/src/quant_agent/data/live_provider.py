@@ -1,9 +1,10 @@
-"""LiveMarketDataProvider：自动拉取行情（美股 yfinance / A股 akshare）。
+"""LiveMarketDataProvider：自动拉取行情（美股 yfinance / A股多源）。
 
+- A 股数据源：新浪 / 腾讯 / 腾讯直连(gtimg) / 同花顺 / 东财 / 雪球(需 token)
 - 依赖 lazy import：未安装对应库时才报错（模块导入不受影响）
 - 拉取成功落盘缓存 var/data/market_snapshot.json（与 FileDataProvider 同格式，
   拉取失败回退上次缓存——离线可用）
-- symbol 约定：纯数字（600519 等）= A股（akshare）；其余 = 美股（yfinance）
+- symbol 约定：纯数字（600519 等）= A股；其余 = 美股（yfinance）
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from quant_agent.data.cn_fetchers import fetch_cn_daily, normalize_cn_sources
 from quant_agent.data.providers import FileDataProvider
 from quant_agent.domain.models import MarketBar, MarketSnapshot
 
@@ -63,10 +65,19 @@ class LiveMarketDataProvider(FileDataProvider):
     - load_account 等文件读取保留（账户仍来自本地 JSON）
     """
 
-    def __init__(self, data_dir: Path, market: str = "us", symbols: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        data_dir: Path,
+        market: str = "us",
+        symbols: tuple[str, ...] = (),
+        cn_sources: tuple[str, ...] | None = None,
+        xq_token_env: str = "QUANT_AGENT_XQ_TOKEN",
+    ):
         super().__init__(data_dir)
         self.market = market  # us | cn | both
         self.symbols = symbols
+        self.cn_sources = normalize_cn_sources(cn_sources)
+        self.xq_token_env = xq_token_env
 
     def load_market(self) -> MarketSnapshot:
         symbols = list(self.symbols)
@@ -85,7 +96,7 @@ class LiveMarketDataProvider(FileDataProvider):
         snapshot = MarketSnapshot(
             snapshot_id=f"live-{uuid.uuid4().hex[:8]}",
             as_of=max(b.timestamp for b in bars),
-            source="live-yfinance/akshare",
+            source="live-yfinance/cn-multi",
             bars=tuple(bars),
         )
         self.save_market(snapshot)  # 缓存（继承自 FileDataProvider）
@@ -114,7 +125,7 @@ class LiveMarketDataProvider(FileDataProvider):
         if _is_cn_symbol(symbol):
             if self.market not in ("cn", "both"):
                 raise ValueError(f"symbol {symbol} 是 A股，但 market={self.market}")
-            return self._fetch_akshare(symbol)
+            return self._fetch_cn(symbol)
         if self.market not in ("us", "both"):
             raise ValueError(f"symbol {symbol} 是美股，但 market={self.market}")
         return self._fetch_yfinance(symbol)
@@ -150,74 +161,35 @@ class LiveMarketDataProvider(FileDataProvider):
             )
         return bars
 
-    def _fetch_akshare(self, symbol: str) -> list[MarketBar]:
-        import akshare as ak  # lazy：未安装才报错
+    def _fetch_cn(self, symbol: str) -> list[MarketBar]:
+        import os
 
         code = symbol.zfill(6) if symbol.isdigit() else symbol
-        df = self._fetch_akshare_daily(ak, code)
-        if df is None or df.empty:
-            raise ValueError("akshare 返回空数据")
-        bars = []
-        for _, row in df.tail(120).iterrows():
-            if "date" in row:
-                dt = datetime.strptime(str(row["date"]), "%Y-%m-%d").replace(tzinfo=UTC)
-                open_, high, low, close, volume = (
-                    row["open"],
-                    row["high"],
-                    row["low"],
-                    row["close"],
-                    row["volume"],
-                )
-            else:
-                dt = datetime.strptime(str(row["日期"]), "%Y-%m-%d").replace(tzinfo=UTC)
-                open_, high, low, close, volume = (
-                    row["开盘"],
-                    row["最高"],
-                    row["最低"],
-                    row["收盘"],
-                    row["成交量"],
-                )
+        xq_token = os.environ.get(self.xq_token_env, "").strip() or None
+        frame = fetch_cn_daily(
+            code, sources=self.cn_sources, lookback=int(_CN_LOOKBACK), xq_token=xq_token
+        )
+        bars: list[MarketBar] = []
+        for row in frame.rows:
+            dt = datetime.strptime(str(row["date"]), "%Y-%m-%d").replace(tzinfo=UTC)
             bars.append(
                 MarketBar(
                     symbol=code,
                     timestamp=dt,
-                    open=_dec(open_),
-                    high=_dec(high),
-                    low=_dec(low),
-                    close=_dec(close),
-                    volume=_dec(volume),
+                    open=_dec(row["open"]),
+                    high=_dec(row["high"]),
+                    low=_dec(row["low"]),
+                    close=_dec(row["close"]),
+                    volume=_dec(row["volume"]),
                     currency="CNY",
                     timeframe="1d",
-                    source="akshare",
+                    source=str(row.get("source", frame.source)),
                     is_synthetic=False,
                     session="regular",
                     snapshot_id="",
                 )
             )
         return bars
-
-    @staticmethod
-    def _fetch_akshare_daily(ak, code: str):
-        """新浪 -> 腾讯 -> 东财，与 tiny_moe_quant fetch 脚本一致。"""
-        sina = ("sh" if code.startswith("6") else "sz") + code
-        tx = sina
-        for attempt, fetch in enumerate(
-            (
-                lambda: ak.stock_zh_a_daily(symbol=sina, adjust="qfq"),
-                lambda: ak.stock_zh_a_hist_tx(symbol=tx),
-                lambda: ak.stock_zh_a_hist(
-                    symbol=code, period="daily", start_date="", end_date="", adjust="qfq"
-                ),
-            )
-        ):
-            try:
-                df = fetch()
-                if df is not None and not df.empty:
-                    return df
-            except Exception as exc:  # noqa: BLE001 — 尝试下一数据源
-                if attempt == 2:
-                    raise exc
-        return None
 
 
 def _dec(value) -> Decimal:

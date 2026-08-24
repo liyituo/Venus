@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from quant_agent.data.cn_fetchers import normalize_cn_sources
 from quant_agent.domain.models import to_dict
 
 yaml: Any
@@ -89,6 +90,8 @@ class MarketDataConfig:
     market: str = "us"  # us | cn | both
     symbols: tuple[str, ...] = ()
     symbols_file: str = ""
+    cn_sources: tuple[str, ...] = ()
+    xq_token_env: str = "QUANT_AGENT_XQ_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,8 @@ def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
             market=str(market_data_yaml.get("market", "us")),
             symbols=symbols,
             symbols_file=str(market_data_yaml.get("symbols_file", "") or ""),
+            cn_sources=normalize_cn_sources(market_data_yaml.get("cn_sources")),
+            xq_token_env=str(market_data_yaml.get("xq_token_env", "QUANT_AGENT_XQ_TOKEN")),
         ),
     )
 

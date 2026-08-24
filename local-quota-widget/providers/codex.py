@@ -188,5 +188,5 @@ def fetch_codex_quota() -> ProviderQuota:
         plan=plan,
         windows=windows[:3],
         extra_lines=extra,
-        updated_at=datetime.now().strftime("%H:%M:%S"),
+        updated_at=datetime.now().strftime("%H:%M"),
     )

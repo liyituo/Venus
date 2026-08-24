@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Agent CLI — 在 Linux 虚拟机 / 任意终端使用 PC Agent（零依赖，纯标准库）
+Venus CLI — 在 Linux 虚拟机 / 任意终端使用 Venus（零依赖，纯标准库）
 
 通过 HTTP 连接 Windows 主机上运行的 llm_server（:8001）：
   - Agent 对话：模型可调用工具（click/type_text/press_key/…）操作主机屏幕
@@ -33,6 +33,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from brand import PRODUCT_NAME, PRODUCT_NAME_UPPER, TAGLINE
 
 CONFIG_PATH = Path.home() / ".pcagent.json"
 
@@ -199,25 +201,25 @@ def _setup_utf8_stdio() -> None:
 
 
 # ======================================================================
-# PC Agent 标准启动横幅（figlet 风格 ASCII 大字）
+# Venus 启动横幅
 # ======================================================================
-PC_AGENT_LOGO = [
-    " ██████╗ ██████╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗",
-    "██╔════╝██╔════╝    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝",
-    "██║     ██║         ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ",
-    "██║     ██║         ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ",
-    "╚██████╗╚██████╗    ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ",
-    " ╚═════╝ ╚═════╝    ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ",
+VENUS_LOGO = [
+    "██╗   ██╗███████╗███╗   ██╗██╗   ██╗███████╗",
+    "██║   ██║██╔════╝████╗  ██║██║   ██║██╔════╝",
+    "██║   ██║█████╗  ██╔██╗ ██║██║   ██║███████╗",
+    "╚██╗ ██╔╝██╔══╝  ██║╚██╗██║██║   ██║╚════██║",
+    " ╚████╔╝ ███████╗██║ ╚████║╚██████╔╝███████║",
+    "  ╚═══╝  ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝",
 ]
 
 
 def print_banner() -> None:
-    """打印 PC Agent 标准横幅（非 TTY 时跳过，避免污染管道输出）。"""
+    """打印 Venus 标准横幅（非 TTY 时跳过，避免污染管道输出）。"""
     if not sys.stdout.isatty():
         return
-    for line in PC_AGENT_LOGO:
+    for line in VENUS_LOGO:
         print(color(line, "cyan"))
-    print(color("  PC Agent — 桌面智能体 · 通过指令控制电脑", "bold"))
+    print(color(f"  {PRODUCT_NAME} — {TAGLINE}", "bold"))
     print()
 
 
@@ -725,6 +727,8 @@ class Cli:
             self.handle_reasoning(parts[1:])
         elif cmd == "/agents":
             self.handle_agents()
+        elif cmd == "/project":
+            self.handle_project(parts[1:])
         elif cmd == "/config":
             self.handle_config(parts[1:])
         else:
@@ -923,6 +927,64 @@ class Cli:
             print(color(f"  {a['name']}{extra}", "bold"))
             print(color(f"    {a.get('description') or '无描述'}", "dim"))
 
+    def handle_project(self, args: List[str]) -> None:
+        """长任务项目：/project list | status | switch <id> | clear"""
+        sub = (args[0].lower() if args else "list")
+        if sub in ("list", "ls"):
+            code, data = self.client.api("GET", "/api/v1/projects")
+            if code != 200 or not data.get("ok"):
+                print(color(f"✗ 获取项目失败：{data.get('detail', code)}", "red"))
+                return
+            active = data.get("active") or ""
+            items = data.get("projects") or []
+            if not items:
+                print(color("暂无项目（对话中让 Agent 用 create_project 创建）", "dim"))
+                return
+            print(color("=== 长任务项目 ===", "bold"))
+            for p in items:
+                mark = "→" if p.get("id") == active else " "
+                print(color(f"  {mark} {p.get('id')}  {p.get('title')} [{p.get('status')}]", "reset"))
+        elif sub == "status":
+            code, data = self.client.api("GET", "/api/v1/projects")
+            if code != 200:
+                print(color("✗ 无法获取活跃项目", "red"))
+                return
+            pid = data.get("active") or ""
+            if not pid:
+                print(color("当前无活跃项目", "dim"))
+                return
+            code2, detail = self.client.api("GET", f"/api/v1/projects/{pid}")
+            if code2 != 200:
+                print(color(f"✗ 读取项目失败：{detail.get('detail', code2)}", "red"))
+                return
+            meta = detail.get("meta") or {}
+            print(color(f"项目：{meta.get('title')} ({pid})", "bold"))
+            print(color(f"  目标：{meta.get('goal') or '（未填写）'}", "reset"))
+            print(color(f"  状态：{meta.get('status')}", "reset"))
+            ms = detail.get("milestones") or []
+            if ms:
+                print(color("  里程碑：", "reset"))
+                for m in ms:
+                    print(color(f"    [{m.get('status')}] {m.get('title')}", "dim"))
+        elif sub == "switch":
+            if len(args) < 2:
+                print(color("用法：/project switch <project_id>", "yellow"))
+                return
+            code, data = self.client.api("POST", "/api/v1/projects/active",
+                                         {"project_id": args[1]})
+            if code == 200 and data.get("ok"):
+                print(color(f"✓ 已切换活跃项目：{args[1]}", "green"))
+            else:
+                print(color(f"✗ 切换失败：{data.get('detail', code)}", "red"))
+        elif sub == "clear":
+            code, data = self.client.api("POST", "/api/v1/projects/active", {"project_id": ""})
+            if code == 200:
+                print(color("✓ 已清除活跃项目", "green"))
+            else:
+                print(color(f"✗ 失败：{data.get('detail', code)}", "red"))
+        else:
+            print(color("用法：/project list | status | switch <id> | clear", "yellow"))
+
     def handle_config(self, args: List[str]) -> None:
         cfg = load_config()
         for a in args:
@@ -935,7 +997,7 @@ class Cli:
         print(color("配置已保存到 ~/.pcagent.json（重启后生效）", "cyan"))
 
     def print_help(self) -> None:
-        print(color("PC Agent CLI — 通过 llm_server 控制电脑", "bold"))
+        print(color(f"{PRODUCT_NAME} CLI — 通过 llm_server 控制电脑", "bold"))
         print()
         print(color("== 会话管理 ==", "cyan"))
         print(color("  /new              新建会话", "reset"))
@@ -953,6 +1015,7 @@ class Cli:
         print(color("  /confirm-mode     问询模式：↑/↓ 方向键选择，回车确认", "reset"))
         print(color("  /reasoning        推理强度：↑/↓ 选择 最高(max)/高(high)/关闭(off)", "reset"))
         print(color("  /agents           子 agent 列表（视觉分析等，自动委派）", "reset"))
+        print(color("  /project          长任务项目：list / status / switch / clear", "reset"))
         print()
         print(color("== 配置 ==", "cyan"))
         print(color("  /config k=v       保存连接配置到 ~/.pcagent.json（host/port/token）", "reset"))
@@ -982,7 +1045,7 @@ class Cli:
 # ======================================================================
 def main() -> int:
     _setup_utf8_stdio()
-    parser = argparse.ArgumentParser(description="PC Agent CLI（Linux/终端使用）")
+    parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} CLI（Linux/终端使用）")
     parser.add_argument("--host", default=None, help="llm_server 地址（默认读 ~/.pcagent.json 或 127.0.0.1）")
     parser.add_argument("--port", type=int, default=None, help="llm_server 端口（默认 8001）")
     parser.add_argument("--token", default=None, help="鉴权 token（llm_server --token 启用时必填）")

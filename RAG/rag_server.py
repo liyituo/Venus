@@ -4,7 +4,7 @@
 - 集合（collection）隔离知识域；文档分块 + 向量索引（numpy 余弦）
 - Embedding 来自本地 Ollama（nomic-embed-text）；Ollama 不可达自动降级词法检索
 - 数据落盘 data/{collection}.json（原子写），重启不丢
-- 暴露 HTTP API，供 PC Agent / 其他客户端接入（见 README「Agent 接入」）
+- 暴露 HTTP API，供 Venus / 其他客户端接入（见 README「Agent 接入」）
 
 运行：python rag_server.py [--port 8010] [--token xxx]
 """

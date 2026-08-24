@@ -1,5 +1,5 @@
 @echo off
-title PC Agent Daemon - Stop
+title Venus Daemon - Stop
 cd /d "%~dp0"
 
 rem ============================================================

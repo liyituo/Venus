@@ -1,5 +1,5 @@
 [Unit]
-Description=PC Agent LLM Server (isolated)
+Description=Venus LLM Server (isolated)
 After=network.target
 
 [Service]

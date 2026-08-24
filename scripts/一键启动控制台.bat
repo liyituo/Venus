@@ -1,5 +1,5 @@
 @echo off
-title PC Agent Daemon - One-Click Launcher
+title Venus - One-Click Launcher
 cd /d "%~dp0"
 
 rem ============================================================

@@ -1,0 +1,9 @@
+{
+  "id": "daily-brief",
+  "name": "每日简报",
+  "version": "1.0.0",
+  "type": "skill",
+  "skill_name": "daily-brief",
+  "permissions": ["network"],
+  "description": "搜索科技新闻并汇总系统状态"
+}

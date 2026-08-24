@@ -1,5 +1,5 @@
 """
-PC Agent Daemon — 桌面 GUI 控制面板（Tkinter，零额外运行时依赖）
+Venus Daemon — 桌面 GUI 控制面板（Tkinter，零额外运行时依赖）
 
 功能
 ----
@@ -32,6 +32,8 @@ import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageTk
+
+from brand import DAEMON_NAME, PRODUCT_NAME
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -154,7 +156,7 @@ class GuiApp:
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        self.root.title("PC Agent Daemon 控制台")
+        self.root.title(f"{DAEMON_NAME} 控制台")
         self.root.geometry("1100x700")
         self.root.configure(bg="#050505")
 
@@ -162,7 +164,7 @@ class GuiApp:
         bar = tk.Frame(self.root, bg="#141419", bd=0, highlightthickness=1,
                        highlightbackground="#2a2a35")
         bar.pack(fill="x")
-        tk.Label(bar, text="🖥️ PC Agent Daemon", bg="#141419", fg="#f8fafc",
+        tk.Label(bar, text=f"🖥️ {DAEMON_NAME}", bg="#141419", fg="#f8fafc",
                  font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=12, pady=8)
         self.badge = tk.Label(bar, text="连接中…", bg="#141419", fg="#94a3b8",
                               font=("Microsoft YaHei UI", 11, "bold"), padx=10)
@@ -579,7 +581,7 @@ class GuiApp:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="PC Agent Daemon 桌面控制面板")
+    parser = argparse.ArgumentParser(description=f"{DAEMON_NAME} 桌面控制面板")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-spawn", action="store_true",

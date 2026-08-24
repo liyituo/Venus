@@ -1,5 +1,5 @@
 @echo off
-title PC Agent Daemon - Background Start
+title Venus Daemon - Background Start
 cd /d "%~dp0"
 
 rem ============================================================
@@ -36,7 +36,7 @@ rem ---- start daemon; the python side writes daemon.pid metadata with its own P
 if not exist "%ROOT%\.pcagent" mkdir "%ROOT%\.pcagent"
 
 rem stderr/stdout 重定向到 daemon.err.log（该文件真实存在，与提示一致）
-start "PC Agent Daemon" cmd /c ""%VENV_PY%" "%APP%" --port 8000 --pid-file "%PIDFILE%" > "%ROOT%\.pcagent\daemon.err.log" 2>&1"
+start "Venus Daemon" cmd /c ""%VENV_PY%" "%APP%" --port 8000 --pid-file "%PIDFILE%" > "%ROOT%\.pcagent\daemon.err.log" 2>&1"
 if errorlevel 1 (
     echo [错误] Daemon 启动失败（exit code %errorlevel%）。
     exit /b 1

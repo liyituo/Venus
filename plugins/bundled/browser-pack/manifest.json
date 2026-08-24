@@ -1,0 +1,8 @@
+{
+  "id": "browser-pack",
+  "name": "浏览器工具包",
+  "version": "1.0.0",
+  "type": "mcp",
+  "skill_name": "browser-pack",
+  "description": "启用 Playwright MCP chrome server 与浏览器别名工具。"
+}

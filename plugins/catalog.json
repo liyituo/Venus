@@ -1,0 +1,34 @@
+{
+  "plugins": [
+    {
+      "id": "daily-brief",
+      "name": "每日简报",
+      "version": "1.0.0",
+      "type": "skill",
+      "author": "venus",
+      "description": "搜索今日科技新闻并汇总系统状态，生成每日简报。",
+      "source": "plugins/bundled/daily-brief",
+      "builtin": true
+    },
+    {
+      "id": "code-review-pack",
+      "name": "代码审查助手",
+      "version": "1.0.0",
+      "type": "agent",
+      "author": "venus",
+      "description": "打包 code-review 子 agent 定义，一键启用代码审查专家。",
+      "source": "plugins/bundled/code-review-pack",
+      "builtin": true
+    },
+    {
+      "id": "browser-pack",
+      "name": "浏览器工具包",
+      "version": "1.0.0",
+      "type": "mcp",
+      "author": "venus",
+      "description": "Playwright MCP chrome server + 浏览器别名工具（browser_open 等）。",
+      "source": "plugins/bundled/browser-pack",
+      "builtin": true
+    }
+  ]
+}

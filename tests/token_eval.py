@@ -22,7 +22,7 @@ import token_budget as TB  # noqa: E402
 
 # ---- 优化前的原始系统提示词（基准；语义与现版等价但更长）----
 BASELINE_SYSTEM = (
-    "\n\n你是 PC Agent，一个可以控制用户电脑的智能体。你可以通过工具操作电脑、编写和修改代码。\n"
+    "\n\n你是 Venus，一个可以控制用户电脑的智能体。你可以通过工具操作电脑、编写和修改代码。\n"
     "编程工作流：\n"
     "1. 先 repo_map 了解项目结构，search_text / glob_files 定位相关代码，list_symbols 查看文件内部结构。\n"
     "2. 修改用 replace_text 小步替换（系统会展示 diff 请用户确认）；新文件用 create_file。\n"

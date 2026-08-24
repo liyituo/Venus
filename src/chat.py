@@ -1,5 +1,5 @@
 """
-PC Agent Chat — Codex 风格的交互前端（Tkinter，零额外依赖）
+Venus Chat — Codex 风格的交互前端（Tkinter，零额外依赖）
 
 改进点
 ------
@@ -40,6 +40,7 @@ from PIL import Image, ImageEnhance, ImageTk, ImageOps
 # R3：Token 预算（动态压缩阈值）与历史检索（压缩后按需取回原文）
 from token_budget import plan_budget
 from history_index import HistoryIndex, find_keys
+from brand import PRODUCT_NAME, PRODUCT_NAME_UPPER, DAEMON_NAME
 from quant_integration import (
     QuantIntegrationConfig,
     QuantLaunchError,
@@ -74,45 +75,23 @@ def _open_daemon_err_log():
         pass
     return open(DAEMON_ERR_LOG, "a", encoding="utf-8")
 
-# ===== 视觉系统：低饱和深空底色 + 克制的冰蓝/紫色状态色 =====
-BG = "#03050a"
-SURFACE = "#070a11"
-SIDEBAR_BG = "#080b13"
-PANEL = "#0a0f19"
-PANEL_LIGHT = "#111827"
-PANEL_HOVER = "#172033"
-BORDER = "#1d2939"
-BORDER_ACTIVE = "#45607d"
-TEXT = "#f2f6fb"
-TEXT_SOFT = "#c8d2df"
-TEXT_DIM = "#8391a5"
-TEXT_MUTED = "#586579"
-ACCENT = "#8cecff"
-ACCENT_HOVER = "#b9f4ff"
-ACCENT_DIM = "#2c6f8f"     # 聚焦发光用的低亮冰蓝
-USER_BUBBLE = "#12334a"
-USER_BUBBLE_HI = "#153d58"
-AGENT_BUBBLE = "#0d1420"
-AGENT_BUBBLE_HI = "#111a2a"
-STOP = "#ff7387"
-OK = "#55e6b5"
-WARN = "#ffc978"
-CODE_BG = "#060a11"
-CODE_FG = "#d0d9e6"
-VIOLET = "#afa3ff"
-VIOLET_DIM = "#4a3f7e"     # 徽章/图标用的低亮紫
-
-
-def _pick_font_family(root: tk.Misc, *candidates: str) -> str:
-    """选择本机存在的字体，避免把 Windows 11 字体硬编码成运行前提。"""
-    try:
-        available = {name.casefold(): name for name in font.families(root)}
-        for candidate in candidates:
-            if candidate.casefold() in available:
-                return available[candidate.casefold()]
-    except tk.TclError:
-        pass
-    return candidates[-1]
+# ===== 视觉系统：统一走 chat_theme 设计系统（深空 · 冰蓝）=====
+# 色板令牌、胶囊按钮、圆角绘制与设计规范都集中在 chat_theme.py，
+# 这里只做命名导入；旧常量名全部保留，供既有代码与测试引用。
+import chat_theme as theme
+from chat_theme import (
+    BG, SURFACE, SIDEBAR_BG, PANEL, PANEL_LIGHT, PANEL_HOVER,
+    BORDER, BORDER_ACTIVE, TEXT, TEXT_SOFT, TEXT_DIM, TEXT_MUTED,
+    ACCENT, ACCENT_HOVER, ACCENT_DIM, USER_BUBBLE, USER_BUBBLE_HI,
+    AGENT_BUBBLE, AGENT_BUBBLE_HI, STOP, OK, WARN, CODE_BG, CODE_FG,
+    VIOLET, VIOLET_DIM,
+    BG0, BG1, BG2, BG3, BG4, BG5, LINE0, LINE1, LINE2, FOCUS, SEL,
+    INK1, INK2, INK3, INK4, CY1, CY2, CY_DEEP, CY_FAINT, ON_CY,
+    VI1, VI_DEEP, VI_FAINT, POS, POS_SOFT, WARN_SOFT, NEG, NEG_SOFT,
+    CONTENT_BG, BUBBLE_LINE_U, BUBBLE_LINE_A, BUBBLE_HI_LINE_U, BUBBLE_HI_LINE_A,
+    RoundedButton, Kicker, entry_opts, rounded_rect, auto_fg,
+    pick_font_family as _pick_font_family,
+)
 
 def _opt_value_str(v) -> str:
     """选项值字符串化：bool → "0"/"1"（兼容历史 bool 存储），其余转字符串。
@@ -333,7 +312,7 @@ class SettingsWindow:
             self.win, "Microsoft YaHei UI", "Segoe UI Variable Display", "Segoe UI")
         self._mono_family = _pick_font_family(
             self.win, "Cascadia Code", "Cascadia Mono", "Consolas", "Courier New")
-        self.win.title("设置 - PC Agent")
+        self.win.title(f"设置 - {PRODUCT_NAME}")
         self.win.geometry("820x680")
         self.win.minsize(740, 610)
         self.win.configure(bg=BG)
@@ -344,12 +323,12 @@ class SettingsWindow:
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        header = tk.Frame(self.win, bg="#070b12", height=96,
-                          highlightthickness=1, highlightbackground="#101827")
+        header = tk.Frame(self.win, bg=BG1, height=96,
+                          highlightthickness=1, highlightbackground=LINE0)
         header.pack(fill="x")
         header.pack_propagate(False)
         # 顶部霓虹渐变横幅（冰蓝：左暗右亮，静态绘制零开销）
-        banner = tk.Canvas(header, height=3, bg="#070b12",
+        banner = tk.Canvas(header, height=3, bg=BG1,
                            highlightthickness=0, bd=0)
         banner.pack(fill="x", side="top")
 
@@ -357,35 +336,70 @@ class SettingsWindow:
             w = max(banner.winfo_width(), 1)
             banner.delete("all")
             steps = 48
+            lo = theme._parse_hex("#0d2030")
+            hi = theme._parse_hex(CY_DEEP)
             for i in range(steps):
                 t = i / max(1, steps - 1)
-                r = int(14 + (44 - 14) * t)
-                g = int(43 + (111 - 43) * t)
-                b = int(64 + (143 - 64) * t)
+                r = int(lo[0] + (hi[0] - lo[0]) * t)
+                g = int(lo[1] + (hi[1] - lo[1]) * t)
+                b = int(lo[2] + (hi[2] - lo[2]) * t)
                 x0 = w * i // steps
                 x1 = w * (i + 1) // steps
                 banner.create_rectangle(x0, 0, x1, 3, fill=f"#{r:02x}{g:02x}{b:02x}",
                                         outline="")
 
         banner.bind("<Configure>", _draw_banner)
-        tk.Label(header, text="SYSTEM  /  CONFIGURATION", bg="#070b12", fg=ACCENT,
-                 font=(self._mono_family, 8, "bold")).pack(anchor="w", padx=24, pady=(16, 0))
-        tk.Label(header, text="设置", bg="#070b12", fg=TEXT,
+        Kicker(header, "SYSTEM  /  CONFIGURATION", bg=BG1,
+               mono_family=self._mono_family, fg=ACCENT, bar=ACCENT).pack(
+            anchor="w", padx=24, pady=(18, 0))
+        tk.Label(header, text="设置", bg=BG1, fg=TEXT,
                  font=(self._display_family, 18, "bold")).pack(anchor="w", padx=24)
-        tk.Label(header, text="连接、权限与工具都在这里集中管理", bg="#070b12", fg=TEXT_DIM,
-                 font=(self._ui_family, 8)).place(x=112, y=55)
+        tk.Label(header, text="连接、权限与工具都在这里集中管理", bg=BG1, fg=TEXT_DIM,
+                 font=(self._ui_family, 8)).place(x=112, y=57)
 
-        nb = ttk.Notebook(self.win)
-        nb.pack(fill="both", expand=True, padx=18, pady=(15, 10))
+        # 底部：状态提示 + 按钮。先于 Notebook 打包（side=bottom 先占位，
+        # 否则 expand 的 Notebook 会把底部按钮栏挤没）。
+        footer = tk.Frame(self.win, bg=BG1, highlightthickness=1,
+                          highlightbackground=LINE0)
+        footer.pack(fill="x", side="bottom")
+        self.test_result = tk.Label(footer, text="", bg=BG1, fg=TEXT_DIM,
+                                    justify="left", anchor="w", wraplength=760,
+                                    font=(self._ui_family, 9))
+        self.test_result.pack(fill="x", padx=22, pady=(9, 0))
+        btns = tk.Frame(footer, bg=BG1)
+        btns.pack(fill="x", padx=20, pady=(8, 14))
+        self.test_btn = self._btn(btns, "测试连接", self._test_connection)
+        self.test_btn.pack(side="left")
+        self._btn(btns, "取消", self.win.destroy).pack(side="right", padx=(8, 0))
+        self._btn(btns, "保存", self._save, accent=True).pack(side="right")
+
+        # Notebook 样式必须在控件创建前配置（clam 的布局/边框手术对
+        # 已创建控件不一定生效）
         try:
             style = ttk.Style()
             style.theme_use("clam")
-            style.configure("Cosmic.TNotebook", background=BG, borderwidth=0)
-            style.configure("Cosmic.TNotebook.Tab", background="#0d131e", foreground=TEXT_DIM,
-                            borderwidth=0, padding=(16, 8), font=(self._ui_family, 9, "bold"))
+            # clam 的边框由 bordercolor/lightcolor/darkcolor 决定，且主题自带
+            # 的 style.map 优先于 configure —— 全部用深色令牌覆盖掉
+            style.configure("Cosmic.TNotebook", background=BG, borderwidth=0,
+                            bordercolor=BG0, lightcolor=BG0, darkcolor=BG0)
+            style.configure("Cosmic.TNotebook.Tab", background=BG2, foreground=TEXT_DIM,
+                            borderwidth=0, padding=(18, 9), font=(self._ui_family, 9, "bold"))
             style.map("Cosmic.TNotebook.Tab",
-                      background=[("selected", "#142535"), ("active", PANEL_HOVER)],
-                      foreground=[("selected", ACCENT), ("active", TEXT)])
+                      background=[("selected", "#10233a"), ("active", PANEL_HOVER)],
+                      foreground=[("selected", ACCENT), ("active", TEXT)],
+                      lightcolor=[("selected", "#10233a"), ("", BG2)],
+                      darkcolor=[("selected", "#10233a"), ("", BG2)],
+                      bordercolor=[("selected", "#10233a"), ("", BG2)])
+            # clam 默认还会给 Notebook 画一圈亮灰边框：从布局里去掉 border 元素
+            style.layout("Cosmic.TNotebook", [
+                ("Notebook.client", {"sticky": "nswe", "border": "0"}),
+            ])
+        except Exception:
+            pass
+
+        nb = ttk.Notebook(self.win)
+        nb.pack(fill="both", expand=True, padx=18, pady=(15, 12))
+        try:
             nb.configure(style="Cosmic.TNotebook")
         except Exception:
             pass
@@ -406,24 +420,9 @@ class SettingsWindow:
         self._build_advanced()
         self._build_quant()
 
-        # 底部：状态提示 + 按钮
-        footer = tk.Frame(self.win, bg="#070b12", highlightthickness=1,
-                          highlightbackground="#101827")
-        footer.pack(fill="x", side="bottom")
-        self.test_result = tk.Label(footer, text="", bg="#070b12", fg=TEXT_DIM,
-                                    justify="left", anchor="w", wraplength=760,
-                                    font=(self._ui_family, 9))
-        self.test_result.pack(fill="x", padx=22, pady=(9, 0))
-        btns = tk.Frame(footer, bg="#070b12")
-        btns.pack(fill="x", padx=20, pady=(6, 13))
-        self.test_btn = self._btn(btns, "测试连接", self._test_connection)
-        self.test_btn.pack(side="left")
-        self._btn(btns, "取消", self.win.destroy).pack(side="right", padx=(8, 0))
-        self._btn(btns, "保存", self._save, accent=True).pack(side="right")
-
     def _make_tab(self, nb: ttk.Notebook, title: str) -> tk.Frame:
         tab = tk.Frame(nb, bg=BG, highlightthickness=1,
-                       highlightbackground="#152030")
+                       highlightbackground=LINE0)
         nb.add(tab, text=title)
         tab.columnconfigure(1, weight=1)
         return tab
@@ -432,11 +431,8 @@ class SettingsWindow:
         tk.Label(parent, text=label.upper(), bg=parent["bg"], fg=VIOLET,
                  font=(self._mono_family, 8, "bold")).grid(row=row, column=0, sticky="nw",
                                                     padx=(18, 0), pady=(14, 4))
-        ent = tk.Entry(parent, bg="#0e1622", fg=TEXT, relief="flat",
-                       highlightthickness=1, highlightbackground="#263548",
-                       highlightcolor=ACCENT, insertbackground=TEXT,
-                       selectbackground="#274b61", font=(self._ui_family, 10),
-                       width=width, show=show)
+        ent = tk.Entry(parent, width=width,
+                       **entry_opts((self._ui_family, 10), show=show))
         ent.insert(0, str(self.config.get(key, "")))
         ent.grid(row=row, column=1, sticky="ew", pady=(14, 4), padx=(12, 18), ipady=5)
         setattr(self, f"entry_{key}", ent)
@@ -450,60 +446,54 @@ class SettingsWindow:
                                                     padx=(18, 0), pady=(14, 4))
         var = tk.StringVar(value=display)
         opt = tk.OptionMenu(parent, var, *options.keys())
-        opt.config(bg="#0e1622", fg=TEXT, relief="flat", highlightthickness=0,
+        opt.config(bg=BG3, fg=TEXT, relief="flat", highlightthickness=0,
                    activebackground=PANEL_HOVER, activeforeground=TEXT,
                    font=(self._ui_family, 9), width=24, cursor="hand2")
-        opt["menu"].config(bg=PANEL_LIGHT, fg=TEXT, font=(self._ui_family, 9))
+        opt["menu"].config(bg=PANEL_LIGHT, fg=TEXT, font=(self._ui_family, 9),
+                           activebackground=CY_FAINT, activeforeground=ACCENT)
         opt.grid(row=row, column=1, sticky="w", pady=(14, 4), padx=(12, 0))
         setattr(self, f"var_{key}", var)
         # 正映射 {显示文本: 值}：_collect 用显示文本取回配置值
         setattr(self, f"opts_{key}", dict(options))
         return var
 
-    def _btn(self, parent, text: str, cmd, accent: bool = False) -> tk.Button:
-        bgc = ACCENT if accent else "#101824"
-        fgc = "#04111a" if accent else TEXT
-        btn = tk.Button(parent, text=text, command=cmd, bg=bgc, fg=fgc,
-                        activebackground=ACCENT_HOVER if accent else PANEL_HOVER,
-                        activeforeground=fgc, relief="flat", bd=0,
-                        padx=18, pady=7, cursor="hand2",
-                        font=(self._ui_family, 9, "bold"))
-        hover = ACCENT_HOVER if accent else PANEL_HOVER
-        btn.bind("<Enter>", lambda _e: btn.configure(bg=hover), add="+")
-        btn.bind("<Leave>", lambda _e: btn.configure(bg=bgc), add="+")
-        return btn
+    def _btn(self, parent, text: str, cmd, accent: bool = False) -> RoundedButton:
+        """统一胶囊按钮：主操作走强调色，次级操作走幽灵款（悬停自带反馈）。"""
+        return RoundedButton(parent, text=text, command=cmd,
+                             accent=accent,
+                             font=(self._ui_family, 9, "bold"),
+                             padx=18, height=32)
 
     # ---- 常规：工作区 / 日志级别 / 开机行为 ----
     def _build_common(self) -> None:
         tab = self._tab_common
         tk.Label(tab, text="当前工作区（Agent 文件/Git/Todo/备份目录）", bg=BG, fg=TEXT,
-                 font=("Microsoft YaHei UI", 9, "bold")).grid(row=0, column=0, columnspan=2,
-                                                              sticky="w", padx=18, pady=(16, 2))
-        self.entry_workspace = tk.Entry(tab, bg=PANEL_LIGHT, fg=TEXT, relief="flat",
-                                        highlightthickness=1, highlightbackground="#2a3d63",
-                                        highlightcolor=ACCENT, insertbackground=TEXT,
-                                        font=("Microsoft YaHei UI", 9), width=46)
+                 font=(self._ui_family, 9, "bold")).grid(row=0, column=0, columnspan=2,
+                                                         sticky="w", padx=18, pady=(16, 2))
+        self.entry_workspace = tk.Entry(tab, width=46,
+                                        **entry_opts((self._ui_family, 9)))
         self.entry_workspace.insert(0, str(self.config.get("workspace", "")))
         self.entry_workspace.grid(row=1, column=0, sticky="ew", padx=(18, 6), pady=(6, 4), ipady=4)
         self._btn(tab, "选择文件夹…", self._pick_workspace).grid(row=1, column=1,
                                                                 sticky="w", padx=(0, 18), pady=(6, 4))
         tk.Label(tab, text="最近工作区（切换后自动记录）", bg=BG, fg=TEXT_DIM,
-                 font=("Microsoft YaHei UI", 9)).grid(row=2, column=0, columnspan=2,
-                                                      sticky="w", padx=18, pady=(6, 2))
+                 font=(self._ui_family, 9)).grid(row=2, column=0, columnspan=2,
+                                                 sticky="w", padx=18, pady=(6, 2))
         recent = self.config.get("recent_workspaces") or []
         if recent:
             self.var_ws_recent = tk.StringVar(value="")
             opt = tk.OptionMenu(tab, self.var_ws_recent, *[str(r) for r in recent])
-            opt.config(bg=PANEL_LIGHT, fg=TEXT, relief="flat", highlightthickness=0,
-                       font=("Microsoft YaHei UI", 9), width=40, cursor="hand2")
-            opt["menu"].config(bg=PANEL_LIGHT, fg=TEXT, font=("Microsoft YaHei UI", 9))
+            opt.config(bg=BG3, fg=TEXT, relief="flat", highlightthickness=0,
+                       font=(self._ui_family, 9), width=40, cursor="hand2",
+                       activebackground=PANEL_HOVER, activeforeground=TEXT)
+            opt["menu"].config(bg=PANEL_LIGHT, fg=TEXT, font=(self._ui_family, 9))
             opt.grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(2, 6))
             self._btn(tab, "切换到所选", self._switch_recent_ws).grid(
                 row=4, column=0, sticky="w", padx=18, pady=(0, 8))
         else:
             tk.Label(tab, text="（暂无历史）", bg=BG, fg=TEXT_DIM,
-                     font=("Microsoft YaHei UI", 9)).grid(row=3, column=0, sticky="w",
-                                                          padx=18, pady=(2, 6))
+                     font=(self._ui_family, 9)).grid(row=3, column=0, sticky="w",
+                                                     padx=18, pady=(2, 6))
         self._select(tab, 5, "日志级别",
                      {"信息": "info", "警告": "warning", "调试": "debug"}, "log_level")
 
@@ -532,8 +522,8 @@ class SettingsWindow:
                      {"最高": "max", "高": "high", "关闭": "off"}, "reasoning_mode")
         # 视觉模型（保留：用户指示不删除视觉功能）
         tk.Label(tab, text="视觉模型（view_image 用）", bg=BG, fg=TEXT_DIM,
-                 font=("Microsoft YaHei UI", 9, "bold")).grid(row=5, column=0, columnspan=2,
-                                                              sticky="w", padx=18, pady=(16, 2))
+                 font=(self._ui_family, 9, "bold")).grid(row=5, column=0, columnspan=2,
+                                                         sticky="w", padx=18, pady=(16, 2))
         self._row(tab, 6, "Vision URL", "vision_api_url")
         self._row(tab, 7, "Vision Key", "vision_api_key", show="*")
         self._row(tab, 8, "Vision Model", "vision_model")
@@ -548,7 +538,7 @@ class SettingsWindow:
         self._row(tab, 1, "最大工具轮数", "max_tool_steps", width=10)
         self._row(tab, 2, "最大任务时间(秒)", "max_agent_seconds", width=10)
         tk.Label(tab, text="危险命令黑名单、工作区路径限制与调用上限始终生效（不随模式关闭）。",
-                 bg=BG, fg=TEXT_DIM, font=("Microsoft YaHei UI", 8)).grid(
+                 bg=BG, fg=TEXT_DIM, font=(self._ui_family, 8)).grid(
             row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(10, 0))
 
     # ---- 工具路由：开关 / Ollama URL / 模型 / 连接测试 ----
@@ -561,7 +551,7 @@ class SettingsWindow:
         self._btn(tab, "测试路由连接", self._test_router).grid(row=3, column=0,
                                                               sticky="w", padx=18, pady=(12, 0))
         self._router_result = tk.Label(tab, text="", bg=BG, fg=TEXT_DIM,
-                                       font=("Microsoft YaHei UI", 9))
+                                       font=(self._ui_family, 9))
         self._router_result.grid(row=4, column=0, columnspan=2, sticky="w", padx=18, pady=(6, 0))
 
     def _test_router(self) -> None:
@@ -668,7 +658,7 @@ class SettingsWindow:
             ent_daemon.delete(0, "end")
             ent_daemon.insert(0, self._TOKEN_PLACEHOLDER)
         tk.Label(tab, text="数据目录：.pcagent/（会话/备份/日志，自动轮转与损坏恢复）",
-                 bg=BG, fg=TEXT_DIM, font=("Microsoft YaHei UI", 8)).grid(
+                 bg=BG, fg=TEXT_DIM, font=(self._ui_family, 8)).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=18, pady=(12, 0))
 
     # ---- 量化中心：仅配置 loopback 服务，不保存交易凭据 ----
@@ -956,10 +946,14 @@ class ChatApp:
         self._bold_font = font.Font(root=root, family=self._ui_family, size=10, weight="bold")
         self._normal_font = font.Font(root=root, family=self._ui_family, size=10)
         self._mono_font = font.Font(root=root, family=self._mono_family, size=9)
+        self._strike_font = font.Font(root=root, family=self._ui_family, size=9,
+                                      overstrike=1)   # 已完成任务：删除线
 
         # 多会话：{sid: {"messages": [...], "history": [(role, text), ...]}}
         self._sessions: dict[int, dict] = {}
         self._current_sid = 1
+        self._active_project_id = ""
+        self._project_choices: dict[str, str] = {"": "（无活跃项目）"}
         # ---- 流式状态（全部显式初始化，Stop/断开安全）----
         self._streaming = False          # 流式输出进行中
         self._stream_cancel = threading.Event()   # Stop 通知 SSE 读取线程退出
@@ -990,7 +984,7 @@ class ChatApp:
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        self.root.title("PC Agent")
+        self.root.title(PRODUCT_NAME)
         self.root.geometry("1360x860")
         self.root.configure(bg=BG)
         self.root.minsize(1024, 680)
@@ -1002,93 +996,116 @@ class ChatApp:
         self.backdrop.tag_lower("all")
         self.backdrop.bind("<Configure>", self._draw_window_backdrop)
 
-        toolbar = tk.Frame(self.root, bg="#050810", height=54, highlightthickness=0)
+        toolbar = tk.Frame(self.root, bg=BG1, height=56, highlightthickness=0)
         toolbar.pack(fill="x")
         toolbar.pack_propagate(False)
 
         # 品牌标志：发光核心 + 感应轨道环 + 导航卫星（静态绘制，零动画开销）
-        brand = tk.Canvas(toolbar, width=34, height=34, bg="#050810",
+        brand = tk.Canvas(toolbar, width=34, height=34, bg=BG1,
                           highlightthickness=0, bd=0)
-        brand.pack(side="left", padx=(16, 9))
-        brand.create_oval(7, 7, 27, 27, outline="#1d3550", width=6)      # 光晕
+        brand.pack(side="left", padx=(18, 10))
+        brand.create_oval(7, 7, 27, 27, outline="#16324c", width=6)      # 光晕
         brand.create_oval(10, 10, 24, 24, outline="#0e2338", width=2)
         brand.create_arc(2, 2, 32, 32, start=206, extent=148, outline=ACCENT,
                          width=2, style="arc")                            # 主轨道
         brand.create_arc(2, 2, 32, 32, start=210, extent=18, outline=ACCENT_HOVER,
                          width=3, style="arc")                            # 轨道高光段
         brand.create_oval(24, 3, 27, 6, fill=ACCENT, outline="")          # 导航卫星
-        brand.create_oval(11, 11, 23, 23, fill="#010307", outline="#6672b8", width=1)
+        brand.create_oval(11, 11, 23, 23, fill="#010307", outline="#5c68ad", width=1)
         brand.create_arc(11, 11, 23, 23, start=250, extent=100, outline=ACCENT,
                          width=1, style="arc")                            # 核心吸积光
 
-        title_stack = tk.Frame(toolbar, bg="#050810")
-        title_stack.pack(side="left", pady=8)
-        tk.Label(title_stack, text="PC AGENT", bg="#050810", fg=TEXT,
+        title_stack = tk.Frame(toolbar, bg=BG1)
+        title_stack.pack(side="left", pady=9)
+        tk.Label(title_stack, text=PRODUCT_NAME_UPPER, bg=BG1, fg=TEXT,
                  font=(self._display_family, 10, "bold")).pack(anchor="w")
         workspace = str(load_config().get("workspace") or "本地工作区")
         workspace_name = Path(workspace).name if workspace != "本地工作区" else workspace
         self.workspace_label = tk.Label(
-            title_stack, text=workspace_name.upper(), bg="#050810", fg=TEXT_MUTED,
+            title_stack, text=workspace_name.upper(), bg=BG1, fg=TEXT_MUTED,
             font=(self._mono_family, 7))
         self.workspace_label.pack(anchor="w")
 
-        status_pill = tk.Frame(toolbar, bg="#0a101b", highlightthickness=1,
-                               highlightbackground="#152234")
-        status_pill.pack(side="right", padx=(8, 16), pady=12)
-        self.status_dot = tk.Label(status_pill, text="●", bg="#0a101b", fg=STOP,
+        status_pill = tk.Frame(toolbar, bg=BG3, highlightthickness=1,
+                               highlightbackground=LINE1)
+        status_pill.pack(side="right", padx=(8, 18), pady=13)
+        self.status_dot = tk.Label(status_pill, text="●", bg=BG3, fg=STOP,
                                    font=(self._ui_family, 8))
-        self.status_dot.pack(side="left", padx=(10, 5), pady=4)
-        self.status_text = tk.Label(status_pill, text="正在连接", bg="#0a101b",
+        self.status_dot.pack(side="left", padx=(11, 5), pady=4)
+        self.status_text = tk.Label(status_pill, text="正在连接", bg=BG3,
                                     fg=TEXT_DIM, font=(self._ui_family, 8))
-        self.status_text.pack(side="left", padx=(0, 4), pady=4)
-        self.status_model = tk.Label(status_pill, text="", bg="#0a101b",
+        self.status_text.pack(side="left", padx=(0, 5), pady=4)
+        self.status_model = tk.Label(status_pill, text="", bg=BG3,
                                      fg=TEXT_MUTED, font=(self._mono_family, 7))
-        self.status_model.pack(side="left", padx=(0, 10), pady=4)
+        self.status_model.pack(side="left", padx=(0, 11), pady=4)
         self.quant_center_btn = self._toolbar_btn(
             toolbar, "量化中心", self._open_quant_center)
-        self.quant_center_btn.pack(side="right", padx=4, pady=11)
-        self._toolbar_btn(toolbar, "设置", self._open_settings).pack(side="right", padx=4, pady=11)
+        self.quant_center_btn.pack(side="right", padx=4, pady=12)
+        self._toolbar_btn(toolbar, "设置", self._open_settings).pack(side="right", padx=4, pady=12)
         self.sidebar_toggle_btn = self._toolbar_btn(
             toolbar, "隐藏侧栏", self._shortcut_toggle_sidebar)
-        self.sidebar_toggle_btn.pack(side="right", padx=4, pady=11)
+        self.sidebar_toggle_btn.pack(side="right", padx=4, pady=12)
         self.root.bind("<<OpenQuantCenter>>", lambda _event: self._open_quant_center(), add="+")
+        # 工具栏底部发丝分隔线（层次靠表面色差 + 1px 线，不用重边框）
+        tk.Frame(self.root, bg=LINE0, height=1).pack(fill="x")
 
         main = tk.Frame(self.root, bg=BG)
-        main.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        main.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         main.columnconfigure(0, weight=0)
         main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
 
         # 会话栏：仅保留真正需要的会话操作，日志和工具清单不再污染主界面。
         side = tk.Frame(main, bg=SIDEBAR_BG, width=276, bd=0,
-                        highlightthickness=1, highlightbackground="#0d1420")
-        side.grid(row=0, column=0, rowspan=3, sticky="ns", padx=(0, 10))
+                        highlightthickness=1, highlightbackground=LINE0)
+        side.grid(row=0, column=0, rowspan=3, sticky="ns", padx=(0, 12))
         self.sidebar = side
         side.pack_propagate(False)
-        self._reveal_outline(side, "#0d1420", BORDER_ACTIVE)
-        nav_head = tk.Frame(side, bg=SIDEBAR_BG, height=154)
+        self._reveal_outline(side, LINE0, BORDER_ACTIVE)
+        nav_head = tk.Frame(side, bg=SIDEBAR_BG, height=158)
         nav_head.pack(fill="x")
         nav_head.pack_propagate(False)
         tk.Label(nav_head, text="工作区", bg=SIDEBAR_BG, fg=TEXT,
-                 font=(self._display_family, 13, "bold")).pack(anchor="w", padx=16, pady=(16, 2))
+                 font=(self._display_family, 13, "bold")).pack(anchor="w", padx=16, pady=(18, 2))
         tk.Label(nav_head, text="对话会自动保存到当前项目", bg=SIDEBAR_BG, fg=TEXT_DIM,
                  font=(self._ui_family, 8)).pack(anchor="w", padx=16)
         self._toolbar_btn(nav_head, "＋  新建对话", self._new_session, accent=True).pack(
-            fill="x", padx=15, pady=(12, 11))
+            fill="x", padx=16, pady=(14, 12))
 
-        search_shell = tk.Frame(side, bg="#0b101a", highlightthickness=1,
-                                highlightbackground="#172131")
-        search_shell.pack(fill="x", padx=14, pady=(14, 8))
-        tk.Label(search_shell, text="⌕", bg="#0b101a", fg=TEXT_MUTED,
-                 font=(self._display_family, 13)).pack(side="left", padx=(9, 2))
+        proj_box = tk.Frame(side, bg=SIDEBAR_BG)
+        proj_box.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Label(proj_box, text="长任务项目", bg=SIDEBAR_BG, fg=TEXT_MUTED,
+                 font=(self._mono_family, 8, "bold")).pack(anchor="w")
+        self._project_var = tk.StringVar(value="（无活跃项目）")
+        self._project_menu = tk.OptionMenu(
+            proj_box, self._project_var, "（无活跃项目）",
+            command=self._on_project_menu_select)
+        self._project_menu.config(bg=BG3, fg=TEXT_SOFT, activebackground=BG4,
+                                  activeforeground=TEXT, highlightthickness=0, bd=0,
+                                  font=(self._ui_family, 9))
+        self._project_menu["menu"].config(bg=PANEL_LIGHT, fg=TEXT_SOFT,
+                                          activebackground=CY_FAINT, activeforeground=ACCENT)
+        self._project_menu.pack(fill="x", pady=(5, 0))
+
+        search_shell = tk.Frame(side, bg=BG3, highlightthickness=1,
+                                highlightbackground=LINE1)
+        search_shell.pack(fill="x", padx=16, pady=(14, 8))
+        tk.Label(search_shell, text="⌕", bg=BG3, fg=TEXT_MUTED,
+                 font=(self._display_family, 13)).pack(side="left", padx=(10, 2))
         self._session_filter = tk.StringVar()
         self._session_filter.trace_add("write", lambda *_: self._update_session_sidebar())
         self.session_search = tk.Entry(search_shell, textvariable=self._session_filter,
-                                       bg="#0b101a", fg=TEXT_SOFT, insertbackground=ACCENT,
-                                       relief="flat", font=(self._ui_family, 9))
-        self.session_search.pack(side="left", fill="x", expand=True, padx=(2, 9), pady=8)
+                                       bg=BG3, fg=TEXT_SOFT, insertbackground=ACCENT,
+                                       relief="flat", font=(self._ui_family, 9),
+                                       highlightthickness=0)
+        self.session_search.pack(side="left", fill="x", expand=True, padx=(2, 10), pady=8)
+        # 搜索框聚焦时给出冰蓝边框反馈
+        self.session_search.bind(
+            "<FocusIn>", lambda _e: search_shell.configure(highlightbackground=FOCUS), add="+")
+        self.session_search.bind(
+            "<FocusOut>", lambda _e: search_shell.configure(highlightbackground=LINE1), add="+")
         tk.Label(side, text="最近对话", bg=SIDEBAR_BG, fg=TEXT_MUTED,
-                 font=(self._ui_family, 8, "bold")).pack(anchor="w", padx=16, pady=(5, 6))
+                 font=(self._mono_family, 8, "bold")).pack(anchor="w", padx=16, pady=(6, 6))
         # 会话列表：滚动容器（会话多时不溢出）
         self._session_scroll = tk.Canvas(side, bg=SIDEBAR_BG, highlightthickness=0, bd=0, height=260)
         self.session_list = tk.Frame(self._session_scroll, bg=SIDEBAR_BG)
@@ -1109,52 +1126,52 @@ class ChatApp:
         self._session_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 6))
         self._session_buttons: dict[int, tk.Widget] = {}
 
-        side_footer = tk.Frame(side, bg="#090e17", height=124,
-                               highlightthickness=1, highlightbackground="#101826")
+        side_footer = tk.Frame(side, bg=BG1, height=124,
+                               highlightthickness=1, highlightbackground=LINE0)
         side_footer.pack(side="bottom", fill="x")
         side_footer.pack_propagate(False)
-        self.llm_status = tk.Label(side_footer, text="正在连接模型…", bg="#090e17", fg=TEXT_DIM,
+        self.llm_status = tk.Label(side_footer, text="正在连接模型…", bg=BG1, fg=TEXT_DIM,
                                    justify="left", wraplength=225,
                                    font=(self._ui_family, 8))
-        self.llm_status.pack(anchor="w", padx=15, pady=(13, 4))
-        self.session_info = tk.Label(side_footer, text="", bg="#090e17", fg=TEXT_MUTED,
+        self.llm_status.pack(anchor="w", padx=16, pady=(13, 4))
+        self.session_info = tk.Label(side_footer, text="", bg=BG1, fg=TEXT_MUTED,
                                      justify="left", font=(self._ui_family, 8))
-        self.session_info.pack(anchor="w", padx=15)
+        self.session_info.pack(anchor="w", padx=16)
         # Token 用量统计（来自 /api/v1/usage；失败不影响聊天主流程）
-        self.token_stats = tk.Label(side_footer, text="◈ 用量统计加载中…", bg="#090e17",
+        self.token_stats = tk.Label(side_footer, text="◈ 用量统计加载中…", bg=BG1,
                                     fg=TEXT_MUTED, justify="left",
                                     font=(self._mono_family, 7))
-        self.token_stats.pack(anchor="w", padx=15, pady=(6, 0))
+        self.token_stats.pack(anchor="w", padx=16, pady=(6, 0))
 
         # 中央工作区：固定标题栏、居中消息列和持续可见的黑洞底图。
         chat_card = tk.Frame(main, bg=SURFACE, bd=0, highlightthickness=1,
-                             highlightbackground="#0d1420")
+                             highlightbackground=LINE0)
         chat_card.grid(row=0, column=1, sticky="nsew")
         self.chat_card = chat_card
-        self._reveal_outline(chat_card, "#0d1420", BORDER_ACTIVE)
+        self._reveal_outline(chat_card, LINE0, BORDER_ACTIVE)
 
-        chat_head = tk.Frame(chat_card, bg="#070b12", height=57,
-                             highlightthickness=1, highlightbackground="#101827")
+        chat_head = tk.Frame(chat_card, bg=BG1, height=58,
+                             highlightthickness=1, highlightbackground=LINE0)
         chat_head.pack(fill="x")
         chat_head.pack_propagate(False)
-        head_text = tk.Frame(chat_head, bg="#070b12")
-        head_text.pack(side="left", padx=17, pady=9)
-        self.chat_title = tk.Label(head_text, text="新对话", bg="#070b12", fg=TEXT,
+        head_text = tk.Frame(chat_head, bg=BG1)
+        head_text.pack(side="left", padx=18, pady=9)
+        self.chat_title = tk.Label(head_text, text="新对话", bg=BG1, fg=TEXT,
                                    font=(self._display_family, 11, "bold"))
         self.chat_title.pack(anchor="w")
-        self.chat_meta = tk.Label(head_text, text="本地工作区  ·  Agent 模式", bg="#070b12",
+        self.chat_meta = tk.Label(head_text, text=f"本地工作区  ·  {PRODUCT_NAME} 模式", bg=BG1,
                                   fg=TEXT_MUTED, font=(self._ui_family, 8))
         self.chat_meta.pack(anchor="w")
         self._toolbar_btn(chat_head, "屏幕控制", self._open_screen_backend).pack(
-            side="right", padx=(4, 13), pady=12)
+            side="right", padx=(4, 14), pady=13)
 
         self.canvas = tk.Canvas(chat_card, bg=SURFACE, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
         scroll_style = ttk.Style()
-        scroll_style.configure("Cosmic.Vertical.TScrollbar", background="#3b4d65",
+        scroll_style.configure("Cosmic.Vertical.TScrollbar", background="#31435f",
                                troughcolor=SURFACE, bordercolor=SURFACE,
-                               arrowcolor=ACCENT, lightcolor="#3b4d65", darkcolor="#1c2838",
-                               width=7)
+                               arrowcolor=ACCENT, lightcolor="#31435f", darkcolor="#16202f",
+                               width=8)
         vbar = ttk.Scrollbar(chat_card, orient="vertical", command=self.canvas.yview,
                              style="Cosmic.Vertical.TScrollbar")
         vbar.place(relx=1, x=-5, y=69, relheight=1, height=-82, anchor="ne")
@@ -1167,7 +1184,7 @@ class ChatApp:
         self.canvas.configure(yscrollcommand=self._on_chat_yview)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
 
-        self._content_bg = "#05080f"
+        self._content_bg = CONTENT_BG
         self._chat_backdrop_item = self.canvas.create_image(
             0, 0, anchor="nw", tags=("chat_backdrop",))
         self.scroll_frame = tk.Frame(self.canvas, bg=self._content_bg)
@@ -1176,54 +1193,52 @@ class ChatApp:
         self.canvas.tag_lower("chat_backdrop")
         self.scroll_frame.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.jump_btn = tk.Button(chat_card, text="↓ 回到底部", command=self._jump_to_bottom,
-                                  bg="#172746", fg=TEXT, activebackground="#263d68",
-                                  activeforeground=TEXT, relief="flat", bd=0,
-                                  padx=12, pady=5, cursor="hand2",
-                                  font=("Microsoft YaHei UI", 9, "bold"))
+        self.jump_btn = RoundedButton(chat_card, text="↓ 回到底部", command=self._jump_to_bottom,
+                                      variant="soft", radius=14, height=30, padx=16,
+                                      font=(self._ui_family, 9, "bold"),
+                                      canvas_bg=SURFACE)
 
         self.empty_stage = tk.Canvas(chat_card, bg=BG, highlightthickness=0, bd=0)
         self.empty_stage.bind("<Configure>", self._draw_empty_stage)
         self._empty_visible = False
 
         # Codex 风格输入器：正文在上，操作与状态放到底部，不挤占输入区域。
-        input_card = tk.Frame(main, bg="#0b1019", bd=0, highlightthickness=1,
-                              highlightbackground="#162131")
-        input_card.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        input_card = tk.Frame(main, bg=BG2, bd=0, highlightthickness=1,
+                              highlightbackground=LINE1)
+        input_card.grid(row=2, column=1, sticky="ew", pady=(10, 0))
         self.input_card = input_card
-        self._reveal_outline(input_card, "#162131", "#55738f")
+        self._reveal_outline(input_card, LINE1, FOCUS)
         input_card.columnconfigure(0, weight=1)
-        meta = tk.Frame(input_card, bg="#0b1019")
-        meta.grid(row=0, column=0, sticky="ew", padx=14, pady=(9, 0))
-        tk.Label(meta, text="▍", bg="#0b1019", fg=ACCENT,
-                 font=(self._mono_family, 8, "bold")).pack(side="left")
-        tk.Label(meta, text="AGENT", bg="#0b1019", fg=ACCENT,
-                 font=(self._mono_family, 7, "bold")).pack(side="left", padx=(3, 0))
-        tk.Label(meta, text="  当前工作区  ·  Enter 发送", bg="#0b1019", fg=TEXT_MUTED,
+        meta = tk.Frame(input_card, bg=BG2)
+        meta.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 0))
+        tk.Frame(meta, bg=ACCENT, width=3, height=12).pack(side="left")
+        tk.Label(meta, text="AGENT", bg=BG2, fg=ACCENT,
+                 font=(self._mono_family, 8, "bold")).pack(side="left", padx=(7, 0))
+        tk.Label(meta, text="  当前工作区  ·  Enter 发送", bg=BG2, fg=TEXT_MUTED,
                  font=(self._ui_family, 8)).pack(side="left")
 
         composer_shell = tk.Frame(input_card, bg=CODE_BG, highlightthickness=1,
-                                  highlightbackground="#1c2a3c", highlightcolor=ACCENT)
-        composer_shell.grid(row=1, column=0, sticky="ew", padx=10, pady=(4, 0))
+                                  highlightbackground=LINE1, highlightcolor=ACCENT)
+        composer_shell.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
         composer_shell.columnconfigure(0, weight=1)
         self.input_box = tk.Text(composer_shell, bg=CODE_BG, fg=TEXT, relief="flat",
                                  highlightthickness=0, font=(self._ui_family, 11),
                                  height=3, wrap="word", undo=True, maxundo=80,
-                                 insertbackground=ACCENT, selectbackground="#274b61",
-                                 selectforeground=TEXT, padx=12, pady=10)
+                                 insertbackground=ACCENT, selectbackground=SEL,
+                                 selectforeground=TEXT, padx=13, pady=10)
         self.input_box.grid(row=0, column=0, sticky="ew")
         # 聚焦反馈：外框冰蓝发光，失焦恢复低调深色
         def _focus_glow(_e=None):
-            composer_shell.configure(highlightbackground=ACCENT_DIM)
+            composer_shell.configure(highlightbackground=FOCUS)
         def _blur_glow(_e=None):
-            composer_shell.configure(highlightbackground="#1c2a3c")
+            composer_shell.configure(highlightbackground=LINE1)
         self.input_box.bind("<FocusIn>", _focus_glow, add="+")
         self.input_box.bind("<FocusOut>", _blur_glow, add="+")
         self._composer_hint = tk.Label(
             composer_shell, text="描述任务，或粘贴代码、错误信息与上下文…",
-            bg=CODE_BG, fg="#536174", cursor="xterm",
+            bg=CODE_BG, fg=INK4, cursor="xterm",
             font=(self._ui_family, 10))
-        self._composer_hint.place(x=13, y=11)
+        self._composer_hint.place(x=14, y=11)
         self._composer_hint.bind("<Button-1>", lambda _e: self.input_box.focus_set())
         self.input_box.bind("<Return>", self._on_return)
         self.input_box.bind("<Shift-Return>", lambda e: None)
@@ -1232,10 +1247,10 @@ class ChatApp:
         self.input_box.bind("<FocusIn>", self._update_composer_hint, add="+")
         self.input_box.bind("<FocusOut>", self._update_composer_hint, add="+")
 
-        composer_actions = tk.Frame(input_card, bg="#0b1019")
-        composer_actions.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 9))
+        composer_actions = tk.Frame(input_card, bg=BG2)
+        composer_actions.grid(row=2, column=0, sticky="ew", padx=12, pady=(7, 11))
         self._toolbar_btn(composer_actions, "屏幕", self._open_screen_backend).pack(side="left")
-        tk.Label(composer_actions, text="Enter 发送  ·  Shift + Enter 换行", bg="#0b1019",
+        tk.Label(composer_actions, text="Enter 发送  ·  Shift + Enter 换行", bg=BG2,
                  fg=TEXT_MUTED, font=(self._ui_family, 8)).pack(side="left", padx=10)
         self.send_btn = self._toolbar_btn(
             composer_actions, "发送  ↑", self._send_message, accent=True)
@@ -1243,22 +1258,22 @@ class ChatApp:
 
         # 后台日志/任务仍保留给运行逻辑，但不再占据用户界面。
         # 任务面板（todo）：恢复为聊天区内的可见、可折叠区域（输入框上方）。
-        self.todo_frame = tk.Frame(main, bg="#0d1526", bd=0, highlightthickness=1,
-                                   highlightbackground="#16233f")
+        self.todo_frame = tk.Frame(main, bg=BG2, bd=0, highlightthickness=1,
+                                   highlightbackground=LINE1)
         self.todo_frame.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         self.todo_frame.grid_remove()        # 无任务时隐藏
         self._todo_expanded = True
         # 顶部微光条：任务面板的层次标识
-        tk.Frame(self.todo_frame, bg=ACCENT_DIM, height=2).pack(fill="x")
-        self._todo_head = tk.Frame(self.todo_frame, bg="#0d1526")
+        tk.Frame(self.todo_frame, bg=CY_DEEP, height=2).pack(fill="x")
+        self._todo_head = tk.Frame(self.todo_frame, bg=BG2)
         self._todo_head.pack(fill="x")
         self._todo_toggle = tk.Button(self._todo_head, text="▾ ☑ 任务清单（0）", command=self._toggle_todo,
-                                      bg="#0d1526", fg=TEXT_DIM, activebackground="#16233f",
+                                      bg=BG2, fg=TEXT_DIM, activebackground=BG3,
                                       activeforeground=ACCENT, relief="flat", bd=0, anchor="w",
-                                      cursor="hand2", font=("Microsoft YaHei UI", 9, "bold"))
-        self._todo_toggle.pack(fill="x", padx=13, pady=(6, 2))
-        self._todo_body = tk.Frame(self.todo_frame, bg="#0d1526")
-        self._todo_body.pack(fill="x", padx=13, pady=(0, 6))
+                                      cursor="hand2", font=(self._ui_family, 9, "bold"))
+        self._todo_toggle.pack(fill="x", padx=14, pady=(7, 2))
+        self._todo_body = tk.Frame(self.todo_frame, bg=BG2)
+        self._todo_body.pack(fill="x", padx=14, pady=(0, 8))
         self._todo_items: list[dict] = []
 
         # 会话初始为空，由 _start 后异步从 LLM 后端加载恢复（失败降级本地创建）。
@@ -1271,6 +1286,64 @@ class ChatApp:
         self.root.bind("<Control-f>", self._shortcut_search_threads)
         # R3：Token 用量轮询（15s；统计失败不打扰聊天）
         self.root.after(15000, self._poll_token_stats)
+        self.root.after(800, self._refresh_projects_async)
+
+    def _refresh_projects_async(self) -> None:
+        self._tasks.put(("projects", self._fetch_projects))
+        self.root.after(30000, self._refresh_projects_async)
+
+    def _fetch_projects(self) -> dict:
+        url = f"{self.llm_url}/api/v1/projects"
+        headers = {}
+        t = _token_for_base(self.llm_url)
+        if t:
+            headers["X-Api-Token"] = t
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    def _apply_projects(self, payload: dict) -> None:
+        if not payload.get("ok"):
+            return
+        choices: dict[str, str] = {"": "（无活跃项目）"}
+        for item in payload.get("projects") or []:
+            pid = str(item.get("id") or "")
+            if not pid:
+                continue
+            title = str(item.get("title") or pid)
+            choices[pid] = f"{title} [{item.get('status', 'active')}]"
+        self._project_choices = choices
+        self._active_project_id = str(payload.get("active") or "")
+        menu = self._project_menu["menu"]
+        menu.delete(0, "end")
+        for pid, label in choices.items():
+            menu.add_command(label=label, command=lambda v=label: self._project_var.set(v))
+        label = choices.get(self._active_project_id, "（无活跃项目）")
+        self._project_var.set(label)
+
+    def _on_project_menu_select(self, label: str) -> None:
+        pid = ""
+        for k, v in self._project_choices.items():
+            if v == label:
+                pid = k
+                break
+        self._tasks.put(("project_set", lambda: self._set_active_project(pid)))
+
+    def _set_active_project(self, project_id: str) -> dict:
+        url = f"{self.llm_url}/api/v1/projects/active"
+        headers = {"Content-Type": "application/json"}
+        t = _token_for_base(self.llm_url)
+        if t:
+            headers["X-Api-Token"] = t
+        body = json.dumps({"project_id": project_id}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    def _on_project_set(self, payload: dict) -> None:
+        if payload.get("ok"):
+            self._active_project_id = str(payload.get("active") or "")
+            self._refresh_projects_async()
 
     def _poll_token_stats(self) -> None:
         """周期拉取 /api/v1/usage（走后台任务队列，不阻塞 Tk 主线程）。"""
@@ -1315,7 +1388,7 @@ class ChatApp:
             self._todo_toggle.config(text=f"▸ ☑ 任务清单（{len(self._todo_items)}）")
 
     def _draw_empty_stage(self, _event=None) -> None:
-        """空会话舞台：黑洞、欢迎语与四个可点击的第一步。"""
+        """空会话舞台：黑洞、欢迎语与四个可点击的第一步（圆角卡片）。"""
         c = self.empty_stage
         w, h = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
         c.delete("all")
@@ -1329,61 +1402,73 @@ class ChatApp:
         else:
             c.create_rectangle(0, 0, w, h, fill=BG, outline="")
         cy = int(h * .40)
-        c.create_text(w // 2, cy - 80, text="EVENT HORIZON  /  READY", fill="#668095",
+        c.create_text(w // 2, cy - 84, text="EVENT  HORIZON  /  READY", fill=INK4,
                       font=(self._mono_family, 8, "bold"))
-        # 标题两侧的微光装饰线
-        line_w = 120
-        c.create_line(w // 2 - line_w, cy - 56, w // 2 - 34, cy - 56,
-                      fill="#1c3b52", width=1)
-        c.create_line(w // 2 + 34, cy - 56, w // 2 + line_w, cy - 56,
-                      fill="#1c3b52", width=1)
+        # 标题两侧的微光装饰线（内侧稍亮，做出向标题汇聚的层次）
+        line_w = 128
+        c.create_line(w // 2 - line_w, cy - 58, w // 2 - 40, cy - 58,
+                      fill=CY_DEEP, width=1)
+        c.create_line(w // 2 + 40, cy - 58, w // 2 + line_w, cy - 58,
+                      fill=CY_DEEP, width=1)
         c.create_text(w // 2, cy - 40, text="从这里开始", fill=TEXT,
                       font=(self._display_family, 23, "bold"))
-        c.create_text(w // 2, cy - 4, text="把一个目标交给 Agent，它会探索、执行并验证结果。", fill=TEXT_SOFT,
-                      font=(self._ui_family, 10))
+        c.create_text(w // 2, cy - 4, text=f"把一个目标交给 {PRODUCT_NAME}，它会探索、执行并验证结果。",
+                      fill=TEXT_SOFT, font=(self._ui_family, 10))
         cards = [
-            ("探索代码", "快速理解当前项目", "请分析这个项目的结构和关键入口。"),
-            ("构建功能", "从需求开始实现", "请帮我规划并实现一个新功能。"),
-            ("审查改动", "找出风险与改进点", "请审查当前代码改动并给出改进建议。"),
-            ("修复问题", "定位并解决错误", "请帮我定位并修复这个问题。"),
+            ("探索代码", "快速理解当前项目", "请分析这个项目的结构和关键入口。", CY1),
+            ("构建功能", "从需求开始实现", "请帮我规划并实现一个新功能。", VI1),
+            ("审查改动", "找出风险与改进点", "请审查当前代码改动并给出改进建议。", CY1),
+            ("修复问题", "定位并解决错误", "请帮我定位并修复这个问题。", VI1),
         ]
-        gap, card_h = 82, 88
-        card_w = max(128, min(176, (w - 72) // 4))
+        gap, card_h = 22, 96
+        card_w = max(150, min(200, (w - 96 - gap * 3) // 4))
         total = card_w * len(cards) + gap * (len(cards) - 1)
         start = max(24, (w - total) // 2)
-        y = cy + 40
-        for idx, (title, desc, prompt) in enumerate(cards):
+        y = cy + 36
+        for idx, (title, desc, prompt, tint) in enumerate(cards):
             x = start + idx * (card_w + gap)
             tag = f"starter_{idx}"
             rect_tag = f"starter_card_{idx}"
             bar_tag = f"starter_bar_{idx}"
-            c.create_rectangle(x, y, x + card_w, y + card_h, fill="#0a111d",
-                               outline="#1c2b3d", width=1,
-                               tags=(tag, "starter", rect_tag))
-            # 卡片底部微光条（hover 时亮起）
-            c.create_line(x + 5, y + card_h - 4, x + card_w - 5, y + card_h - 4,
-                          fill="#0e2536", width=2, tags=(tag, "starter", bar_tag))
-            c.create_text(x + 15, y + 25, anchor="w", text=f"{idx + 1:02d}",
-                          fill=ACCENT_DIM, font=(self._mono_family, 8, "bold"),
+            rounded_rect(c, x, y, x + card_w, y + card_h, 12,
+                         fill=BG2, outline=LINE1, width=1,
+                         tags=(tag, "starter", rect_tag))
+            # 卡片底部微光条（hover 时点亮为主色）
+            c.create_line(x + 14, y + card_h - 12, x + card_w - 14, y + card_h - 12,
+                          fill=LINE0, width=2, tags=(tag, "starter", bar_tag))
+            c.create_text(x + 16, y + 24, anchor="w", text=f"{idx + 1:02d}",
+                          fill=CY_DEEP, font=(self._mono_family, 9, "bold"),
                           tags=(tag, "starter"))
-            c.create_text(x + 47, y + 25, anchor="w", text=title,
-                          fill=ACCENT if idx in (0, 3) else VIOLET,
-                          font=(self._ui_family, 9, "bold"), tags=(tag, "starter"))
-            c.create_text(x + 15, y + 52, anchor="w", text=desc, fill=TEXT_DIM,
+            c.create_text(x + 46, y + 24, anchor="w", text=title, fill=tint,
+                          font=(self._ui_family, 10, "bold"), tags=(tag, "starter"))
+            c.create_text(x + 16, y + 54, anchor="w", text=desc, fill=TEXT_DIM,
                           font=(self._ui_family, 8), tags=(tag, "starter"))
             c.tag_bind(tag, "<Button-1>", lambda _event, value=prompt: self._prefill_prompt(value))
             c.tag_bind(tag, "<Enter>", lambda _event, rt=rect_tag, bt=bar_tag: (
                 c.configure(cursor="hand2"),
-                c.itemconfigure(rt, fill="#101c2b", outline="#4e7895"),
-                c.itemconfigure(bt, fill=ACCENT_DIM)))
+                c.itemconfigure(rt, fill=BG3, outline=FOCUS),
+                c.itemconfigure(bt, fill=CY_DEEP)))
             c.tag_bind(tag, "<Leave>", lambda _event, rt=rect_tag, bt=bar_tag: (
                 c.configure(cursor=""),
-                c.itemconfigure(rt, fill="#0a111d", outline="#1c2b3d"),
-                c.itemconfigure(bt, fill="#0e2536")))
-        # 快捷键提示行
-        c.create_text(w // 2, y + card_h + 32,
-                      text="Ctrl+L 聚焦输入   ·   Ctrl+N 新建对话   ·   Ctrl+B 侧栏",
-                      fill=TEXT_MUTED, font=(self._mono_family, 8))
+                c.itemconfigure(rt, fill=BG2, outline=LINE1),
+                c.itemconfigure(bt, fill=LINE0)))
+        # 快捷键提示行：键帽样式让操作提示更像界面而不是说明文字
+        ky = y + card_h + 34
+        hints = [(("Ctrl", "L"), "聚焦输入"), (("Ctrl", "N"), "新建对话"),
+                 (("Ctrl", "B"), "侧栏开关")]
+        item_w = 132
+        kx = w // 2 - item_w * len(hints) // 2
+        for (mod, key), label in hints:
+            x0 = kx
+            for text, kw in ((mod, 36), (key, 22)):
+                rounded_rect(c, x0, ky - 9, x0 + kw, ky + 9, 5,
+                             fill=BG3, outline=LINE1, width=1)
+                c.create_text(x0 + kw / 2, ky + 1, text=text, fill=INK3,
+                              font=(self._mono_family, 7, "bold"))
+                x0 += kw + 4
+            c.create_text(x0 + 8, ky + 1, anchor="w", text=label, fill=INK4,
+                          font=(self._ui_family, 8))
+            kx += item_w
 
     def _show_empty_workspace(self) -> None:
         self.empty_stage.place(x=0, y=58, relwidth=1, relheight=1, height=-58)
@@ -1405,17 +1490,11 @@ class ChatApp:
         self._resize_composer()
         self._update_composer_hint()
 
-    def _toolbar_btn(self, parent, text: str, cmd, accent: bool = False) -> tk.Button:
-        bgc = ACCENT if accent else "#0e1521"
-        fgc = "#04111a" if accent else TEXT
-        hover_bg = ACCENT_HOVER if accent else PANEL_HOVER
-        btn = tk.Button(parent, text=text, command=cmd, bg=bgc, fg=fgc,
-                        activebackground=hover_bg, activeforeground=fgc,
-                        relief="flat", bd=0, padx=13, pady=6, cursor="hand2",
-                        takefocus=True, font=(self._ui_family, 9, "bold"))
-        btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))
-        btn.bind("<Leave>", lambda e: btn.config(bg=bgc))
-        return btn
+    def _toolbar_btn(self, parent, text: str, cmd, accent: bool = False) -> RoundedButton:
+        """统一胶囊按钮入口：主操作强调色填充，次级操作幽灵款（自带悬停反馈）。"""
+        return RoundedButton(parent, text=text, command=cmd, accent=accent,
+                             font=(self._ui_family, 9, "bold"),
+                             padx=14, height=30)
 
     def _reveal_outline(self, widget: tk.Widget, resting: str, active: str) -> None:
         """默认弱化容器边线，鼠标进入时才给出冷色轮廓反馈。"""
@@ -1684,6 +1763,8 @@ class ChatApp:
                 "stream_tool_result": self._on_stream_tool_result,
                 "stream_ask": self._on_stream_ask,
                 "token_stats": self._on_token_stats,
+                "projects": self._apply_projects,
+                "project_set": self._on_project_set,
                 "stream_todo": self._on_stream_todo,
                 "respond_failed": self._on_respond_failed,
             }.get(kind)
@@ -2062,7 +2143,8 @@ class ChatApp:
                 "session_id": self._current_sid,
                 "request_id": f"chat-{task_id}-{uuid.uuid4().hex[:6]}",
                 "workspace": str(load_config().get("workspace") or ""),
-                "session_version": int(sess.get("version") or 0)}
+                "session_version": int(sess.get("version") or 0),
+                "project_id": self._active_project_id or None}
         req = urllib.request.Request(
             url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers=headers, method="POST")
@@ -2239,21 +2321,24 @@ class ChatApp:
         win.grab_set()
         self._confirm_win = win
 
-        header = tk.Frame(win, bg=PANEL, height=44)
+        header = tk.Frame(win, bg=BG2, height=52)
         header.pack(fill="x")
         header.pack_propagate(False)
-        tk.Label(header, text="⚠ 操作确认", bg=PANEL, fg=WARN,
-                 font=("Segoe UI", 13, "bold")).pack(side="left", padx=14, pady=8)
+        # 左侧警示条纹：确认窗口唯一的强提醒元素
+        tk.Frame(header, bg=WARN, width=4).pack(side="left", fill="y")
+        tk.Label(header, text="⚠ 操作确认", bg=BG2, fg=WARN,
+                 font=(self._display_family, 13, "bold")).pack(side="left", padx=14, pady=8)
         tool_name = data.get("name") or ""
-        tk.Label(header, text=f"工具: {tool_name}", bg=PANEL, fg=TEXT_DIM,
-                 font=("Consolas", 9)).pack(side="right", padx=14, pady=8)
+        tk.Label(header, text=f"工具: {tool_name}", bg=BG2, fg=TEXT_DIM,
+                 font=(self._mono_family, 9)).pack(side="right", padx=14, pady=8)
+        tk.Frame(win, bg=LINE0, height=1).pack(fill="x")
 
         body = tk.Frame(win, bg=BG)
-        body.pack(fill="both", expand=True, padx=16, pady=12)
+        body.pack(fill="both", expand=True, padx=18, pady=14)
 
         tk.Label(body, text=data.get("question") or "确认执行该操作吗？",
                  bg=BG, fg=TEXT, justify="left", wraplength=600,
-                 font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 8))
+                 font=(self._ui_family, 11)).pack(anchor="w", pady=(0, 8))
 
         plan = data.get("plan")
         if plan:
@@ -2264,16 +2349,18 @@ class ChatApp:
                 if s.get("reason"):
                     lines.append(f"    原因: {s['reason']}")
             tk.Label(body, text="\n".join(lines), bg=BG, fg=TEXT, justify="left",
-                     wraplength=600, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
+                     wraplength=600, font=(self._ui_family, 10)).pack(anchor="w", pady=(0, 10))
 
         diff = data.get("diff")
         if diff:
             tk.Label(body, text="改动预览（diff）:", bg=BG, fg=TEXT_DIM,
-                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 2))
-            diff_frame = tk.Frame(body, bg=CODE_BG)
+                     font=(self._ui_family, 9, "bold")).pack(anchor="w", pady=(6, 2))
+            diff_frame = tk.Frame(body, bg=CODE_BG, highlightthickness=1,
+                                  highlightbackground=LINE1)
             diff_frame.pack(fill="both", expand=True)
             box = tk.Text(diff_frame, bg=CODE_BG, fg=CODE_FG, relief="flat",
-                          font=("Consolas", 9), height=12, wrap="none")
+                          font=(self._mono_family, 9), height=12, wrap="none",
+                          highlightthickness=0, padx=8, pady=6)
             vbar = ttk.Scrollbar(diff_frame, orient="vertical", command=box.yview)
             hbar = ttk.Scrollbar(diff_frame, orient="horizontal", command=box.xview)
             box.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
@@ -2286,28 +2373,22 @@ class ChatApp:
             box.config(state="disabled")
 
         btns = tk.Frame(win, bg=BG)
-        btns.pack(fill="x", padx=16, pady=(0, 14))
+        btns.pack(fill="x", padx=18, pady=(0, 16))
         request_id = data.get("id", "")
 
         def choose(choice: str) -> None:
             self._send_respond(request_id, choice)
             win.destroy()
 
-        tk.Button(btns, text="✓ 允许", command=lambda: choose("yes"),
-                  bg=OK, fg="white", activebackground="#16a34a",
-                  activeforeground="white", relief="flat", bd=0,
-                  padx=24, pady=8, cursor="hand2",
-                  font=("Segoe UI", 10, "bold")).pack(side="left")
-        tk.Button(btns, text="✗ 拒绝", command=lambda: choose("no"),
-                  bg=STOP, fg="white", activebackground="#b91c1c",
-                  activeforeground="white", relief="flat", bd=0,
-                  padx=24, pady=8, cursor="hand2",
-                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=10)
-        tk.Button(btns, text="关闭（按拒绝处理）", command=lambda: choose("no"),
-                  bg=PANEL_LIGHT, fg=TEXT_DIM, activebackground="#262c36",
-                  activeforeground=TEXT_DIM, relief="flat", bd=0,
-                  padx=14, pady=8, cursor="hand2",
-                  font=("Segoe UI", 9)).pack(side="right")
+        RoundedButton(btns, text="✓ 允许", command=lambda: choose("yes"),
+                      bg=OK, padx=26, height=36, radius=10,
+                      font=(self._ui_family, 10, "bold")).pack(side="left")
+        RoundedButton(btns, text="✗ 拒绝", command=lambda: choose("no"),
+                      bg=STOP, padx=26, height=36, radius=10,
+                      font=(self._ui_family, 10, "bold")).pack(side="left", padx=10)
+        RoundedButton(btns, text="关闭（按拒绝处理）", command=lambda: choose("no"),
+                      padx=16, height=36, radius=10,
+                      font=(self._ui_family, 9)).pack(side="right")
         win.focus_force()
 
     def _send_respond(self, request_id: str, choice: str) -> None:
@@ -2355,14 +2436,21 @@ class ChatApp:
                 self._todo_body.pack_forget()
         colors = {"pending": WARN, "in_progress": ACCENT, "completed": OK,
                   "failed": STOP, "cancelled": TEXT_DIM}
+        labels = {"pending": "待办", "in_progress": "进行中", "completed": "完成",
+                  "failed": "失败", "cancelled": "已取消"}
         for t in self._todo_items:
-            row = tk.Frame(self._todo_body, bg="#0d1526")
+            row = tk.Frame(self._todo_body, bg=BG2)
             row.pack(fill="x", pady=1)
             st = t.get("status", "pending")
-            tk.Label(row, text=f"[{st}]", bg="#0d1526", fg=colors.get(st, WARN),
-                     font=("Consolas", 8, "bold")).pack(side="left")
-            tk.Label(row, text=t.get("title", ""), bg="#0d1526", fg=TEXT,
-                     font=("Microsoft YaHei UI", 9), wraplength=700,
+            tk.Label(row, text="●", bg=BG2, fg=colors.get(st, WARN),
+                     font=(self._ui_family, 8)).pack(side="left")
+            tk.Label(row, text=labels.get(st, st), bg=BG2, fg=colors.get(st, WARN),
+                     font=(self._mono_family, 7, "bold")).pack(side="left", padx=(4, 8))
+            done = st == "completed"
+            tk.Label(row, text=t.get("title", ""), bg=BG2,
+                     fg=TEXT_MUTED if done else TEXT,
+                     font=self._strike_font if done else (self._ui_family, 9),
+                     wraplength=700,
                      justify="left").pack(side="left", padx=4)
 
     def _on_stream_delta(self, payload) -> None:
@@ -2429,29 +2517,26 @@ class ChatApp:
         align = tk.Frame(container, bg=self._content_bg)
         align.pack(side="right" if is_user else "left", anchor="e" if is_user else "w")
 
-        # 消息头：角色徽章 + 名称 + 时间
+        # 消息头：角色 chip + 时间（chip 用低亮身份色底，替代散点标记）
         meta = tk.Frame(align, bg=self._content_bg)
         meta.pack(anchor="w" if not is_user else "e", fill="x")
         label = "YOU" if is_user else "AGENT"
-        tk.Label(meta, text="●", bg=self._content_bg,
-                 fg=ACCENT if is_user else VIOLET,
-                 font=(self._ui_family, 7)).pack(
-                     side="left" if not is_user else "right")
-        tk.Label(meta, text=label, bg=self._content_bg,
-                 fg=ACCENT if is_user else VIOLET,
-                 font=(self._mono_family, 7, "bold")).pack(
-                     side="left" if not is_user else "right")
+        chip = tk.Label(meta, text=label,
+                        bg=CY_FAINT if is_user else VI_FAINT,
+                        fg=CY1 if is_user else VI1,
+                        font=(self._mono_family, 7, "bold"), padx=7, pady=1)
+        chip.pack(side="left" if not is_user else "right")
         tk.Label(meta, text=time.strftime("%H:%M"), bg=self._content_bg, fg=TEXT_MUTED,
                  font=(self._mono_family, 7)).pack(
-                     side="left" if not is_user else "right", padx=7)
+                     side="left" if not is_user else "right", padx=8)
 
         # 气泡主体：顶部霓虹微光条 + 独立内容容器（流式更新只重建内容，不触碰发光条）
         bubble = tk.Frame(align, bg=bubble_bg, bd=0, highlightthickness=1,
-                          highlightbackground="#28556b" if is_user else "#1a2737")
-        bubble.pack(anchor="e" if is_user else "w", pady=(4, 0))
+                          highlightbackground=BUBBLE_LINE_U if is_user else BUBBLE_LINE_A)
+        bubble.pack(anchor="e" if is_user else "w", pady=(5, 0))
         self._reveal_outline(
-            bubble, "#28556b" if is_user else "#1a2737",
-            "#5d8da5" if is_user else "#495e79")
+            bubble, BUBBLE_LINE_U if is_user else BUBBLE_LINE_A,
+            BUBBLE_HI_LINE_U if is_user else BUBBLE_HI_LINE_A)
         glow = tk.Frame(bubble, bg=ACCENT_DIM if is_user else VIOLET_DIM, height=2)
         glow.pack(fill="x")
         body = tk.Frame(bubble, bg=bubble_bg)
@@ -2518,13 +2603,13 @@ class ChatApp:
     def _render_code_block(self, parent: tk.Frame, code: str, lang: str) -> None:
         """深色代码卡片：语言徽章 + 等宽代码内容 + 悬停复制。"""
         box = tk.Frame(parent, bg=CODE_BG, highlightthickness=1,
-                       highlightbackground=BORDER)
+                       highlightbackground=LINE1)
         box.pack(fill="x", padx=10, pady=(6, 2))
-        # 头部：语言徽章 + 复制按钮
+        # 头部：语言徽章 + 复制按钮，底部 1px 发丝线与正文分隔
         head = tk.Frame(box, bg=CODE_BG)
-        head.pack(fill="x", padx=10, pady=(5, 0))
-        badge = tk.Label(head, text=lang.upper(), bg="#0e2233", fg=ACCENT,
-                         padx=6, pady=1, font=(self._mono_family, 7, "bold"))
+        head.pack(fill="x", padx=10, pady=(6, 0))
+        badge = tk.Label(head, text=lang.upper(), bg=CY_FAINT, fg=ACCENT,
+                         padx=7, pady=1, font=(self._mono_family, 7, "bold"))
         badge.pack(side="left")
         copy_btn = tk.Button(
             head, text="复制", bg=CODE_BG, fg=TEXT_MUTED, activebackground=CODE_BG,
@@ -2534,6 +2619,7 @@ class ChatApp:
         copy_btn.pack(side="right")
         copy_btn.bind("<Enter>", lambda _e: copy_btn.configure(fg=ACCENT), add="+")
         copy_btn.bind("<Leave>", lambda _e: copy_btn.configure(fg=TEXT_MUTED), add="+")
+        tk.Frame(box, bg=LINE0, height=1).pack(fill="x", padx=1, pady=(6, 0))
         # 代码内容（超长行折行显示，防止撑爆气泡）
         code_lbl = tk.Label(box, text=code, bg=CODE_BG, fg=CODE_FG, justify="left",
                             anchor="w", wraplength=max(360, self.canvas.winfo_width() - 230),
@@ -2608,11 +2694,11 @@ class ChatApp:
             parent, width=width_chars, height=display_lines, bg=parent["bg"], fg=fg,
             relief="flat", bd=0, highlightthickness=0, wrap="char", cursor="arrow",
             takefocus=False, padx=12, pady=4, spacing1=1, spacing3=1,
-            font=self._normal_font, selectbackground="#274b61", selectforeground=TEXT)
+            font=self._normal_font, selectbackground=SEL, selectforeground=TEXT)
         body.tag_configure("normal", font=self._normal_font, foreground=fg)
         body.tag_configure("bold", font=self._bold_font, foreground=fg)
         body.tag_configure("code", font=self._mono_font, foreground=CODE_FG,
-                           background="#182231")
+                           background=BG4)
         for kind, txt in parts:
             if txt:
                 body.insert("end", txt, kind)
@@ -2705,10 +2791,10 @@ class ChatApp:
         shown = 0
         for sid in sorted(self._sessions, reverse=True):
             is_current = sid == self._current_sid
-            bgc = "#101c29" if is_current else SIDEBAR_BG
+            bgc = BG4 if is_current else SIDEBAR_BG
             row = tk.Frame(self.session_list, bg=bgc, height=58,
                            highlightthickness=1,
-                           highlightbackground="#1d3548" if is_current else SIDEBAR_BG)
+                           highlightbackground=LINE2 if is_current else SIDEBAR_BG)
             title = self._sessions[sid].get("title") or f"会话 #{sid}"
             if query and query not in title.lower() and query not in str(sid):
                 continue
@@ -2757,7 +2843,7 @@ class ChatApp:
         current_title = current.get("title") or f"会话 #{self._current_sid}"
         self.chat_title.config(text=current_title)
         self.chat_meta.config(
-            text=f"本地工作区  ·  {cfg.get('model') or 'Agent'}  ·  "
+            text=f"本地工作区  ·  {cfg.get('model') or PRODUCT_NAME}  ·  "
                  f"{len(current['history'])} 条消息")
         self.session_info.config(
             text=f"当前会话  #{self._current_sid}  ·  {len(current['history'])} 条消息")
@@ -2773,10 +2859,10 @@ class ChatApp:
                 rx, ry = row.winfo_rootx(), row.winfo_rooty()
                 if rx <= px <= rx + row.winfo_width() and ry <= py <= ry + row.winfo_height():
                     return
-            bgc = "#101c29" if selected else (PANEL_HOVER if entered else SIDEBAR_BG)
+            bgc = BG4 if selected else (PANEL_HOVER if entered else SIDEBAR_BG)
             row.configure(bg=bgc,
-                          highlightbackground="#41617b" if entered else (
-                              "#1d3548" if selected else SIDEBAR_BG))
+                          highlightbackground=FOCUS if entered else (
+                              LINE2 if selected else SIDEBAR_BG))
             body.configure(bg=bgc)
             title.configure(bg=bgc)
             detail.configure(bg=bgc)
@@ -2906,9 +2992,9 @@ class ChatApp:
             except Exception as exc:
                 messagebox.showinfo("量化中心日志", f"日志目录：\n{log_dir}\n\n无法自动打开：{exc}", parent=win)
 
-        self._btn(actions, "查看日志", view_logs).pack(side="left", padx=4)
-        self._btn(actions, "关闭", win.destroy).pack(side="right", padx=4)
-        self._btn(actions, "重试", retry, accent=True).pack(side="right", padx=4)
+        self._toolbar_btn(actions, "查看日志", view_logs).pack(side="left", padx=4)
+        self._toolbar_btn(actions, "关闭", win.destroy).pack(side="right", padx=4)
+        self._toolbar_btn(actions, "重试", retry, accent=True).pack(side="right", padx=4)
         win.grab_set()
 
     def _set_quant_button(self, text: str, color: str, enabled: bool = True) -> None:
@@ -3019,7 +3105,7 @@ class ChatApp:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PC Agent Chat")
+    parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} Chat")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     root = tk.Tk()

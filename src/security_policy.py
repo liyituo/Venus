@@ -164,6 +164,34 @@ TOOL_META: dict[str, dict] = {
                   "workspace_scoped": True, "requires_confirmation": True,
                   "allowed_in_query": False, "allowed_in_isolated": True,
                   "external_side_effect": False},
+    "run_sandboxed_shell": {"category": "execute", "read_only": False, "risk_level": "high",
+                            "workspace_scoped": True, "requires_confirmation": True,
+                            "allowed_in_query": False, "allowed_in_isolated": True,
+                            "external_side_effect": False},
+    "run_sandboxed_code": {"category": "execute", "read_only": False, "risk_level": "high",
+                           "workspace_scoped": True, "requires_confirmation": True,
+                           "allowed_in_query": False, "allowed_in_isolated": True,
+                           "external_side_effect": False},
+    "browser_open": {"category": "browser", "read_only": False, "risk_level": "medium",
+                     "workspace_scoped": False, "requires_confirmation": True,
+                     "allowed_in_query": False, "allowed_in_isolated": False,
+                     "external_side_effect": True},
+    "browser_snapshot": {"category": "browser", "read_only": True, "risk_level": "low",
+                         "workspace_scoped": False, "requires_confirmation": False,
+                         "allowed_in_query": True, "allowed_in_isolated": False,
+                         "external_side_effect": False},
+    "browser_click": {"category": "browser", "read_only": False, "risk_level": "medium",
+                      "workspace_scoped": False, "requires_confirmation": True,
+                      "allowed_in_query": False, "allowed_in_isolated": False,
+                      "external_side_effect": True},
+    "browser_type": {"category": "browser", "read_only": False, "risk_level": "medium",
+                     "workspace_scoped": False, "requires_confirmation": True,
+                     "allowed_in_query": False, "allowed_in_isolated": False,
+                     "external_side_effect": True},
+    "browser_tabs": {"category": "browser", "read_only": True, "risk_level": "low",
+                     "workspace_scoped": False, "requires_confirmation": False,
+                     "allowed_in_query": True, "allowed_in_isolated": False,
+                     "external_side_effect": False},
     # ---- 检索 / 编辑 ----
     "search_text": {"category": "edit", "read_only": True, "risk_level": "low",
                     "workspace_scoped": True, "requires_confirmation": False,
@@ -236,6 +264,39 @@ TOOL_META: dict[str, dict] = {
                    "workspace_scoped": False, "requires_confirmation": False,
                    "allowed_in_query": True, "allowed_in_isolated": True,
                    "external_side_effect": False},
+    # ---- 长任务项目 ----
+    "create_project": {"category": "project", "read_only": False, "risk_level": "low",
+                       "workspace_scoped": False, "requires_confirmation": False,
+                       "allowed_in_query": False, "allowed_in_isolated": True,
+                       "external_side_effect": False},
+    "update_project": {"category": "project", "read_only": False, "risk_level": "low",
+                       "workspace_scoped": False, "requires_confirmation": False,
+                       "allowed_in_query": False, "allowed_in_isolated": True,
+                       "external_side_effect": False},
+    "get_project": {"category": "project", "read_only": True, "risk_level": "low",
+                    "workspace_scoped": False, "requires_confirmation": False,
+                    "allowed_in_query": True, "allowed_in_isolated": True,
+                    "external_side_effect": False},
+    "list_projects": {"category": "project", "read_only": True, "risk_level": "low",
+                      "workspace_scoped": False, "requires_confirmation": False,
+                      "allowed_in_query": True, "allowed_in_isolated": True,
+                      "external_side_effect": False},
+    "add_milestone": {"category": "project", "read_only": False, "risk_level": "low",
+                      "workspace_scoped": False, "requires_confirmation": False,
+                      "allowed_in_query": False, "allowed_in_isolated": True,
+                      "external_side_effect": False},
+    "update_milestone": {"category": "project", "read_only": False, "risk_level": "low",
+                         "workspace_scoped": False, "requires_confirmation": False,
+                         "allowed_in_query": False, "allowed_in_isolated": True,
+                         "external_side_effect": False},
+    "save_checkpoint": {"category": "project", "read_only": False, "risk_level": "low",
+                        "workspace_scoped": False, "requires_confirmation": False,
+                        "allowed_in_query": False, "allowed_in_isolated": True,
+                        "external_side_effect": False},
+    "link_todo": {"category": "project", "read_only": False, "risk_level": "low",
+                  "workspace_scoped": False, "requires_confirmation": False,
+                  "allowed_in_query": False, "allowed_in_isolated": True,
+                  "external_side_effect": False},
     # ---- 项目索引 ----
     "repo_map": {"category": "index", "read_only": True, "risk_level": "low",
                  "workspace_scoped": True, "requires_confirmation": False,
@@ -353,7 +414,12 @@ def _needs_confirm(name: str, args: dict) -> bool:
     if not meta["requires_confirmation"]:
         return False
     if name == "run_shell":
+        if args.get("sandbox"):
+            return True
         return not _is_readonly_shell((args.get("command") or "").strip())
+    if name in ("run_sandboxed_shell", "run_sandboxed_code"):
+        if args.get("allow_network"):
+            return True
     return True
 
 

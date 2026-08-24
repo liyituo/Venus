@@ -26,6 +26,9 @@ market_data:
   source: live
   market: cn
   symbols_file: config/csi300_symbols.txt
+  # 数据源优先级：腾讯直连 -> 同花顺 -> 新浪 -> 腾讯 -> 东财 -> 雪球(需 token)
+  cn_sources: [gtimg, ths, sina, tx, em, xq]
+  xq_token_env: QUANT_AGENT_XQ_TOKEN
 
 # llm-fundamental 保留配置段（切换 strategy.id 即可恢复）
 llm:

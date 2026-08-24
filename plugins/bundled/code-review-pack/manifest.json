@@ -1,0 +1,7 @@
+{
+  "id": "code-review-pack",
+  "name": "代码审查助手",
+  "version": "1.0.0",
+  "type": "agent",
+  "description": "代码审查子 agent"
+}

@@ -1,4 +1,4 @@
-# PC Agent
+# Venus
 
 把 LLM 接到你的电脑上，让它能看屏幕、点鼠标、敲键盘、读写文件、跑命令、管 Git、查代码。
 
@@ -101,20 +101,54 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 ## 技能包（Skill）
 
-把常用工作流写成 `skills/<名称>/SKILL.md`（frontmatter 写 `name`/`description`），丢进目录即导入，无需重启：
+把常用工作流写成 `skills/<名称>/SKILL.md`（frontmatter 写 `name`/`description`），丢进目录即导入，无需重启。也可通过 **插件市场**（`plugins/catalog.json`）安装内置技能包：
 
-```markdown
----
-name: daily-brief
-description: 每日简报：搜科技新闻 + 查系统状态，汇总成简报
----
-# 每日简报
-1. 用 system_status 查资源
-2. 用 tavily 搜索今日科技新闻
-3. 汇总输出
+```powershell
+# API 示例（llm_server 运行中）
+curl -X POST http://127.0.0.1:8001/api/v1/extensions/enable -H "Content-Type: application/json" -d "{\"plugin_id\":\"daily-brief\"}"
 ```
 
 启动时只把**技能清单**（名称 + 一句话）注入系统提示，模型判断任务匹配时用 `load_skill` 加载全文——惰性注入，技能再多也不撑上下文。技能要求的操作**不绕过确认模式**。
+
+### 长任务项目模式
+
+跨天、跨会话的复杂任务可建 **项目**（目标 + 里程碑 + 检查点），数据在 `.pcagent/projects/`：
+
+| 工具 | 作用 |
+| --- | --- |
+| `create_project` | 建项目并设为当前活跃 |
+| `get_project` / `list_projects` | 查询与恢复 |
+| `add_milestone` / `update_milestone` | 里程碑管理 |
+| `save_checkpoint` | 写检查点（进度/下一步/阻塞） |
+| `link_todo` | 关联任务清单 |
+
+Chat 侧栏可切换**活跃项目**；CLI：`/project list`、`/project status`、`/project switch <id>`、`/project clear`。绑定项目后，每轮对话自动注入项目摘要。
+
+### 浏览器工具（阶段 2）
+
+通过 Playwright MCP 提供 `browser_open` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_tabs` 别名（内部转发 `mcp_chrome_*`）。**不修改 Chat 前端**也可经 API 启用：
+
+```powershell
+# 依赖检测
+.\scripts\check_browser_deps.ps1
+
+# 启用 / 状态
+curl http://127.0.0.1:8001/api/v1/browser/status
+curl -X POST http://127.0.0.1:8001/api/v1/browser/enable
+```
+
+或安装插件：`POST /api/v1/extensions/enable` + `{"plugin_id":"browser-pack"}`。`browser_snapshot` 为只读；导航/点击需确认。
+
+### 执行沙箱（阶段 3）
+
+不可信命令可用 `run_sandboxed_shell` / `run_sandboxed_code`（默认 `workspace` 档位、默认禁网、审计写入 `.pcagent/sandbox_audit.jsonl`）。`run_shell` 也可传 `sandbox: true`。
+
+```powershell
+curl http://127.0.0.1:8001/api/v1/sandbox/status
+curl -X POST http://127.0.0.1:8001/api/v1/sandbox/default -H "Content-Type: application/json" -d "{\"mode\":\"workspace\"}"
+```
+
+档位：`host`（现有行为）| `workspace`（受控环境）| `wsl`（Windows + WSL）。`allow_network: true` 需用户确认。
 
 ## 子 Agent 与视觉操作
 
@@ -299,7 +333,8 @@ scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、syste
 static/index.html   网页控制台
 quant-agent-lab/    隔离的量化研究、策略调试、回测、MCP Apps GUI 与 Paper Trading 子项目
 local-quota-widget/ Windows 透明桌面组件：Cursor + Codex 剩余额度（凭据在 .local/，不入库）
-skills/             技能包（用户自建：<名称>/SKILL.md，可入库分享）
+skills/             技能包（用户自建或插件安装：<名称>/SKILL.md）
+plugins/            插件 catalog 与内置包（bundled/）
 tests/              三十套自动测试 + 评测入口（含记忆系统 L0-L3/Skill/CodeGraph）
 .github/workflows/  CI（主 Agent 双平台 + RAG + 量化子项目独立验证）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）

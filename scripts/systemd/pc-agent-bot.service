@@ -1,5 +1,5 @@
 [Unit]
-Description=PC Agent Telegram Bot
+Description=Venus Telegram Bot
 After=network.target pc-agent-llm.service
 Wants=pc-agent-llm.service
 

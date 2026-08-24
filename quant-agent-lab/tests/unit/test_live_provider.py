@@ -78,20 +78,24 @@ def test_yfinance_conversion(tmp_path):
     assert snap.as_of == snap.bars[-1].timestamp
     # 缓存已落盘（file 格式兼容）
     cached = json.loads((tmp_path / "market_snapshot.json").read_text(encoding="utf-8"))
-    assert cached["source"] == "live-yfinance/akshare"
+    assert cached["source"] == "live-yfinance/cn-multi"
 
 
-# ============ akshare 转换 ============
-def test_akshare_conversion(tmp_path):
-    df = FakeDF(
-        [
+# ============ A股多源转换 ============
+def test_cn_conversion(tmp_path):
+    from quant_agent.data.cn_fetchers import CnDailyFrame
+
+    frame = CnDailyFrame(
+        source="gtimg",
+        rows=(
             {
                 "date": "2026-07-01",
                 "open": 10.0,
                 "high": 11.0,
                 "low": 9.0,
                 "close": 10.5,
-                "volume": 500,
+                "volume": 500.0,
+                "source": "gtimg",
             },
             {
                 "date": "2026-07-02",
@@ -99,7 +103,8 @@ def test_akshare_conversion(tmp_path):
                 "high": 11.0,
                 "low": 9.0,
                 "close": 10.5,
-                "volume": 500,
+                "volume": 500.0,
+                "source": "gtimg",
             },
             {
                 "date": "2026-07-03",
@@ -107,19 +112,16 @@ def test_akshare_conversion(tmp_path):
                 "high": 11.0,
                 "low": 9.0,
                 "close": 10.5,
-                "volume": 500,
+                "volume": 500.0,
+                "source": "gtimg",
             },
-        ]
+        ),
     )
-    fake_ak = ModuleType("akshare")
-    fake_ak.stock_zh_a_daily = mock.Mock(return_value=df)
-    fake_ak.stock_zh_a_hist_tx = mock.Mock(return_value=FakeDF([]))
-    fake_ak.stock_zh_a_hist = mock.Mock(return_value=FakeDF([]))
-    with mock.patch.dict(sys.modules, {"akshare": fake_ak}):
+    with mock.patch("quant_agent.data.live_provider.fetch_cn_daily", return_value=frame):
         snap = LiveMarketDataProvider(tmp_path, market="cn", symbols=("600519",)).load_market()
     assert len(snap.bars) == 3
     assert snap.bars[0].currency == "CNY"
-    assert snap.bars[0].source == "akshare"
+    assert snap.bars[0].source == "gtimg"
 
 
 # ============ 市场校验 ============

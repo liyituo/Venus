@@ -1,5 +1,5 @@
 """
-PC Agent Daemon — 异步解耦的桌面自动化守护进程（骨架）
+Venus Daemon — 异步解耦的桌面自动化守护进程（骨架）
 
 核心设计
 --------
@@ -45,6 +45,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from brand import APP_VERSION, DAEMON_NAME, PRODUCT_NAME, env_is_set
 
 # --------------------------------------------------------------------------
 # 全局配置
@@ -640,8 +642,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="PC Agent Daemon",
-    version="0.7.0",
+    title=DAEMON_NAME,
+    version=APP_VERSION,
     description="异步解耦的桌面自动化守护进程：网页控制电脑（点击 / 输入 / 按键 / 截图）",
     lifespan=lifespan,
 )
@@ -665,7 +667,7 @@ async def host_guard(request, call_next):
     hostname = _parse_host_header(host)
     if hostname is None or hostname not in _LOOPBACK_HOSTS:
         # 测试环境（TestClient 默认 testserver）白名单：不放开任意 Host
-        if os.environ.get("PCAGENT_ALLOW_TEST_HOST") == "1" \
+        if env_is_set(("VENUS_ALLOW_TEST_HOST", "PCAGENT_ALLOW_TEST_HOST")) \
                 and hostname in ("testserver", "testclient", "localhost"):
             return await call_next(request)
         return Response(status_code=403, content="非法 Host（仅允许本机回环访问）")
@@ -818,7 +820,7 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="PC Agent Daemon")
+    parser = argparse.ArgumentParser(description=DAEMON_NAME)
     parser.add_argument("--host", default="127.0.0.1",
                         help="监听地址（保持 127.0.0.1 防止局域网内他人控制）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")

@@ -2,7 +2,7 @@
 
 - embedder 可用：query → 向量 → 余弦 top_k
 - embedder 不可用：BM25 词法打分（保证框架无 embedding 也能用）
-- 词法检索分词：ASCII 词 + 中文二元组（与 PC Agent 的 history_index 一致）
+- 词法检索分词：ASCII 词 + 中文二元组（与 Venus 的 history_index 一致）
 """
 from __future__ import annotations
 

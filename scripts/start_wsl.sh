@@ -1,5 +1,5 @@
 #!/bin/bash
-# PC Agent WSL 一键启动（隔离模式）——统一入口：
+# Venus WSL 一键启动（隔离模式）——统一入口：
 #  - llm_server 以 --isolated 运行（禁屏幕工具，只留文件类），带代理（run_shell 可访问外网）
 #  - Telegram bot 若未运行则自动拉起（守护）
 #  - 最后进入 cli 终端

@@ -18,14 +18,46 @@ class QuotaWindow:
 
 
 @dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    truncated: bool = False
+
+    @property
+    def total(self) -> int:
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
+
+
+@dataclass
 class ProviderQuota:
     ok: bool
     title: str
     plan: str = ""
     windows: list[QuotaWindow] = field(default_factory=list)
     extra_lines: list[str] = field(default_factory=list)
+    tokens: TokenUsage | None = None
     error: str = ""
     updated_at: str = ""
+
+
+def format_tokens(n: int) -> str:
+    n = max(0, int(n))
+    if n >= 10_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}K"
+    if n >= 1_000:
+        return f"{n / 1_000:.2f}K"
+    return str(n)
 
 
 def _request(
@@ -68,17 +100,87 @@ def _pick_percent(obj: Any, *keys: str) -> float | None:
     return None
 
 
-def _format_reset(ts: int | None) -> str:
-    if not ts:
-        return ""
+def _iso_to_ms(iso: str) -> int | None:
     from datetime import datetime
 
     try:
-        if ts > 10_000_000_000:
-            ts = ts // 1000
-        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
-    except (OSError, OverflowError, ValueError):
-        return ""
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _sum_event_tokens(events: list[Any]) -> TokenUsage:
+    usage = TokenUsage()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        block = event.get("tokenUsage") or event.get("token_usage") or {}
+        if not isinstance(block, dict):
+            continue
+        for src, dst in (
+            ("inputTokens", "input_tokens"),
+            ("outputTokens", "output_tokens"),
+            ("cacheReadTokens", "cache_read_tokens"),
+            ("cacheWriteTokens", "cache_write_tokens"),
+        ):
+            val = block.get(src)
+            if val is None:
+                continue
+            try:
+                setattr(usage, dst, getattr(usage, dst) + int(val))
+            except (TypeError, ValueError):
+                continue
+    return usage
+
+
+def _fetch_cycle_tokens(
+    session_token: str,
+    start_ms: int | None,
+    end_ms: int | None,
+    *,
+    max_pages: int = 12,
+) -> TokenUsage | None:
+    """汇总本计费周期 token；事件过多时只拉前若干页并在 truncated 标记。"""
+    payload: dict[str, Any] = {"page": 1, "pageSize": 100}
+    if start_ms is not None:
+        payload["startDate"] = str(start_ms)
+    if end_ms is not None:
+        payload["endDate"] = str(end_ms)
+
+    total = TokenUsage()
+    total_count = 0
+    page = 1
+    while page <= max_pages:
+        payload["page"] = page
+        try:
+            data = _request(session_token, "POST", "/api/dashboard/get-filtered-usage-events", payload)
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+            return total if total.total else None
+        if not isinstance(data, dict):
+            break
+        if page == 1:
+            try:
+                total_count = int(data.get("totalUsageEventsCount") or 0)
+            except (TypeError, ValueError):
+                total_count = 0
+        events = data.get("usageEventsDisplay") or data.get("usage_events_display") or []
+        if not isinstance(events, list) or not events:
+            break
+        chunk = _sum_event_tokens(events)
+        total.input_tokens += chunk.input_tokens
+        total.output_tokens += chunk.output_tokens
+        total.cache_read_tokens += chunk.cache_read_tokens
+        total.cache_write_tokens += chunk.cache_write_tokens
+        if len(events) < payload["pageSize"]:
+            break
+        if total_count and page * payload["pageSize"] >= total_count:
+            break
+        page += 1
+    else:
+        total.truncated = bool(total_count and total_count > max_pages * payload["pageSize"])
+
+    return total if total.total else None
 
 
 def fetch_cursor_quota(session_token: str) -> ProviderQuota:
@@ -116,8 +218,12 @@ def fetch_cursor_quota(session_token: str) -> ProviderQuota:
     windows: list[QuotaWindow] = []
     extra: list[str] = []
     plan = ""
+    billing_start_ms: int | None = None
+    billing_end_ms: int | None = None
 
     if isinstance(summary, dict):
+        billing_start_ms = _iso_to_ms(str(summary.get("billingCycleStart") or ""))
+        billing_end_ms = _iso_to_ms(str(summary.get("billingCycleEnd") or ""))
         individual = summary.get("individualUsage") or summary.get("individual_usage") or {}
         plan_obj = individual.get("plan") if isinstance(individual, dict) else {}
         if isinstance(plan_obj, dict):
@@ -163,6 +269,8 @@ def fetch_cursor_quota(session_token: str) -> ProviderQuota:
     if not windows:
         windows.append(QuotaWindow("本周期", None, detail="未能解析字段，请检查 Dashboard 是否改版"))
 
+    tokens = _fetch_cycle_tokens(token, billing_start_ms, billing_end_ms)
+
     from datetime import datetime
 
     return ProviderQuota(
@@ -171,5 +279,6 @@ def fetch_cursor_quota(session_token: str) -> ProviderQuota:
         plan=plan,
         windows=windows[:3],
         extra_lines=extra,
-        updated_at=datetime.now().strftime("%H:%M:%S"),
+        tokens=tokens,
+        updated_at=datetime.now().strftime("%H:%M"),
     )

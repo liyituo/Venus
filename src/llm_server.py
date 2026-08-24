@@ -61,13 +61,17 @@ from provider_capabilities import load_overrides_from_config as _load_provider_o
 from prompt_cache import PromptCacheManager  # noqa: E402
 from subagent_router import should_delegate, RISK_LOW, RISK_MEDIUM  # noqa: E402
 # R4：记忆系统（L0-L3 + Skill + CodeGraph）——只在需要时 import，失败不影响主流程
-import agent_memory as _agent_memory  # noqa: E402
+import agent_memory as _agent_memory
+import extension_registry as _extensions
+import project_store as _projects  # noqa: E402
+from brand import APP_VERSION, SYSTEM_IDENTITY, env_is_set
+import browser_tools as _browser  # noqa: E402
+import sandbox_runner as _sandbox  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "chat_config.json"
-APP_VERSION = "0.8.0"       # 系统版本（health 端点返回，前端可展示）
 UPSTREAM_TIMEOUT = 180  # 模型生成可能较慢（reasoner 更慢）
 DAEMON_BASE = "http://127.0.0.1:8000"   # 屏幕控制 daemon（app.py）
 
@@ -598,6 +602,7 @@ ROUTER_CORE_TOOLS = {
     "git_status", "git_diff", "git_log", "list_todos", "repo_map",
     "system_status", "load_skill", "view_image",
     "process_output", "list_processes", "create_todo", "update_todo",
+    "list_projects", "get_project", "save_checkpoint",
     "create_plan", "stop", "delegate", "create_file",
     "remember", "recall_memory", "codegraph_query",
 }
@@ -811,6 +816,15 @@ class ChatRequest(BaseModel):
     request_id: str | None = Field(default=None, description="本次请求唯一 ID（幂等）")
     workspace: str | None = Field(default=None, description="规范化工作区路径（记忆隔离用）")
     session_version: int | None = Field(default=None, description="会话版本（提取进度游标）")
+    project_id: str | None = Field(default=None, description="绑定的长任务项目 ID")
+
+
+class ProjectActiveUpdate(BaseModel):
+    project_id: str = Field(default="", description="设为活跃项目；空字符串表示清除")
+
+
+class ExtensionAction(BaseModel):
+    plugin_id: str = Field(..., description="catalog 中的插件 id")
 
 
 class CompressRequest(BaseModel):
@@ -845,7 +859,7 @@ app = FastAPI(title="LLM Backend", version=APP_VERSION)
 @app.on_event("startup")
 async def _warmup_mcp() -> None:
     """启动时后台预连接 MCP server：首个请求不等待连接（懒加载兜底仍在）。"""
-    if os.environ.get("PCAGENT_DISABLE_MCP"):
+    if env_is_set(("VENUS_DISABLE_MCP", "PCAGENT_DISABLE_MCP")):
         return
     threading.Thread(target=_ensure_mcp, daemon=True, name="mcp-warmup").start()
     # 工具路由预热：把本地路由模型加载进内存（防首个路由请求冷加载超时）
@@ -952,7 +966,7 @@ async def host_guard(request, call_next):
     hostname = _parse_host_header(host)
     if hostname is None or hostname not in _LOOPBACK_HOSTS:
         # 测试环境（TestClient 默认 testserver）白名单：不放开任意 Host
-        if (os.environ.get("PCAGENT_ALLOW_TEST_HOST") == "1"
+        if (env_is_set(("VENUS_ALLOW_TEST_HOST", "PCAGENT_ALLOW_TEST_HOST"))
                 and hostname in ("testserver", "testclient", "localhost")):
             return await call_next(request)
         return JSONResponse(status_code=403,
@@ -1279,6 +1293,95 @@ async def stats() -> dict:
 async def list_agents() -> dict:
     return {"ok": True, "agents": [
         {k: v for k, v in a.items() if k != "system_prompt"} for a in _scan_agents()]}
+
+
+@app.get("/api/v1/projects", summary="长任务项目列表")
+async def api_list_projects(status: str | None = None) -> dict:
+    items = _projects.list_projects(status=status or None)
+    return {"ok": True, "projects": items, "active": _projects.get_active_project_id()}
+
+
+@app.get("/api/v1/projects/{project_id}", summary="读取单个项目")
+async def api_get_project(project_id: str) -> dict:
+    proj = _projects.get_project(project_id)
+    if proj is None:
+        raise HTTPException(404, f"项目不存在：{project_id}")
+    return {"ok": True, **proj}
+
+
+@app.post("/api/v1/projects/active", summary="设置当前活跃项目")
+async def api_set_active_project(req: ProjectActiveUpdate) -> dict:
+    ok, msg = _projects.set_active_project(req.project_id)
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "active": req.project_id, "message": msg}
+
+
+@app.get("/api/v1/extensions", summary="插件 catalog 与启用状态")
+async def api_list_extensions() -> dict:
+    return _extensions.list_extensions()
+
+
+@app.post("/api/v1/extensions/install", summary="从 catalog 安装插件")
+async def api_install_extension(req: ExtensionAction) -> dict:
+    ok, msg = _extensions.install_plugin(req.plugin_id)
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg}
+
+
+@app.post("/api/v1/extensions/enable", summary="启用插件（部署 skill/agent）")
+async def api_enable_extension(req: ExtensionAction) -> dict:
+    ok, msg = _extensions.enable_plugin(req.plugin_id)
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg}
+
+
+@app.post("/api/v1/extensions/disable", summary="禁用插件")
+async def api_disable_extension(req: ExtensionAction) -> dict:
+    ok, msg = _extensions.disable_plugin(req.plugin_id)
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg}
+
+
+@app.get("/api/v1/browser/status", summary="浏览器工具依赖与启用状态")
+async def api_browser_status() -> dict:
+    return _browser.browser_status()
+
+
+@app.post("/api/v1/browser/enable", summary="启用浏览器 MCP（写入 chrome server）")
+async def api_browser_enable() -> dict:
+    ok, msg = _browser.enable_browser()
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg, "hint": _browser.reload_mcp_hint()}
+
+
+@app.post("/api/v1/browser/disable", summary="禁用浏览器 MCP")
+async def api_browser_disable() -> dict:
+    ok, msg = _browser.disable_browser()
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg}
+
+
+class SandboxDefaultUpdate(BaseModel):
+    mode: str = Field(..., description="host | workspace | wsl")
+
+
+@app.get("/api/v1/sandbox/status", summary="沙箱默认档位与可用性")
+async def api_sandbox_status() -> dict:
+    return _sandbox.sandbox_status()
+
+
+@app.post("/api/v1/sandbox/default", summary="设置默认沙箱档位")
+async def api_sandbox_default(req: SandboxDefaultUpdate) -> dict:
+    ok, msg = _sandbox.set_sandbox_default(req.mode)
+    if not ok:
+        raise HTTPException(422, msg)
+    return {"ok": True, "message": msg, "default_mode": req.mode}
 
 
 @app.get("/api/v1/workspace", summary="查看当前工作区")
@@ -1654,13 +1757,46 @@ AGENT_TOOLS = [
                        "默认在工作区目录执行，cwd 仅接受工作区内的相对路径（拒绝绝对路径与 ..）。"
                        "执行超时 30 秒，输出最多 3000 字符。"
                        "破坏性命令（rm -rf /、mkfs、shutdown、dd 写磁盘、fork bomb 等）会被拦截。"
+                       "sandbox=true 时改走隔离执行（默认 workspace 档位，禁网除非 allow_network）。"
                        "注意：sudo 命令需要交互密码，非交互环境会失败。",
         "parameters": {"type": "object",
                        "properties": {
                            "command": {"type": "string", "description": "要执行的 shell 命令"},
                            "cwd": {"type": "string",
-                                   "description": "可选：执行目录（工作区内相对路径，默认工作区）"}},
+                                   "description": "可选：执行目录（工作区内相对路径，默认工作区）"},
+                           "sandbox": {"type": "boolean", "default": False,
+                                       "description": "为 true 时使用沙箱执行（workspace/wsl）"},
+                           "sandbox_mode": {"type": "string",
+                                            "enum": ["workspace", "wsl"],
+                                            "description": "sandbox=true 时的档位（默认取 extensions 配置）"},
+                           "allow_network": {"type": "boolean", "default": False,
+                                           "description": "沙箱模式下是否允许出网（需确认）"}},
                        "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "run_sandboxed_shell",
+        "description": "在沙箱中执行 shell 命令（默认 workspace 档位：受控环境、默认禁网、审计日志）。"
+                       "不可信命令优先使用本工具而非 run_shell。超时默认 120 秒。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "command": {"type": "string"},
+                           "cwd": {"type": "string", "description": "工作区内相对路径"},
+                           "mode": {"type": "string", "enum": ["workspace", "wsl"], "default": "workspace"},
+                           "timeout": {"type": "number", "default": 120},
+                           "allow_network": {"type": "boolean", "default": False}},
+                       "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "run_sandboxed_code",
+        "description": "在沙箱中执行 Python 代码（临时脚本 + 子进程，默认禁网，写入 sandbox_audit.jsonl）。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "file": {"type": "string", "description": "工作区内 .py 文件"},
+                           "code": {"type": "string", "description": "Python 代码字符串"},
+                           "mode": {"type": "string", "enum": ["workspace", "wsl"], "default": "workspace"},
+                           "timeout": {"type": "number", "default": 120},
+                           "allow_network": {"type": "boolean", "default": False}},
+                       "required": []},
     }},
     {"type": "function", "function": {
         "name": "stop",
@@ -1850,6 +1986,93 @@ AGENT_TOOLS = [
         "name": "list_todos",
         "description": "查看当前任务清单。",
         "parameters": {"type": "object", "properties": {}},
+    }},
+    # ---- 长任务项目模式 ----
+    {"type": "function", "function": {
+        "name": "create_project",
+        "description": "创建跨会话的长任务项目（含目标与可选里程碑）。复杂任务先建项目再分解执行。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "title": {"type": "string", "description": "项目标题"},
+                           "goal": {"type": "string", "description": "项目目标（一段话）"},
+                           "milestones": {"type": "array",
+                                          "items": {"type": "object",
+                                                    "properties": {
+                                                        "title": {"type": "string"},
+                                                        "notes": {"type": "string"}}},
+                                          "description": "可选里程碑列表"}},
+                       "required": ["title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "update_project",
+        "description": "更新项目标题/目标/状态（active/paused/completed/archived）。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string"},
+                           "title": {"type": "string"},
+                           "goal": {"type": "string"},
+                           "status": {"type": "string",
+                                      "enum": ["active", "paused", "completed", "archived"]}},
+                       "required": ["project_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "get_project",
+        "description": "读取项目详情（里程碑、最近检查点、关联 todo）。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string", "description": "省略则用当前活跃项目"}},
+                       "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "list_projects",
+        "description": "列出所有项目（可按状态过滤）。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "status": {"type": "string",
+                                      "enum": ["active", "paused", "completed", "archived"]}},
+                       "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "add_milestone",
+        "description": "为项目添加里程碑。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string"},
+                           "title": {"type": "string"},
+                           "notes": {"type": "string"}},
+                       "required": ["project_id", "title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "update_milestone",
+        "description": "更新里程碑状态或备注。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string"},
+                           "milestone_id": {"type": "integer"},
+                           "status": {"type": "string",
+                                      "enum": ["pending", "in_progress", "completed", "cancelled"]},
+                           "notes": {"type": "string"}},
+                       "required": ["project_id", "milestone_id"]},
+    }},
+    {"type": "function", "function": {
+        "name": "save_checkpoint",
+        "description": "保存项目检查点（当前进度摘要、下一步、阻塞项），便于跨会话续作。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string"},
+                           "summary": {"type": "string"},
+                           "next_step": {"type": "string"},
+                           "blockers": {"type": "string"}},
+                       "required": ["project_id", "summary"]},
+    }},
+    {"type": "function", "function": {
+        "name": "link_todo",
+        "description": "把 todo 项关联到项目。",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "project_id": {"type": "string"},
+                           "todo_id": {"type": "integer"}},
+                       "required": ["project_id", "todo_id"]},
     }},
     # ---- 编程工具：项目索引 ----
     {"type": "function", "function": {
@@ -2093,7 +2316,7 @@ def _agent_catalog_text() -> str:
 
 
 AGENT_SYSTEM_SUFFIX = (
-    "\n\n你是 PC Agent，可以控制用户电脑的智能体（工具操作、编写和修改代码）。\n"
+    SYSTEM_IDENTITY +
     "编程工作流：\n"
     "1. 先 repo_map / search_text / glob_files / list_symbols 定位相关代码，"
     "再用 replace_text 小步修改（系统展示 diff 请用户确认），新文件用 create_file。\n"
@@ -3139,6 +3362,8 @@ def _agent_tools() -> list[dict]:
         tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _FILE_TOOLS]
     else:
         tools = list(AGENT_TOOLS)
+    if _browser.is_browser_enabled():
+        tools.extend(_browser.alias_tool_definitions())
     mcp = _ensure_mcp()
     if mcp is not None:
         tools.extend(mcp.all_tools())     # MCP server 工具动态并入（mcp_<server>_<tool>）
@@ -4016,10 +4241,22 @@ def _execute_tool(name: str, arguments: str,
             for pat in DANGEROUS_PATTERNS:
                 if re.search(pat, command):
                     return False, f"危险命令已被拦截：{command[:80]}（破坏性操作禁止执行）"
-            # cwd 安全：默认当前工作区；只允许工作区内的相对路径（拒绝绝对路径与 ..）
             workspace = _get_workspace()
-            cwd = str(workspace)
             rel = (args.get("cwd") or "").strip()
+            if args.get("sandbox"):
+                mode = (args.get("sandbox_mode") or _sandbox.get_sandbox_default() or "workspace")
+                if mode == "host":
+                    mode = "workspace"
+                return _sandbox.run_sandboxed_shell(
+                    workspace,
+                    command,
+                    mode=mode,
+                    cwd_rel=rel or None,
+                    timeout=float(args.get("timeout") or _sandbox.DEFAULT_TIMEOUT),
+                    allow_network=bool(args.get("allow_network")),
+                )
+            # cwd 安全：默认当前工作区；只允许工作区内的相对路径（拒绝绝对路径与 ..）
+            cwd = str(workspace)
             if rel and rel != ".":
                 target = _safe_join(workspace, rel)
                 if target is None:
@@ -4050,6 +4287,33 @@ def _execute_tool(name: str, arguments: str,
                 return False, json.dumps({"exit_code": rc,
                                           "stderr": stderr or stdout}, ensure_ascii=False)
             return True, json.dumps({"exit_code": 0, "stdout": stdout}, ensure_ascii=False)
+        if name == "run_sandboxed_shell":
+            command = (args.get("command") or "").strip()
+            if not command:
+                return False, "没有提供命令"
+            workspace = _get_workspace()
+            mode = (args.get("mode") or _sandbox.get_sandbox_default() or "workspace")
+            timeout = _safe_float(args.get("timeout"), _sandbox.DEFAULT_TIMEOUT, 5.0, 600.0)
+            return _sandbox.run_sandboxed_shell(
+                workspace,
+                command,
+                mode=mode,
+                cwd_rel=(args.get("cwd") or "").strip() or None,
+                timeout=timeout,
+                allow_network=bool(args.get("allow_network")),
+            )
+        if name == "run_sandboxed_code":
+            workspace = _get_workspace()
+            mode = (args.get("mode") or _sandbox.get_sandbox_default() or "workspace")
+            timeout = _safe_float(args.get("timeout"), _sandbox.DEFAULT_TIMEOUT, 5.0, 600.0)
+            return _sandbox.run_sandboxed_code(
+                workspace,
+                code=args.get("code"),
+                file_rel=(args.get("file") or "").strip() or None,
+                mode=mode,
+                timeout=timeout,
+                allow_network=bool(args.get("allow_network")),
+            )
         # ================= 编程工具：检索 =================
         if name == "search_text":
             workspace = _get_workspace()
@@ -4426,6 +4690,61 @@ def _execute_tool(name: str, arguments: str,
             return False, f"todo 不存在：{tid}"
         if name == "list_todos":
             return True, json.dumps(_todos_snapshot(), ensure_ascii=False)
+        # ================= 长任务项目 =================
+        if name == "create_project":
+            ms = args.get("milestones")
+            if ms is not None and not isinstance(ms, list):
+                ms = None
+            ok, result = _projects.create_project(
+                args.get("title") or "", args.get("goal") or "", ms)
+            if not ok:
+                return False, str(result)
+            _projects.set_active_project(result["created"]["id"])
+            return True, json.dumps(result, ensure_ascii=False)
+        if name == "update_project":
+            pid = (args.get("project_id") or "").strip()
+            fields = {k: args[k] for k in ("title", "goal", "status") if k in args and args[k] is not None}
+            ok, result = _projects.update_project(pid, **fields)
+            return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
+        if name == "get_project":
+            pid = (args.get("project_id") or _projects.get_active_project_id()).strip()
+            proj = _projects.get_project(pid)
+            if proj is None:
+                return False, f"项目不存在：{pid or '(未指定)'}"
+            return True, json.dumps(proj, ensure_ascii=False)
+        if name == "list_projects":
+            status = (args.get("status") or "").strip() or None
+            items = _projects.list_projects(status=status)
+            return True, json.dumps({"projects": items, "active": _projects.get_active_project_id()},
+                                    ensure_ascii=False)
+        if name == "add_milestone":
+            ok, result = _projects.add_milestone(
+                args.get("project_id") or "", args.get("title") or "", args.get("notes") or "")
+            return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
+        if name == "update_milestone":
+            try:
+                mid = int(args.get("milestone_id"))
+            except (TypeError, ValueError):
+                return False, "milestone_id 必须是整数"
+            ok, result = _projects.update_milestone(
+                args.get("project_id") or "", mid,
+                status=args.get("status"), notes=args.get("notes"))
+            return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
+        if name == "save_checkpoint":
+            ok, result = _projects.save_checkpoint(
+                args.get("project_id") or "",
+                args.get("summary") or "",
+                args.get("next_step") or "",
+                args.get("blockers") or "",
+            )
+            return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
+        if name == "link_todo":
+            try:
+                tid = int(args.get("todo_id"))
+            except (TypeError, ValueError):
+                return False, "todo_id 必须是整数"
+            ok, result = _projects.link_todo(args.get("project_id") or "", tid)
+            return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         # ================= 编程工具：项目索引 =================
         if name == "repo_map":
             workspace = _get_workspace()
@@ -4554,6 +4873,11 @@ def _execute_tool(name: str, arguments: str,
         if name == "delegate":
             return _exec_delegate(args, api_url, headers, model, temperature,
                                   q, cancel, depth, task_id)
+        if name in _browser.ALIAS_TOOL_NAMES:
+            mcp = _ensure_mcp()
+            if mcp is None or not mcp.conns:
+                return False, "浏览器 MCP 未连接（请先 POST /api/v1/browser/enable 并等待重连）"
+            return _browser.execute_alias(name, args, mcp.call)
         if name.startswith("mcp_"):
             # MCP 外部工具转发（mcp_<server>_<tool>）
             mcp = _ensure_mcp()
@@ -5282,6 +5606,9 @@ async def chat_stream(req: ChatRequest):
             todo_note = _todos_system_note()
             if todo_note:
                 m["content"] += todo_note
+            project_note = _projects.project_system_note(req.project_id)
+            if project_note:
+                m["content"] += project_note
             # 注入可用技能包清单（只注入清单，全文按需 load_skill）
             m["content"] += _skill_catalog_text()
             # 注入可用子 agent 清单（delegate 委派）
@@ -5296,6 +5623,7 @@ async def chat_stream(req: ChatRequest):
         if not appended:
             messages.insert(0, {"role": "system",
                                 "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
+                                + _projects.project_system_note(req.project_id)
                                 + _skill_catalog_text() + _agent_catalog_text()})
         return StreamingResponse(
             _agent_stream_events(api_url, headers, messages, model, req.temperature,

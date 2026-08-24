@@ -17,6 +17,8 @@ import os
 import threading
 from pathlib import Path
 
+from brand import env_is_set
+
 log = logging.getLogger("llm-backend")
 
 _mcp_manager = None
@@ -49,7 +51,7 @@ def _ensure_mcp():
     - 首次连接最多等待 MCP_START_TIMEOUT 秒（不阻塞健康检查 20 秒）。
     """
     global _mcp_manager
-    if _mcp_manager is None and os.environ.get("PCAGENT_DISABLE_MCP"):
+    if _mcp_manager is None and env_is_set(("VENUS_DISABLE_MCP", "PCAGENT_DISABLE_MCP")):
         return None
     with _mcp_init_lock:
         if _mcp_manager is None:

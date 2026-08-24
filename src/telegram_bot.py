@@ -1,5 +1,5 @@
 """
-Telegram Bot 前端 — 用手机控制 PC Agent（纯标准库，零依赖）
+Telegram Bot 前端 — 用手机控制 Venus（纯标准库，零依赖）
 
 架构：Telegram Bot 只是 llm_server 的又一个前端，复用全部现有 API——
   手机消息 → 本 bot → POST /api/v1/chat/stream（消费 SSE 流）
@@ -32,6 +32,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from brand import PRODUCT_NAME
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent / "telegram_config.json"
@@ -575,7 +577,7 @@ class Bot:
 
     def cmd_help(self, chat_id: int) -> None:
         self.send_message(chat_id, (
-            "PC Agent（Telegram 前端）\n"
+            f"{PRODUCT_NAME}（Telegram 前端）\n"
             "直接发消息即可，Agent 自主调用工具。\n\n"
             "/new 新建会话\n/sessions 会话列表\n/switch N 切换会话\n"
             "/status 状态\n/stats Token 用量\n/send <路径> 发送工作区文件给你\n"

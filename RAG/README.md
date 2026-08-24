@@ -1,13 +1,13 @@
 # RAG Server — 本地文档知识库检索服务
 
 独立的 RAG（检索增强生成）服务：把文档分块 + 向量化，暴露 HTTP API 供查询。
-**PC Agent 可通过 `rag_search` 工具接入**（见文末「Agent 接入」）。
+**Venus 可通过 `rag_search` 工具接入**（见文末「Agent 接入」）。
 
 ## 架构
 
 ```
 ┌─────────────┐    HTTP     ┌──────────────────────────────┐
-│  PC Agent / │ ──────────► │  RAG Server (127.0.0.1:8010) │
+│  Venus /    │ ──────────► │  RAG Server (127.0.0.1:8010) │
 │  其他客户端  │             │  集合 → 文档 → 分块 → 向量索引  │
 └─────────────┘             │  检索：向量优先 / 词法兜底      │
                             └──────────────┬───────────────┘
@@ -61,8 +61,8 @@ python rag_server.py --port 8010 --token xxx   # 启用鉴权（客户端需 X-A
   "ok": true, "query": "agent 能控制电脑吗",
   "embedding": true,            // false = 词法兜底模式
   "hits": [{
-    "doc_id": "07a1519349e8", "title": "PC Agent 介绍",
-    "text": "PC Agent 是把 LLM 接到电脑的桌面智能体…",
+    "doc_id": "07a1519349e8", "title": "Venus 介绍",
+    "text": "Venus 是把 LLM 接到电脑的桌面智能体…",
     "score": 0.6824, "method": "vector"   // vector | lexical
   }]
 }
@@ -103,7 +103,7 @@ RAG/
 
 ## Agent 接入
 
-PC Agent 侧新增一个 `rag_search` 工具即可接入（llm_server.py 的 `_execute_tool` 加分支）：
+Venus 侧新增一个 `rag_search` 工具即可接入（llm_server.py 的 `_execute_tool` 加分支）：
 
 ```python
 # 工具实现（示意）：检索 → 把 top_k 片段注入上下文
@@ -115,7 +115,7 @@ if name == "rag_search":
 ```
 
 设计要点：
-- RAG 服务与 PC Agent 完全解耦：只通过 HTTP 通信，Agent 挂了 RAG 不受影响
+- RAG 服务与 Venus 完全解耦：只通过 HTTP 通信，Agent 挂了 RAG 不受影响
 - 集合名即知识域（如 `project-docs`、`daily-notes`），Agent 按任务选集合
 - 检索结果以 `method` 字段标记向量/词法，Agent 可感知精度差异
 - 鉴权可选（`--token`），Agent 请求时带 `X-Api-Token`

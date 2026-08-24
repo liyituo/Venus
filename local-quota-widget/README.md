@@ -42,10 +42,12 @@ cd local-quota-widget
 
 | 区块 | 数据来源 |
 |------|----------|
-| Cursor | Dashboard 非官方 API（本周期 / Auto / API 百分比） |
+| Cursor | Dashboard 非官方 API（本周期 / Auto / API 百分比 + **本周期 token 汇总**） |
 | Codex | `wham/usage`（5 小时 / 7 天窗口、credits） |
 
-- 默认每 5 分钟自动刷新（可在 `.local/settings.json` 改 `refresh_seconds`）
+- **自动刷新：默认每 5 分钟**（`.local/settings.json` 里 `refresh_seconds`，范围 60–3600 秒）
+- Cursor 卡片左下角显示「更新 HH:MM · 每 5m」；F5 或菜单可立即刷新
+- Cursor **token** 来自 Dashboard 的 `get-filtered-usage-events`，按当前计费周期汇总（输入+输出+缓存）；请求极多时会截断并显示 `+`
 - 大数字与圆环表示**剩余**百分比；颜色：绿 > 40%，黄 ≤ 40%，红 ≤ 15%
 - 界面：窗外全透明，上下两张圆角卡片（上 Cursor 海雾蓝，下 Codex 杏茶金）
 

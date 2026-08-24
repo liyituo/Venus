@@ -59,7 +59,7 @@ class ApplicationService:
                 self.config.risk.kill_switch_default, "configured default", "system"
             )
         # 行情源：file（默认）/ simulated（离线模拟市场，每日自动推进）/
-        # live（yfinance+akshare 自动拉取，失败回退缓存）
+        # live（yfinance + A股多源自动拉取，失败回退缓存）
         self.provider: FileDataProvider
         if self.config.market_data.source == "live":
             from quant_agent.data.live_provider import LiveMarketDataProvider
@@ -68,6 +68,8 @@ class ApplicationService:
                 self.paths.data_dir,
                 market=self.config.market_data.market,
                 symbols=self.config.market_data.symbols,
+                cn_sources=self.config.market_data.cn_sources or None,
+                xq_token_env=self.config.market_data.xq_token_env,
             )
         elif self.config.market_data.source == "simulated":
             from quant_agent.data.simulated_provider import SimulatedMarketProvider
