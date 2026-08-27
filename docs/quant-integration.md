@@ -2,7 +2,7 @@
 
 ## Baseline
 
-The parent Agent is the repository root; its desktop GUI is `src/chat.py`.
+The parent Agent is the repository root; the desktop GUI is `src/venuschat_v1/` (local WIP) or `src/cli.py`.
 The isolated quantitative project is `quant-agent-lab/` and has no nested Git
 repository. The current baseline is 29 Python tests and 5 Node
 MCP/UI/standalone contract tests. On the local Windows validation host, the

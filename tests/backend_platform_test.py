@@ -97,5 +97,15 @@ except ValueError:
 row = S.add_schedule(time_hhmm="09:30", prompt="测试定时")
 check("store add", row.get("time") == "09:30", row)
 
+print("== 4. CodeGraph / MCP / 扩展配置 ==")
+r = client.get("/api/v1/codegraph/stats")
+check("codegraph stats", r.status_code == 200 and "files" in r.json(), r.text)
+
+r = client.get("/api/v1/mcp/status")
+check("mcp status", r.status_code == 200 and "servers" in r.json(), r.text)
+
+r = client.post("/api/v1/config", json={"tool_router": True, "memory_enabled": True})
+check("config tool_router", r.status_code == 200 and r.json().get("config", {}).get("tool_router"), r.text)
+
 print(f"\n{'=' * 40}\n  {passed} passed, {failed} failed\n{'=' * 40}")
 sys.exit(1 if failed else 0)

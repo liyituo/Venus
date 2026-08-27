@@ -2,7 +2,7 @@
 
 **个人 Agent 调度台** — 派活即走，本地可控。把 LLM 接到你的电脑上，让它能读写文件、跑命令、管 Git、操作屏幕；长任务后台异步执行，跨会话记住你的偏好。
 
-> **v0.10.0** — 后端平台第一阶段已冻结（异步任务台 + 记忆 API + 智能派发 + 统一定时任务）。桌面 Chat UI 重构中，CLI 可完整验证后端能力。
+> **v0.10.1** — VenusChat V1 桌面端接入 llm_server（会话/SSE/确认/派活/设置）；旧 `chat.py` 已移除。CLI 与 Web UI（`/venus`）可并行验证后端能力。
 
 ## 免责声明
 
@@ -23,7 +23,7 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 
 ```
 ┌──────────── 入口 ────────────┐
-│ chat.py · cli.py · telegram  │
+│ cli.py · venuschat_v1 · telegram │
 └──────────────┬───────────────┘
                │ HTTP :8001
 ┌──────────────▼───────────────┐
@@ -44,7 +44,7 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 
 - `src/app.py` — 屏幕控制 daemon，鼠标键盘操作在单线程队列里排队执行
 - `src/llm_server.py` — 中枢：Agent 循环、异步任务、记忆、确认流、MCP、会话
-- 前端（任选其一）— `chat.py` 聊天窗 / `cli.py` 终端 / `gui.py` 屏幕面板 / `telegram_bot.py` 手机遥控 / `static/index.html` 网页
+- 前端（任选其一）— `cli.py` 终端 / `venuschat_v1` 桌面 / `gui.py` 屏幕面板 / `telegram_bot.py` 手机遥控 / `static/venus.html` 网页（`/venus`）
 
 ### 后端模块（v0.10 冻结）
 
@@ -63,8 +63,16 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 双击 `scripts/一键启动控制台.bat`：首次自动建 `.venv` 装依赖，之后直接弹聊天窗口。手动起也一样：
 
 ```
-.venv\Scripts\python src\chat.py
+.venv\Scripts\python src\cli.py
 ```
+
+桌面 Chat（VenusChat V1，本地开发版，未入库）：
+
+```
+.venv\Scripts\python -m venuschat_v1
+```
+
+或双击 `scripts/一键启动控制台.bat`（需本地存在 `src/venuschat_v1/`）。
 
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
 

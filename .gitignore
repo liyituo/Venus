@@ -29,4 +29,5 @@ tools/
 # 量化子项目作为隔离子目录纳入主仓库；其缓存、数据库、日志和构建产物
 # 由 quant-agent-lab/.gitignore 单独排除。
 
-# 本地 AI 额度面板：源码入库；凭据与窗口位置见 local-quota-widget/.gitignore
+artifacts/gui/
+

@@ -3,10 +3,9 @@ title Venus - One-Click Launcher
 cd /d "%~dp0"
 
 rem ============================================================
-rem  One-Click launcher: double-click this file to open the Chat.
+rem  One-Click launcher: starts VenusChat V1 desktop UI
+rem  and ensures llm_server is reachable.
 rem  First run: auto-creates .venv and installs dependencies.
-rem  The Chat auto-starts / reuses the Daemon.
-rem  Use "Open Screen Backend" button inside Chat to open the screen panel.
 rem ============================================================
 
 if not exist "..\.venv\Scripts\pythonw.exe" (
@@ -22,10 +21,16 @@ if errorlevel 1 (
     if errorlevel 1 goto :fail
 )
 
-echo [3/3] Starting Chat ...
-start "" "..\.venv\Scripts\pythonw.exe" "..\src\chat.py"
+if not exist "..\src\venuschat_v1\__main__.py" (
+    echo VenusChat V1 not found at src\venuschat_v1
+    echo Use CLI instead: .venv\Scripts\python src\cli.py
+    goto :fail
+)
+
+echo [3/3] Starting VenusChat V1 ...
+start "" "..\.venv\Scripts\pythonw.exe" -m venuschat_v1
 echo.
-echo Chat started - use "Open Screen Backend" button to open the screen panel.
+echo VenusChat V1 started. Ensure llm_server is running on :8001.
 echo This window will close automatically.
 exit /b 0
 

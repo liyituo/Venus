@@ -5,7 +5,7 @@ from __future__ import annotations
 PRODUCT_NAME = "Venus"
 PRODUCT_NAME_UPPER = "VENUS"
 PRODUCT_SLUG = "venus"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
 TAGLINE = "个人 Agent 调度台 · 派活即走 · 本地可控"
 DAEMON_NAME = "Venus Daemon"
 

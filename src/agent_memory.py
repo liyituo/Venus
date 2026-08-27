@@ -850,6 +850,24 @@ def build_codegraph(workspace_root, files_iter, max_files: int = CG_MAX_FILES) -
     return ws
 
 
+def codegraph_stats(workspace_root) -> dict:
+    """当前工作区 CodeGraph 索引统计（供前端设置页展示）。"""
+    whash = _workspace_hash(str(workspace_root))
+    data = _load_json_robust(_memory_file("codegraph.json"), {})
+    ws = (data.get("workspaces") or {}).get(whash)
+    if not ws:
+        return {"ok": True, "built": False, "files": 0, "symbols": 0, "truncated": False}
+    files = ws.get("files") or {}
+    symbols = sum(len(f.get("symbols") or []) for f in files.values())
+    return {
+        "ok": True,
+        "built": True,
+        "files": len(files),
+        "symbols": symbols,
+        "truncated": bool(ws.get("truncated")),
+    }
+
+
 def codegraph_query(workspace_root, symbol: str, top_k: int = 10) -> dict:
     """符号查找：定义位置 + 调用方（谁调用它）。"""
     whash = _workspace_hash(str(workspace_root))

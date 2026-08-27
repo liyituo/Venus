@@ -12,7 +12,7 @@ LLM API 后端 — 把 Chat 前端的聊天请求转发到任意 OpenAI 兼容�
   给出明确提示而不是返回空回复
 - 实时读取 chat_config.json（API URL / Key / Model），Settings 保存后立即生效
 - 网络调用放在线程池执行，不阻塞 FastAPI 事件循环
-- 由 chat.py 自动拉起（默认端口 8001），也可手动运行
+- 由 CLI / VenusChat V1（本地）或手动运行（默认端口 8001）
 
 运行：python llm_server.py [--host 127.0.0.1] [--port 8001]
 """
@@ -895,6 +895,13 @@ class ConfigUpdate(BaseModel):
     vision_api_url: str | None = None
     vision_api_key: str | None = None
     vision_model: str | None = None
+    tool_router: bool | None = None
+    tool_router_url: str | None = None
+    tool_router_model: str | None = None
+    memory_enabled: bool | None = None
+    llm_memory_extract: bool | None = None
+    confirm_mode: str | None = None
+    log_level: str | None = None
 
 
 class LlmError(Exception):
@@ -1238,16 +1245,31 @@ async def compress(req: CompressRequest) -> dict:
             "summary": summary_text, "stats": stats}
 
 
+def _public_config(cfg: dict | None = None) -> dict:
+    """返回可下发给前端的配置摘要（密钥脱敏）。"""
+    c = cfg or load_config()
+    return {
+        "api_url": c.get("api_url", ""),
+        "api_key": "***" if c.get("api_key") else "",
+        "model": c.get("model", ""),
+        "context_window": c.get("context_window", 65536),
+        "reasoning_mode": c.get("reasoning_mode", "max"),
+        "vision_api_url": c.get("vision_api_url", ""),
+        "vision_api_key": "***" if c.get("vision_api_key") else "",
+        "vision_model": c.get("vision_model", ""),
+        "tool_router": bool(c.get("tool_router")),
+        "tool_router_url": c.get("tool_router_url", ""),
+        "tool_router_model": c.get("tool_router_model", ""),
+        "memory_enabled": bool(c.get("memory_enabled", True)),
+        "llm_memory_extract": bool(c.get("llm_memory_extract")),
+        "confirm_mode": c.get("confirm_mode", "auto"),
+        "log_level": c.get("log_level", "info"),
+    }
+
+
 @app.get("/api/v1/config", summary="查看 API 配置（Key 脱敏）")
 async def get_config() -> dict:
-    cfg = load_config()
-    return {"ok": True, "config": {
-        "api_url": cfg.get("api_url", ""),
-        "api_key": "***" if cfg.get("api_key") else "",
-        "model": cfg.get("model", ""),
-        "context_window": cfg.get("context_window", 65536),
-        "reasoning_mode": cfg.get("reasoning_mode", "max"),
-    }}
+    return {"ok": True, "config": _public_config()}
 
 
 @app.post("/api/v1/config", summary="更新 API 配置（写入 chat_config.json，实时生效）")
@@ -1312,10 +1334,37 @@ async def update_config(req: ConfigUpdate) -> dict:
             raise HTTPException(422, f"无效推理强度，可选：{' / '.join(REASONING_MODES)}")
         cfg["reasoning_mode"] = req.reasoning_mode
         updates["reasoning_mode"] = True
+    if req.tool_router is not None:
+        cfg["tool_router"] = bool(req.tool_router)
+        updates["tool_router"] = True
+    if req.tool_router_url is not None:
+        cfg["tool_router_url"] = req.tool_router_url.strip()
+        updates["tool_router_url"] = True
+    if req.tool_router_model is not None:
+        cfg["tool_router_model"] = req.tool_router_model.strip()
+        updates["tool_router_model"] = True
+    if req.memory_enabled is not None:
+        cfg["memory_enabled"] = bool(req.memory_enabled)
+        updates["memory_enabled"] = True
+    if req.llm_memory_extract is not None:
+        cfg["llm_memory_extract"] = bool(req.llm_memory_extract)
+        updates["llm_memory_extract"] = True
+    if req.confirm_mode is not None:
+        mode = req.confirm_mode.strip()
+        if mode not in ("auto", "strict", "trusted", "query"):
+            raise HTTPException(422, "confirm_mode 无效")
+        cfg["confirm_mode"] = mode
+        updates["confirm_mode"] = True
+    if req.log_level is not None:
+        lvl = req.log_level.strip().lower()
+        if lvl not in ("debug", "info", "warning", "error"):
+            raise HTTPException(422, "log_level 无效")
+        cfg["log_level"] = lvl
+        updates["log_level"] = True
     if not updates:
         raise HTTPException(
             422, "没有可更新的字段（支持 api_url/api_key/model/context_window/"
-                 "reasoning_mode/vision_api_url/vision_api_key/vision_model）")
+                 "reasoning_mode/vision_*/tool_router*/memory_*/confirm_mode/log_level）")
     # 写盘前脱敏：内存中的真实密钥（secure store 读出的明文）绝不落盘，
     # 未在本请求中更新的密钥字段替换回占位符
     try:
@@ -1333,13 +1382,7 @@ async def update_config(req: ConfigUpdate) -> dict:
     except OSError as exc:
         raise HTTPException(500, f"配置写入失败：{exc}") from exc
     log.info("config updated: %s", updates)
-    return {"ok": True, "updated": list(updates.keys()), "config": {
-        "api_url": cfg.get("api_url", ""),
-        "api_key": "***" if cfg.get("api_key") else "",
-        "model": cfg.get("model", ""),
-        "context_window": cfg.get("context_window", 65536),
-        "reasoning_mode": cfg.get("reasoning_mode", "max"),
-    }}
+    return {"ok": True, "updated": list(updates.keys()), "config": _public_config(cfg)}
 
 
 @app.get("/api/v1/stats", summary="Token 用量统计（缓存命中率）")
@@ -1650,6 +1693,48 @@ async def api_schedules_delete(schedule_id: str) -> dict:
     if not _schedules.delete_schedule(schedule_id):
         raise HTTPException(404, "定时任务不存在")
     return {"ok": True, "deleted": schedule_id}
+
+
+@app.get("/api/v1/codegraph/stats", summary="CodeGraph 索引统计（当前工作区）")
+async def api_codegraph_stats() -> dict:
+    ws = _get_workspace()
+    stats = _agent_memory.codegraph_stats(ws)
+    stats["workspace"] = str(ws)
+    return stats
+
+
+@app.post("/api/v1/codegraph/rebuild", summary="重建当前工作区 CodeGraph 索引")
+async def api_codegraph_rebuild() -> dict:
+    ws = _get_workspace()
+    try:
+        files_iter = _iter_workspace_files(ws)
+        res = _agent_memory.build_codegraph(ws, files_iter)
+        return {
+            "ok": True,
+            "built": True,
+            "files": len(res.get("files") or {}),
+            "truncated": bool(res.get("truncated")),
+        }
+    except Exception as exc:
+        raise HTTPException(500, f"CodeGraph 重建失败：{exc}") from exc
+
+
+@app.get("/api/v1/mcp/status", summary="MCP 服务连接状态")
+async def api_mcp_status() -> dict:
+    from mcp_manager import _load_mcp_config, get_manager_state
+    configured = _load_mcp_config()
+    live = {row["name"]: row for row in get_manager_state()}
+    servers = []
+    for name in sorted(configured.keys()):
+        st = live.get(name, {})
+        servers.append({
+            "name": name,
+            "configured": True,
+            "connected": bool(st.get("connected")),
+            "tool_count": int(st.get("tool_count") or 0),
+            "error": st.get("error") or "",
+        })
+    return {"ok": True, "servers": servers, "total_tools": sum(s["tool_count"] for s in servers)}
 
 
 @app.get("/api/v1/workspace", summary="查看当前工作区")
