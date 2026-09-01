@@ -42,7 +42,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 # 工具权限元数据与判定 / MCP 接入层（显式导入：import * 不会带入下划线符号；
 # 以下名字是模块级 re-export，测试通过模块属性访问，必须保留）
 from security_policy import (  # noqa: E402,F401
@@ -65,6 +65,7 @@ import agent_memory as _agent_memory
 import extension_registry as _extensions
 import project_store as _projects  # noqa: E402
 from brand import APP_VERSION, SYSTEM_IDENTITY, env_is_set
+import team_collab
 from data_paths import workspace_data_dir
 import browser_tools as _browser  # noqa: E402
 import sandbox_runner as _sandbox  # noqa: E402
@@ -876,6 +877,13 @@ class ProjectActiveUpdate(BaseModel):
     project_id: str = Field(default="", description="设为活跃项目；空字符串表示清除")
 
 
+class ProjectCreate(BaseModel):
+    title: str = Field(..., description="项目标题")
+    goal: str = Field(default="", description="项目目标")
+    is_team: bool = Field(default=False, description="团队项目（敏感操作需多人复核）")
+    milestones: list[dict] | None = Field(default=None, description="可选里程碑")
+
+
 class ExtensionAction(BaseModel):
     plugin_id: str = Field(..., description="catalog 中的插件 id")
 
@@ -965,6 +973,51 @@ async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
         raise HTTPException(500, f"配置写入失败：{exc}") from exc
     log.info("confirm mode -> %s", req.mode)
     return {"ok": True, "mode": req.mode, "description": CONFIRM_MODE_DESC[req.mode]}
+
+
+class TeamUserCreate(BaseModel):
+    name: str = Field(..., description="显示名")
+    role: str = Field(default="member", description="admin / member")
+    color: str = Field(default="#2F8A5B", description="UI 色点")
+
+
+@app.get("/api/v1/team", summary="团队成员列表（不含 token）")
+async def team_list() -> dict:
+    users = team_collab.public_users()
+    return {
+        "ok": True,
+        "team_enabled": team_collab.team_enabled(),
+        "users": users,
+        "owner": team_collab.OWNER_USER,
+    }
+
+
+@app.post("/api/v1/team/users", summary="创建团队成员（admin；token 仅返回一次）")
+async def team_create_user(req: TeamUserCreate, request: Request) -> dict:
+    user = _request_user(request)
+    if not team_collab.is_admin(user):
+        raise HTTPException(403, "仅 admin 可创建成员")
+    try:
+        public, token = team_collab.create_user(
+            name=req.name, role=req.role, color=req.color)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    team_collab.audit(str(user.get("id")), "team.user_create", {"user_id": public["id"]})
+    return {"ok": True, "user": public, "token": token}
+
+
+@app.get("/api/v1/audit", summary="协作审计日志（只读）")
+async def audit_list(limit: int = 100) -> dict:
+    limit = max(1, min(int(limit or 100), 500))
+    return {"ok": True, "entries": team_collab.read_audit(limit=limit)}
+
+
+@app.get("/api/v1/confirm/pending", summary="当前用户待审批确认")
+async def confirm_pending(request: Request) -> dict:
+    user = _request_user(request)
+    with _confirm_lock:
+        pending = team_collab.pending_for_user(str(user.get("id")), _confirm_table)
+    return {"ok": True, "pending": pending, "count": len(pending)}
 
 
 # 可选 token 鉴权：--token 启动时启用，所有请求须带 X-Api-Token 头
@@ -1060,12 +1113,25 @@ async def log_requests(request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request, call_next):
-    if AUTH_TOKEN and not _token_ok(request):
+    try:
+        request.state.user = team_collab.resolve_request_user(
+            request.headers.get("X-User-Token", ""),
+            request.headers.get("X-Api-Token", ""),
+            AUTH_TOKEN,
+        )
+    except team_collab.AuthError:
         return JSONResponse(
             status_code=401,
-            content={"detail": "未授权：需要正确的 X-Api-Token（llm_server 已启用 token 鉴权）"},
+            content={"detail": "未授权：需要正确的 X-User-Token 或 X-Api-Token"},
         )
     return await call_next(request)
+
+
+def _request_user(request: Request | None) -> dict:
+    if request is None:
+        return dict(team_collab.OWNER_USER)
+    user = getattr(request.state, "user", None)
+    return user if isinstance(user, dict) else dict(team_collab.OWNER_USER)
 
 
 # 结构化压缩：schema 版本 + 稳定结构（规格第六章）
@@ -1419,6 +1485,20 @@ async def api_get_project(project_id: str) -> dict:
     return {"ok": True, **proj}
 
 
+@app.post("/api/v1/projects", summary="创建长任务项目")
+async def api_create_project(req: ProjectCreate, request: Request) -> dict:
+    ok, result = _projects.create_project(
+        req.title, req.goal, req.milestones, is_team=req.is_team)
+    if not ok:
+        raise HTTPException(422, str(result))
+    user = _request_user(request)
+    team_collab.audit(str(user.get("id")), "project.create", {
+        "project_id": result["created"]["id"],
+        "is_team": req.is_team,
+    })
+    return {"ok": True, **result}
+
+
 @app.post("/api/v1/projects/active", summary="设置当前活跃项目")
 async def api_set_active_project(req: ProjectActiveUpdate) -> dict:
     ok, msg = _projects.set_active_project(req.project_id)
@@ -1721,7 +1801,7 @@ async def api_codegraph_rebuild() -> dict:
 
 @app.get("/api/v1/mcp/status", summary="MCP 服务连接状态")
 async def api_mcp_status() -> dict:
-    from mcp_manager import _load_mcp_config, get_manager_state
+    from mcp_manager import get_manager_state
     configured = _load_mcp_config()
     live = {row["name"]: row for row in get_manager_state()}
     servers = []
@@ -2365,6 +2445,8 @@ AGENT_TOOLS = [
                        "properties": {
                            "title": {"type": "string", "description": "项目标题"},
                            "goal": {"type": "string", "description": "项目目标（一段话）"},
+                           "is_team": {"type": "boolean",
+                                       "description": "是否为团队项目（true=多人复核；false=个人项目）"},
                            "milestones": {"type": "array",
                                           "items": {"type": "object",
                                                     "properties": {
@@ -4149,20 +4231,32 @@ def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
 
 
 def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
-                  task_id: str = "") -> str | None:
+                  task_id: str = "", tool_name: str = "") -> str | None:
     """等待用户对确认请求的响应；超时返回 None（视为拒绝）。
 
     条目绑定 task_id 与过期时间：agent_respond 校验，取消/完成/过期任务的确认被拒绝。
+    团队模式下 required>1 时需收集足够 yes 票；任一 no 立即拒绝。
     """
     ev = threading.Event()
+    required = team_collab.required_votes(
+        tool_name or "unknown", project_id=_projects.get_active_project_id())
     with _confirm_lock:
-        _confirm_table[request_id] = {"event": ev, "choice": None,
-                                      "task_id": task_id, "source": "http",
-                                      "expires": time.monotonic() + timeout}
+        _confirm_table[request_id] = {
+            "event": ev, "choice": None,
+            "task_id": task_id, "source": "http",
+            "expires": time.monotonic() + timeout,
+            "tool": tool_name,
+            "required": required,
+            "approvals": {},
+        }
     ev.wait(timeout)
     with _confirm_lock:
         entry = _confirm_table.pop(request_id, None)
-        return entry["choice"] if entry else None
+        if not entry:
+            return None
+        if entry.get("choice") is not None:
+            return entry["choice"]
+        return None
 
 
 class AskResponse(BaseModel):
@@ -4171,14 +4265,18 @@ class AskResponse(BaseModel):
 
 
 @app.post("/api/v1/agent/respond", summary="响应 Agent 的确认请求")
-async def agent_respond(req: AskResponse) -> dict:
+async def agent_respond(req: AskResponse, request: Request) -> dict:
     """响应确认请求。
 
     生命周期：waiter（_wait_confirm）是确认记录的唯一所有者——它创建、读取并清理记录；
     responder 只能原子地写入 choice 并触发 Event，绝不提前删除记录（否则 waiter 醒来
     拿不到 choice，HTTP 返回 200 但 Agent 仍按拒绝/超时处理）。
     重复响应幂等：已消费的确认不再改变结果。
+    团队模式：required>1 时逐票累计，满票才唤醒 waiter；一票否决立即终止。
     """
+    user = _request_user(request)
+    user_id = str(user.get("id") or team_collab.OWNER_ID)
+    vote = "yes" if req.choice == "yes" else "no"
     task_id_for_job = ""
     with _confirm_lock:
         entry = _confirm_table.get(req.request_id)
@@ -4191,16 +4289,59 @@ async def agent_respond(req: AskResponse) -> dict:
         if entry["task_id"] and entry["task_id"] != current_task:
             raise HTTPException(404, "该确认请求所属任务已结束，无法应答")
         if entry["choice"] is not None:
-            # 已消费（重复点击/并发响应）：幂等返回，不改变最终结果
-            return {"ok": True, "choice": entry["choice"], "already_processed": True}
+            status = team_collab.confirm_vote_status(entry)
+            return {"ok": True, "choice": entry["choice"], "already_processed": True, **status}
+
+        required = max(1, int(entry.get("required") or 1))
+        if required > 1:
+            approvals = entry.setdefault("approvals", {})
+            if user_id in approvals:
+                status = team_collab.confirm_vote_status(entry)
+                return {"ok": True, "already_processed": True, **status}
+            approvals[user_id] = vote
+            team_collab.audit(user_id, "confirm.vote", {
+                "request_id": req.request_id,
+                "tool": entry.get("tool"),
+                "vote": vote,
+            })
+            if vote == "no":
+                entry["choice"] = "no"
+                task_id_for_job = entry.get("task_id") or ""
+                entry["event"].set()
+                status = team_collab.confirm_vote_status(entry)
+                log.info("confirm %s veto by %s", req.request_id, user_id)
+                _resume_job_after_confirm(task_id_for_job)
+                return {"ok": True, "choice": "no", "resolved": True, **status}
+            yes_votes = sum(1 for v in approvals.values() if v == "yes")
+            if yes_votes >= required:
+                entry["choice"] = "yes"
+                task_id_for_job = entry.get("task_id") or ""
+                entry["event"].set()
+                status = team_collab.confirm_vote_status(entry)
+                log.info("confirm %s approved (%d/%d)", req.request_id, yes_votes, required)
+                _resume_job_after_confirm(task_id_for_job)
+                return {"ok": True, "choice": "yes", "resolved": True, **status}
+            status = team_collab.confirm_vote_status(entry)
+            log.info("confirm %s vote %s (%d/%d)", req.request_id, user_id, yes_votes, required)
+            return {"ok": True, "pending": True, **status}
+
         entry["choice"] = req.choice
         task_id_for_job = entry.get("task_id") or ""
         entry["event"].set()
+        team_collab.audit(user_id, "confirm.vote", {
+            "request_id": req.request_id,
+            "tool": entry.get("tool"),
+            "vote": req.choice,
+        })
+    _resume_job_after_confirm(task_id_for_job)
+    log.info("confirm %s -> %s", req.request_id, req.choice)
+    return {"ok": True, "choice": req.choice}
+
+
+def _resume_job_after_confirm(task_id_for_job: str) -> None:
     job = _agent_jobs.find_job_by_task_id(task_id_for_job)
     if job and job.get("status") == "waiting_confirm":
         _agent_jobs.update_job(job["id"], status="running", pending_ask=None)
-    log.info("confirm %s -> %s", req.request_id, req.choice)
-    return {"ok": True, "choice": req.choice}
 
 
 class SessionAppend(BaseModel):
@@ -4318,7 +4459,7 @@ async def session_get(sid: int, limit: int = 0, offset: int = 0) -> dict:
 
 
 @app.post("/api/v1/sessions/{sid}/messages", summary="向会话追加消息（增量；返回摘要而非完整历史）")
-async def session_append(sid: int, req: SessionAppend) -> dict:
+async def session_append(sid: int, req: SessionAppend, request: Request) -> dict:
     _ensure_sessions()
     if not req.messages:
         raise HTTPException(422, "messages 不能为空")
@@ -4374,6 +4515,12 @@ async def session_append(sid: int, req: SessionAppend) -> dict:
         import copy as _copy
         snapshot = _copy.deepcopy(s)
         _persist_sessions_or_rollback(lambda: _rollback_session_state(s, snapshot))
+        user = _request_user(request)
+        team_collab.audit(str(user.get("id")), "session.append", {
+            "sid": sid,
+            "count": len(validated),
+            "request_id": req.request_id,
+        })
         # 只返回摘要，不返回完整历史（省传输；完整内容按需 GET）
         return {"ok": True, "session": {"id": sid, "message_count": len(msgs),
                                         "title": s.get("title", ""),
@@ -5122,14 +5269,16 @@ def _execute_tool(name: str, arguments: str,
             if ms is not None and not isinstance(ms, list):
                 ms = None
             ok, result = _projects.create_project(
-                args.get("title") or "", args.get("goal") or "", ms)
+                args.get("title") or "", args.get("goal") or "", ms,
+                is_team=bool(args.get("is_team")))
             if not ok:
                 return False, str(result)
             _projects.set_active_project(result["created"]["id"])
             return True, json.dumps(result, ensure_ascii=False)
         if name == "update_project":
             pid = (args.get("project_id") or "").strip()
-            fields = {k: args[k] for k in ("title", "goal", "status") if k in args and args[k] is not None}
+            fields = {k: args[k] for k in ("title", "goal", "status", "is_team")
+                      if k in args and args[k] is not None}
             ok, result = _projects.update_project(pid, **fields)
             return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         if name == "get_project":
@@ -5696,9 +5845,12 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                                        "计划内声明的范围（files/commands）内操作免确认；"
                                                        "范围外参数、文件被外部修改会重新确认。",
                                            "options": ["yes", "no"],
-                                           "plan": plan_steps}))
+                                           "plan": plan_steps,
+                                           "required": team_collab.required_votes(
+                                               "create_plan", project_id=_projects.get_active_project_id()),
+                                           "approvals": {}}))
                             choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
-                                                   task_id=task_id)
+                                                   task_id=task_id, tool_name="create_plan")
                             if time.monotonic() - start > _MAX_SECS:
                                 # 确认等待也计入任务总时长
                                 q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
@@ -5748,8 +5900,11 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                        "arguments": fn["arguments"],
                                        "question": question,
                                        "options": ["yes", "no"],
-                                       "diff": _confirm_question(fn["name"], args)[1]}))
-                        choice = _wait_confirm(ask_id, task_id=task_id)
+                                       "diff": _confirm_question(fn["name"], args)[1],
+                                       "required": team_collab.required_votes(
+                                           fn["name"], project_id=_projects.get_active_project_id()),
+                                       "approvals": {}}))
+                        choice = _wait_confirm(ask_id, task_id=task_id, tool_name=fn["name"])
                         if time.monotonic() - start > _MAX_SECS:
                             q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
                             return f"任务超过总时长上限 {_MAX_SECS}s"
@@ -5775,8 +5930,11 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                         q.put(("ask", {"id": ask_id, "name": fn["name"],
                                        "arguments": fn["arguments"],
                                        "question": question,
-                                       "options": ["yes", "no"], "diff": diff}))
-                        choice = _wait_confirm(ask_id, task_id=task_id)
+                                       "options": ["yes", "no"], "diff": diff,
+                                       "required": team_collab.required_votes(
+                                           fn["name"], project_id=_projects.get_active_project_id()),
+                                       "approvals": {}}))
+                        choice = _wait_confirm(ask_id, task_id=task_id, tool_name=fn["name"])
                         if time.monotonic() - start > _MAX_SECS:
                             q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
                             return f"任务超过总时长上限 {_MAX_SECS}s"

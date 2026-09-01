@@ -128,10 +128,23 @@ def get_project(project_id: str, *, include_checkpoints: int = 5) -> dict | None
     }
 
 
+def is_team_project(project_id: str | None = None) -> bool:
+    """当前/指定项目是否为团队项目（启用多人复核）。"""
+    pid = (project_id or get_active_project_id()).strip()
+    if not pid:
+        return False
+    proj = get_project(pid, include_checkpoints=0)
+    if proj is None:
+        return False
+    return bool(proj["meta"].get("is_team"))
+
+
 def create_project(
     title: str,
     goal: str = "",
     milestones: list[dict] | None = None,
+    *,
+    is_team: bool = False,
 ) -> tuple[bool, str | dict]:
     title = (title or "").strip()
     goal = (goal or "").strip()[:_MAX_GOAL]
@@ -146,6 +159,7 @@ def create_project(
         "title": title,
         "goal": goal,
         "status": "active",
+        "is_team": bool(is_team),
         "created": now,
         "updated": now,
     }
@@ -169,7 +183,7 @@ def create_project(
         _write_json(_project_dir(pid) / "milestones.json", ms)
         _write_json(_project_dir(pid) / "linked_todos.json", [])
         idx = _load_index()
-        summary = {k: meta[k] for k in ("id", "title", "goal", "status", "created", "updated")}
+        summary = {k: meta[k] for k in ("id", "title", "goal", "status", "is_team", "created", "updated")}
         summary["milestone_count"] = len(ms)
         idx["projects"].append(summary)
         _save_index(idx)
@@ -191,13 +205,15 @@ def update_project(project_id: str, **fields: Any) -> tuple[bool, str | dict]:
         if st not in _PROJECT_STATUSES:
             return False, f"无效状态：{st}"
         meta["status"] = st
+    if "is_team" in fields:
+        meta["is_team"] = bool(fields["is_team"])
     meta["updated"] = int(time.time())
     with _LOCK:
         _write_json(_project_dir(pid) / "meta.json", meta)
         idx = _load_index()
         for item in idx.get("projects") or []:
             if item.get("id") == pid:
-                item.update({k: meta[k] for k in ("title", "goal", "status", "updated")})
+                item.update({k: meta[k] for k in ("title", "goal", "status", "is_team", "updated")})
         _save_index(idx)
     return True, {"updated": meta}
 
@@ -304,6 +320,7 @@ def project_system_note(project_id: str | None = None) -> str:
     meta = proj["meta"]
     lines = [
         f"\n\n【当前项目】{meta.get('title', pid)}（{meta.get('status', 'active')}）",
+        f"类型：{'团队项目（敏感操作需多人复核）' if meta.get('is_team') else '个人项目（单人确认）'}",
         f"目标：{meta.get('goal') or '（未填写）'}",
     ]
     pending_ms = [m for m in proj["milestones"] if m.get("status") not in ("completed", "cancelled")]

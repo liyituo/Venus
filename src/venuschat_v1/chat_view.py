@@ -15,7 +15,7 @@ from typing import Callable
 
 from . import theme as t
 from .api_client import ApiClient                      # noqa: F401  (contract)
-from .backend_bridge import BackendBridge, SessionState
+from .backend_bridge import BackendBridge
 from .widgets import (
     HAS_PIL,
     Dot,
@@ -294,6 +294,12 @@ class ChatView(tk.Frame):
         new_chat.pack(fill="x", padx=t.s(18), pady=(t.s(13), t.s(18)))
 
         self._section_heading(header_zone, "长期项目")
+        proj_actions = tk.Frame(header_zone, bg=t.SIDEBAR)
+        proj_actions.pack(fill="x", padx=t.s(18), pady=(0, t.s(4)))
+        FlatButton(
+            proj_actions, "＋  新建项目", self._new_project, font=self.fonts.caption,
+            variant="outline", height=32, radius=8, parent_bg=t.SIDEBAR,
+        ).pack(fill="x")
         self.project_box = tk.Frame(header_zone, bg=t.SIDEBAR)
         self.project_box.pack(fill="x", padx=t.s(10), pady=(t.s(3), t.s(10)))
         self.refresh_projects()
@@ -721,14 +727,15 @@ class ChatView(tk.Frame):
             return
         for item in self.bridge.projects[-6:]:
             status = str(item.get("status") or "planning")
+            kind = "团队" if item.get("is_team") else "个人"
             row = SidebarItem(
                 self.project_box,
                 title=fit_text(self.fonts.small, str(item.get("title") or "项目"),
                                t.s(216)),
                 font=self.fonts.small,
                 command=lambda pid=item.get("id"): self._select_project(pid),
-                meta=PROJECT_STATUS_CN.get(status, status),
-                meta_color=PROJECT_STATUS_COLOR.get(status, t.INK_MUTED),
+                meta=f"{kind} · {PROJECT_STATUS_CN.get(status, status)}",
+                meta_color=t.TERRACOTTA if item.get("is_team") else PROJECT_STATUS_COLOR.get(status, t.INK_MUTED),
                 show_dot=True)
             row.pack(fill="x", pady=1)
             row.set_active(str(item.get("id")) == self.bridge.active_project_id)
@@ -738,6 +745,75 @@ class ChatView(tk.Frame):
             return
         self.bridge.submit("project_set", lambda: self.bridge.client.post(
             "/api/v1/projects/active", {"project_id": str(project_id)}))
+
+    def _new_project(self) -> None:
+        dlg = tk.Toplevel(self.app.root)
+        dlg.title("新建项目")
+        dlg.configure(bg=t.HEADER)
+        dlg.transient(self.app.root)
+        dlg.grab_set()
+        card = tk.Frame(dlg, bg=t.HEADER, padx=t.s(18), pady=t.s(16))
+        card.pack(fill="both", expand=True)
+        tk.Label(card, text="新建长期项目", bg=t.HEADER, fg=t.INK,
+                 font=self.fonts.display_md).pack(anchor="w")
+        tk.Label(card, text="类型在创建时确定；团队项目启用多人复核。",
+                 bg=t.HEADER, fg=t.INK_MUTED, font=self.fonts.caption,
+                 wraplength=t.s(320), justify="left").pack(
+            anchor="w", pady=(t.s(6), t.s(10)))
+        tk.Label(card, text="项目名称", bg=t.HEADER, fg=t.INK_SOFT,
+                 font=self.fonts.caption).pack(anchor="w")
+        title_var = tk.StringVar()
+        title_entry = tk.Entry(
+            card, textvariable=title_var, bg=t.SURFACE, fg=t.INK,
+            insertbackground=t.INK, relief="flat", font=self.fonts.body)
+        title_entry.pack(fill="x", ipady=t.s(6), pady=(t.s(4), t.s(10)))
+        tk.Label(card, text="目标（可选）", bg=t.HEADER, fg=t.INK_SOFT,
+                 font=self.fonts.caption).pack(anchor="w")
+        goal_var = tk.StringVar()
+        goal_entry = tk.Entry(
+            card, textvariable=goal_var, bg=t.SURFACE, fg=t.INK,
+            insertbackground=t.INK, relief="flat", font=self.fonts.body)
+        goal_entry.pack(fill="x", ipady=t.s(6), pady=(t.s(4), t.s(10)))
+        team_var = tk.BooleanVar(value=False)
+        team_row = tk.Frame(card, bg=t.HEADER)
+        team_row.pack(fill="x", pady=(t.s(2), t.s(12)))
+        tk.Checkbutton(
+            team_row, text="团队项目（敏感操作需多人复核）",
+            variable=team_var, bg=t.HEADER, fg=t.INK_SOFT,
+            activebackground=t.HEADER, activeforeground=t.INK,
+            selectcolor=t.SURFACE, font=self.fonts.small,
+        ).pack(anchor="w")
+        actions = tk.Frame(card, bg=t.HEADER)
+        actions.pack(fill="x")
+
+        def submit() -> None:
+            title = title_var.get().strip()
+            if not title:
+                self.app.toast("请输入项目名称")
+                return
+            dlg.destroy()
+            self.bridge.submit("project_create", lambda: (
+                "ok",
+                self.bridge.client.post("/api/v1/projects", {
+                    "title": title,
+                    "goal": goal_var.get().strip(),
+                    "is_team": bool(team_var.get()),
+                }),
+            ))
+
+        FlatButton(actions, "取消", dlg.destroy, font=self.fonts.small,
+                   variant="ghost", height=34, min_width=80,
+                   parent_bg=t.HEADER).pack(side="right", padx=(t.s(8), 0))
+        FlatButton(actions, "创建", submit, font=self.fonts.small_bold,
+                   variant="primary", height=34, min_width=80,
+                   parent_bg=t.HEADER).pack(side="right")
+        title_entry.focus_set()
+        dlg.bind("<Return>", lambda _e: submit())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.update_idletasks()
+        rx = self.app.root.winfo_rootx() + t.s(120)
+        ry = self.app.root.winfo_rooty() + t.s(140)
+        dlg.geometry(f"+{rx}+{ry}")
 
     def _confirm_delete_session(self, state) -> None:
         if self.bridge._streaming:
@@ -902,6 +978,18 @@ class ChatView(tk.Frame):
                 self.app.toast("已切换活跃项目" if code == 200 else "切换项目失败")
                 self.bridge.submit("projects",
                                    lambda: ("ok", self.bridge.client.get("/api/v1/projects")))
+            elif kind == "project_create":
+                code, data = payload if isinstance(payload, tuple) else (200, {})
+                if code == 200:
+                    created = (data or {}).get("created") or {}
+                    kind_cn = "团队" if created.get("is_team") else "个人"
+                    self.app.toast(f"已创建{kind_cn}项目：{created.get('title', '')}")
+                    pid = str(created.get("id") or "")
+                    if pid:
+                        self.bridge.submit("project_set", lambda: self.bridge.client.post(
+                            "/api/v1/projects/active", {"project_id": pid}))
+                else:
+                    self.app.toast(f"创建失败：{(data or {}).get('detail', code)}")
             elif kind == "session_delete":
                 code = payload[0] if isinstance(payload, tuple) else 200
                 if code == 200:
