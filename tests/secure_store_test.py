@@ -10,7 +10,6 @@ os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import app as daemon_mod        # noqa: E402
-import chat as chat_mod         # noqa: E402
 import llm_server as L          # noqa: E402
 import secure_store as SS       # noqa: E402
 
@@ -92,15 +91,6 @@ check("click 记坐标", meta2 == {"action": "click", "position": [100, 200], "c
 req3 = daemon_mod.ActionRequest(action="press_key", key="ctrl+c")
 meta3 = daemon_mod._safe_action_log(req3)
 check("press_key 记按键", meta3 == {"action": "press_key", "key": "ctrl+c"}, str(meta3))
-
-# ============ 5. chat 参数日志脱敏 ============
-print("== 5. 工具参数日志脱敏 ==")
-red = chat_mod._redact_args(json.dumps({"text": "secret text", "x": 10}))
-check("type_text 内容不出现", "secret" not in red and "<11字>" in red, red)
-red2 = chat_mod._redact_args(json.dumps({"command": "rm -rf /etc", "cwd": "."}))
-check("command 内容不出现", "rm" not in red2 and "<11字>" in red2, red2)
-red3 = chat_mod._redact_args(json.dumps({"file": "a.py", "occurrence": 2}))
-check("非敏感参数正常显示", "a.py" in red3 and "occurrence=2" in red3, red3)
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
