@@ -3,5 +3,5 @@
 from .app import VenusChatV1, main
 
 __all__ = ["VenusChatV1", "main"]
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
