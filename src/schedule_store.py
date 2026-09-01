@@ -6,7 +6,6 @@ import json
 import re
 import threading
 import time
-import uuid
 from typing import Any
 
 from data_paths import data_file

@@ -33,10 +33,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Dict, List, Optional
 
-from brand import PRODUCT_NAME, PRODUCT_NAME_UPPER, TAGLINE
+from brand import PRODUCT_NAME, TAGLINE
 from data_paths import cli_config_path
 
 CONFIG_PATH = cli_config_path()

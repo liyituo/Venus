@@ -46,7 +46,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from brand import APP_VERSION, DAEMON_NAME, PRODUCT_NAME, env_is_set
+from brand import APP_VERSION, DAEMON_NAME, env_is_set
 
 # --------------------------------------------------------------------------
 # 全局配置
