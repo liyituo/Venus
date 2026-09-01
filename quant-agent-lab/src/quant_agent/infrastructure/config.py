@@ -34,6 +34,8 @@ class PortfolioConfig:
     slippage_bps: Decimal = Decimal("10")
     currency: str = "USD"
     approval_ttl_seconds: int = 3600
+    cash_reserve: Decimal = Decimal("50000")
+    max_notional_per_signal: Decimal | None = None  # None → 同 target_notional_per_signal
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,12 @@ def load_demo_config(config_dir: Path | None = None) -> DemoConfig:
             slippage_bps=_decimal(portfolio_data, "slippage_bps", Decimal("10")),
             currency=str(portfolio_data.get("currency", "USD")),
             approval_ttl_seconds=int(portfolio_data.get("approval_ttl_seconds", 3600)),
+            cash_reserve=_decimal(portfolio_data, "cash_reserve", Decimal("50000")),
+            max_notional_per_signal=(
+                _decimal(portfolio_data, "max_notional_per_signal", Decimal("0"))
+                if portfolio_data.get("max_notional_per_signal")
+                else None
+            ),
         ),
         risk=RiskConfig(
             version=str(risk.get("version", "risk-demo-v1")),

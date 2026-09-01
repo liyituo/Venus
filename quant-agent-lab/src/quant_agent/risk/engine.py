@@ -123,6 +123,7 @@ class RiskEngine:
         values = {position.symbol: position.market_value for position in account.positions}
         buy_cash = Decimal("0")
         turnover = Decimal("0")
+        simulated_cash = account.cash
         order_blocked: dict[str, bool] = {}
         for order in orders:
             blocked = False
@@ -196,14 +197,13 @@ class RiskEngine:
                         order.order_id,
                     )
                 )
-            projected_value = values.get(order.symbol, Decimal("0"))
-            projected_value += order.notional if order.side == Direction.BUY else -order.notional
+            projected_value = order.post_quantity * price
             checks_for_order.append(
                 self._check(
                     "symbol_exposure",
-                    Decimal("0") <= projected_value <= self.config.max_symbol_notional,
+                    projected_value <= self.config.max_symbol_notional,
                     "SYMBOL_EXPOSURE_OK"
-                    if Decimal("0") <= projected_value <= self.config.max_symbol_notional
+                    if projected_value <= self.config.max_symbol_notional
                     else "SYMBOL_EXPOSURE_LIMIT",
                     f"projected {order.symbol} exposure is {projected_value}; limit is {self.config.max_symbol_notional}",
                     order.order_id,
@@ -216,22 +216,25 @@ class RiskEngine:
             turnover += order.notional
             if order.side == Direction.BUY:
                 buy_cash += order.notional + order.estimated_fee
+                simulated_cash -= order.notional + order.estimated_fee
+            else:
+                simulated_cash += order.notional - order.estimated_fee
 
-        projected_total = sum(values.values(), Decimal("0")) + sum(
-            (
-                order.notional if order.side == Direction.BUY else -order.notional
-                for order in orders
-            ),
+        projected_total = sum(
+            (order.post_quantity * (order.limit_price or order.reference_price) for order in orders),
             Decimal("0"),
         )
+        for position in account.positions:
+            if not any(order.symbol == position.symbol for order in orders):
+                projected_total += position.market_value
         global_checks = [
             self._check(
                 "cash_buffer",
-                account.cash - buy_cash >= self.config.min_cash_buffer,
+                simulated_cash >= self.config.min_cash_buffer,
                 "CASH_BUFFER_OK"
-                if account.cash - buy_cash >= self.config.min_cash_buffer
+                if simulated_cash >= self.config.min_cash_buffer
                 else "CASH_BUFFER_LIMIT",
-                f"cash after buys is {account.cash - buy_cash}; required buffer is {self.config.min_cash_buffer}",
+                f"cash after planned orders is {simulated_cash}; required buffer is {self.config.min_cash_buffer}",
             ),
             self._check(
                 "total_exposure",

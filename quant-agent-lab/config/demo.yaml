@@ -4,7 +4,9 @@ strategy:
   id: tiny-moe-ranker
   version: 2.0.0
 portfolio:
-  target_notional_per_signal: "10000"
+  target_notional_per_signal: "8000"
+  max_notional_per_signal: "20000"
+  cash_reserve: "50000"
   lot_size: "100"
   fee_bps: "5"
   slippage_bps: "10"

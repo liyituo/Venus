@@ -1,7 +1,7 @@
 version: risk-demo-v1
 max_order_notional: "15000"
 max_symbol_notional: "30000"
-max_total_exposure: "250000"
+max_total_exposure: "500000"
 min_cash_buffer: "50000"
 max_daily_turnover: "250000"
 max_price_deviation_bps: "500"
