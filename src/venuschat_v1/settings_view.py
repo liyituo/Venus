@@ -938,12 +938,12 @@ class SettingsView(tk.Frame):
                 payload["api_url"] = url_f.get().strip()
             if key_f is not None and hasattr(key_f, "get"):
                 k = key_f.get().strip()
-                if k and not k.startswith("•"):
+                if k and k not in ("***", "__secure__") and not k.startswith("•"):
                     payload["api_key"] = k
             if model is not None and hasattr(model, "get"):
                 payload["model"] = model.get().strip()
             if reasoning is not None:
-                rev = {"最高": "max", "高": "高", "关闭": "off"}
+                rev = {"最高": "max", "高": "high", "关闭": "off"}
                 payload["reasoning_mode"] = rev.get(getattr(reasoning, "value", "最高"), "max")
         elif self.active_page == "permissions":
             seg = self.local_controls.get("confirm_mode")

@@ -11,15 +11,15 @@ import re
 from collections import Counter
 
 _ASCII_RE = re.compile(r"[A-Za-z0-9_./\\\-]{2,}")
-_CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af]{2}")
+_CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af]+")
 
 
 def tokenize(text: str) -> list[str]:
     toks: list[str] = []
     for m in _ASCII_RE.finditer(text):
         toks.append(m.group().lower())
-    cjk = "".join(re.findall(r"[\u2e80-\u9fff\uac00-\ud7af]", text))
-    toks.extend(_CJK_RE.findall(cjk))
+    for run in _CJK_RE.findall(text):
+        toks.extend(run[i:i + 2] for i in range(len(run) - 1))
     return toks
 
 

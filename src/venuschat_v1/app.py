@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import sys
-import threading
 import tkinter as tk
 
 from . import theme as t

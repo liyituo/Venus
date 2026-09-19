@@ -1305,12 +1305,11 @@ class MenuPopup(tk.Toplevel):
         try:
             ax, ay = anchor.winfo_rootx(), anchor.winfo_rooty()
             aw, ah = anchor.winfo_width(), anchor.winfo_height()
-            sx, sy = root.winfo_rootx(), root.winfo_rooty()
             sw = root.winfo_screenwidth()
             sh = root.winfo_screenheight()
         except tk.TclError:
             ax = ay = aw = ah = 0
-            sx, sy, sw, sh = 100, 100, 1920, 1080
+            sw, sh = 1920, 1080
         x = ax + aw - req_w if align_right else ax
         y = ay + ah + t.s(3)
         if y + req_h > sh - t.s(10):
