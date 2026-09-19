@@ -1,11 +1,26 @@
 """Telegram bot 修复测试：/new 全新会话 ID / 定时时间校验与 ID 单调 / callback 权限 / 并发串行。"""
 import sys
 import threading
+import os
+import tempfile
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+os.environ["VENUS_DATA_DIR"] = tempfile.mkdtemp(prefix="venus_telegram_")
+os.environ["PCAGENT_DISABLE_MCP"] = "1"
+os.environ["PCAGENT_ALLOW_TEST_HOST"] = "1"
 import telegram_bot as tg  # noqa: E402
+import llm_server as L  # noqa: E402
+import schedule_store as S  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+client = TestClient(L.app)
+
+
+def backend_request(method, path, payload=None, timeout=30):
+    response = client.request(method, path, json=payload)
+    return response.status_code, response.json()
 
 passed = failed = 0
 
@@ -27,15 +42,15 @@ def make_bot():
                "allowed_user_ids": [], "owner_user_id": 42}
     bot.chats = {}
     bot.messages = {}
-    bot.schedules = []
+    bot._job_notifications = {}
     bot.busy = set()
     bot.stream_state = {}
     bot.context_window = 65536
     bot._state_lock = threading.Lock()
     bot._chat_locks = {}
-    bot._schedules_lock = threading.Lock()
     bot._save_chats = mock.Mock()
-    bot._save_schedules = mock.Mock()
+    bot._save_job_notifications = mock.Mock()
+    bot.llm = mock.Mock(side_effect=backend_request)
     bot.send_message = mock.Mock()
     bot.answer_callback = mock.Mock()
     return bot
@@ -74,26 +89,34 @@ bot.cmd_schedule(100, "/schedule add 99:99 任务")
 check("非法时间拒绝（3 次）", bot.send_message.call_count == 3
       and all("时间" in c.args[1] or "格式" in c.args[1] for c in bot.send_message.call_args_list),
       str([c.args[1] for c in bot.send_message.call_args_list]))
-check("非法时间不添加", bot.schedules == [], str(bot.schedules))
+check("非法时间不添加", S.list_schedules() == [] and not bot.llm.called)
 
 bot.send_message.reset_mock()
 bot.cmd_schedule(100, "/schedule add 08:30 每日新闻")
-check("合法时间添加", len(bot.schedules) == 1 and bot.schedules[0]["time"] == "08:30", str(bot.schedules))
+rows = S.list_schedules()
+check("合法时间添加", len(rows) == 1 and rows[0]["time"] == "08:30", str(rows))
+check("通过后端保存通知目标", rows[0]["channel"] == "telegram" and rows[0]["chat_id"] == 100)
 check("添加提示", bot.send_message.call_count == 1 and "已添加" in bot.send_message.call_args.args[1], "")
 
 # ============ 3. 删除后新建 ID 不重复 ============
 print("== 3. 删除后 ID 单调 ==")
 bot = make_bot()
-bot.schedules = [{"id": "s1", "time": "08:00", "prompt": "a", "chat_id": 100,
-                  "last_run": "", "enabled": True},
-                 {"id": "s2", "time": "09:00", "prompt": "b", "chat_id": 100,
-                  "last_run": "", "enabled": True}]
+old_id = rows[0]["id"]
 bot.send_message.reset_mock()
-bot.cmd_schedule(100, "/schedule del s1")
-new_id = bot._next_schedule_id()
-check("删除 s1 后新建不重复", new_id == "s3", new_id)
+bot.cmd_schedule(100, f"/schedule del {old_id}")
+check("后端任务已删除", S.list_schedules() == [])
 bot.cmd_schedule(100, "/schedule add 10:00 新任务")
-check("新建 ID = s3", bot.schedules[-1]["id"] == "s3", str(bot.schedules[-1]))
+new_id = S.list_schedules()[0]["id"]
+check("删除全部后 ID 仍递增", int(new_id) > int(old_id), new_id)
+bot.cmd_schedule(100, f"/schedule off {new_id}")
+check("通过 API 暂停", S.get_schedule(new_id)["enabled"] is False)
+bot.cmd_schedule(100, f"/schedule on {new_id}")
+check("通过 API 恢复", S.get_schedule(new_id)["enabled"] is True)
+bot.cmd_schedule(200, f"/schedule del {new_id}")
+check("其他聊天无法删除任务", S.get_schedule(new_id) is not None)
+bot.llm = mock.Mock(return_value=(503, {"detail": "offline"}))
+bot.cmd_schedule(100, "/schedule")
+check("后端断线有错误提示", "失败" in bot.send_message.call_args.args[1])
 
 # ============ 4. callback 身份验证 ============
 print("== 4. callback 权限 ==")

@@ -7,10 +7,11 @@ from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
+os.environ["VENUS_DATA_DIR"] = tempfile.mkdtemp(prefix="venus_secure_test_")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import app as daemon_mod        # noqa: E402
-import chat as chat_mod         # noqa: E402
+from venuschat_v1 import config_store as frontend_config  # noqa: E402
 import llm_server as L          # noqa: E402
 import secure_store as SS       # noqa: E402
 
@@ -93,14 +94,27 @@ req3 = daemon_mod.ActionRequest(action="press_key", key="ctrl+c")
 meta3 = daemon_mod._safe_action_log(req3)
 check("press_key 记按键", meta3 == {"action": "press_key", "key": "ctrl+c"}, str(meta3))
 
-# ============ 5. chat 参数日志脱敏 ============
-print("== 5. 工具参数日志脱敏 ==")
-red = chat_mod._redact_args(json.dumps({"text": "secret text", "x": 10}))
-check("type_text 内容不出现", "secret" not in red and "<11字>" in red, red)
-red2 = chat_mod._redact_args(json.dumps({"command": "rm -rf /etc", "cwd": "."}))
-check("command 内容不出现", "rm" not in red2 and "<11字>" in red2, red2)
-red3 = chat_mod._redact_args(json.dumps({"file": "a.py", "occurrence": 2}))
-check("非敏感参数正常显示", "a.py" in red3 and "occurrence=2" in red3, red3)
+# ============ 5. 当前桌面端保存普通配置不得写回解密后的凭据 ============
+print("== 5. VenusChat V1 配置凭据保护 ==")
+frontend_config.CONFIG_PATH = Path(tmpdir) / "frontend.json"
+secret_keys = ("api_key", "vision_api_key", "api_token", "daemon_token")
+for key in secret_keys:
+    SS.store(key, f"test-secret-{key}")
+raw = dict.fromkeys(secret_keys, SS.PLACEHOLDER)
+raw.update(llm_base="http://127.0.0.1:8001", daemon_base="http://127.0.0.1:8000", model="keep-me")
+frontend_config.CONFIG_PATH.write_text(json.dumps(raw), encoding="utf-8")
+loaded = frontend_config.load_config()
+check("前端可读取安全存储", all(loaded[k] == f"test-secret-{k}" for k in secret_keys))
+frontend_config.save_local_config({"workspace": "test-workspace", "api_key": "must-not-write"})
+saved_text = frontend_config.CONFIG_PATH.read_text(encoding="utf-8")
+saved = json.loads(saved_text)
+check("普通保存保留所有密钥占位符", all(saved[k] == SS.PLACEHOLDER for k in secret_keys))
+check("明文密钥未落盘", "test-secret-" not in saved_text and "must-not-write" not in saved_text)
+check("普通字段正常合并", saved["workspace"] == "test-workspace" and saved["model"] == "keep-me")
+check("配置后端收到对应 token", frontend_config.token_for_base(raw["llm_base"] + "/") == "test-secret-api_token")
+check("配置 daemon 收到对应 token", frontend_config.token_for_base(raw["daemon_base"]) == "test-secret-daemon_token")
+check("未知地址不泄漏 token", frontend_config.token_for_base("https://untrusted.invalid:8001") == "")
+check("相同域名不同路径不泄漏 token", frontend_config.token_for_base(raw["llm_base"] + "/other") == "")
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

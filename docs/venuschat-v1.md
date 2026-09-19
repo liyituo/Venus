@@ -22,13 +22,16 @@ VenusChat V1 是与已移除的 `src/chat.py` 完全隔离的原生 Windows 前�
 
 ```powershell
 # 先确保 llm_server 在 :8001 运行
-.venv\Scripts\python -m venuschat_v1
+cd src
+..\.venv\Scripts\python -m venuschat_v1
 ```
 
 打开设置页：
 
 ```powershell
-.venv\Scripts\python -m venuschat_v1 --settings
+..\.venv\Scripts\python -m venuschat_v1 --settings
 ```
 
 配置读写 `chat_config.json`（本地，已在 `.gitignore`）。
+
+保存普通配置会保留文件中的密钥占位符，不会把安全存储解密后的值写回 JSON。连接 token 只发送给配置中明确指定的后端或 daemon 地址。

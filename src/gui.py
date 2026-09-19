@@ -33,7 +33,7 @@ from pathlib import Path
 
 from PIL import Image, ImageTk
 
-from brand import DAEMON_NAME, PRODUCT_NAME
+from brand import DAEMON_NAME
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0

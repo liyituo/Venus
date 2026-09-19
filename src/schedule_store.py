@@ -6,7 +6,6 @@ import json
 import re
 import threading
 import time
-import uuid
 from typing import Any
 
 from data_paths import data_file
@@ -26,8 +25,12 @@ def _read() -> dict:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return {"schedules": data}
+            data = {"schedules": data}
         if isinstance(data, dict) and isinstance(data.get("schedules"), list):
+            for row in data["schedules"]:
+                # Legacy Telegram entries predate the channel field.
+                if row.get("chat_id") is not None:
+                    row.setdefault("channel", "telegram")
             return data
     except (OSError, json.JSONDecodeError):
         pass
@@ -55,13 +58,14 @@ def get_schedule(schedule_id: str) -> dict | None:
     return None
 
 
-def _next_id(schedules: list[dict]) -> str:
-    n = 0
-    for s in schedules:
+def _next_id(data: dict) -> str:
+    n = int(data.get("next_id") or 1) - 1
+    for s in data.get("schedules", []):
         try:
-            n = max(n, int(str(s.get("id", "0"))))
+            n = max(n, int(str(s.get("id", "0")).removeprefix("s")))
         except ValueError:
             pass
+    data["next_id"] = n + 2
     return str(n + 1)
 
 
@@ -77,8 +81,8 @@ def add_schedule(*, time_hhmm: str, prompt: str, channel: str = "api",
         data = _read()
         schedules = data.setdefault("schedules", [])
         row = {
-            "id": _next_id(schedules),
-            "time": time_hhmm.strip(),
+            "id": _next_id(data),
+            "time": time_hhmm.strip().zfill(5),
             "prompt": prompt,
             "enabled": enabled,
             "channel": channel,
@@ -101,7 +105,7 @@ def update_schedule(schedule_id: str, **fields: Any) -> dict | None:
                     raise ValueError("time 格式须为 HH:MM")
                 for k, v in fields.items():
                     if v is not None:
-                        s[k] = v
+                        s[k] = str(v).strip().zfill(5) if k == "time" else v
                 _write(data)
                 return dict(s)
     return None

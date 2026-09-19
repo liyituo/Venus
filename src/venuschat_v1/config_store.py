@@ -49,7 +49,10 @@ def load_config() -> dict:
 
 def save_local_config(updates: dict) -> None:
     """Merge updates into chat_config.json (non-secret fields only)."""
-    cfg = load_config()
+    # Preserve the on-disk secret placeholders; load_config() decrypts them.
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    if not isinstance(cfg, dict):
+        raise ValueError("配置文件必须是 JSON 对象")
     for key, val in updates.items():
         if key in ("api_key", "vision_api_key", "api_token", "daemon_token"):
             continue
@@ -78,7 +81,7 @@ def token_for_base(base_url: str) -> str:
     elif daemon and base == daemon:
         key = "daemon_token"
     else:
-        key = "api_token" if ":8001" in base else "daemon_token"
+        return ""
     val = str(cfg.get(key) or "").strip()
     if val == "__secure__":
         try:

@@ -74,6 +74,10 @@ hits2 = lex.search("embedding 模型", 2)
 check("中文词法命中", hits2 and hits2[0]["doc_id"] == "b", str(hits2))
 check("无关查询无结果", lex.search("zzzzqqqq", 2) == [])
 check("tokenize 中英混合", "fastapi" in tokenize("FastAPI 接口") and "接口" in tokenize("FastAPI 接口"))
+check("滑动中文双字切分", tokenize("人工智能") == ["人工", "工智", "智能"])
+check("不跨标点拼接中文", "工智" not in tokenize("人工，智能"))
+cross = LexicalIndex([{"doc_id": "cn", "text": "人工智能"}]).search("工智", 1)
+check("跨旧切分边界可检索", bool(cross) and cross[0]["doc_id"] == "cn")
 
 # ============ 3. 存储 ============
 print("== 3. store ==")

@@ -15,7 +15,7 @@ from typing import Callable
 
 from . import theme as t
 from .api_client import ApiClient                      # noqa: F401  (contract)
-from .backend_bridge import BackendBridge, SessionState
+from .backend_bridge import BackendBridge
 from .widgets import (
     HAS_PIL,
     Dot,

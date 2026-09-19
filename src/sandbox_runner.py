@@ -238,7 +238,6 @@ class SandboxRunner:
             wsl_cwd = _to_wsl_path(cwd)
             if not wsl_cwd:
                 return False, "无法将工作区路径转换为 WSL 路径"
-            inner = command.replace("\\", "\\\\").replace('"', '\\"')
             proxy = ""
             if not allow_network:
                 proxy = (

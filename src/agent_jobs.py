@@ -94,8 +94,11 @@ def _trim_index(data: dict) -> None:
     jobs = data.get("jobs") or []
     if len(jobs) <= _MAX_JOBS:
         return
-    drop = jobs[: len(jobs) - _MAX_JOBS]
-    data["jobs"] = jobs[len(jobs) - _MAX_JOBS :]
+    # Never evict queued/running work to satisfy the history limit.
+    terminal = JOB_STATUSES - {"queued", "running", "waiting_confirm"}
+    drop = [row for row in jobs if row.get("status") in terminal][:len(jobs) - _MAX_JOBS]
+    dropped = {row["id"] for row in drop}
+    data["jobs"] = [row for row in jobs if row["id"] not in dropped]
     for row in drop:
         jid = str(row.get("id") or "")
         if jid:
@@ -112,6 +115,10 @@ def _summary(job: dict) -> dict:
         "title": job.get("title") or "",
         "session_id": job.get("session_id"),
         "workspace": job.get("workspace") or "",
+        "request_id": job.get("request_id") or "",
+        "schedule_id": job.get("schedule_id") or "",
+        "channel": job.get("channel") or "",
+        "chat_id": job.get("chat_id"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
@@ -132,6 +139,10 @@ def create_job(
     model: str | None = None,
     temperature: float = 0.7,
     request_id: str | None = None,
+    schedule_id: str = "",
+    channel: str = "",
+    chat_id: int | None = None,
+    deduplicate: bool = False,
 ) -> dict:
     """创建 queued 任务并写入磁盘。"""
     if not messages:
@@ -149,6 +160,9 @@ def create_job(
         "model": model,
         "temperature": temperature,
         "request_id": request_id or "",
+        "schedule_id": schedule_id,
+        "channel": channel,
+        "chat_id": chat_id,
         "task_id": "",
         "created_at": now,
         "started_at": None,
@@ -161,6 +175,12 @@ def create_job(
         "progress": {"tool_calls": 0, "last_tool": ""},
     }
     with _lock:
+        if deduplicate and request_id:
+            for row in _load_index().get("jobs", []):
+                if row.get("request_id") == request_id:
+                    existing = get_job(row["id"])
+                    if existing:
+                        return existing
         _write_json(_job_file(job["id"]), job)
         idx = _load_index()
         idx["jobs"].append(_summary(job))
@@ -172,7 +192,19 @@ def create_job(
 def get_job(job_id: str) -> dict | None:
     with _lock:
         job = _read_json(_job_file(job_id), None)
-        return dict(job) if isinstance(job, dict) else None
+        if not isinstance(job, dict):
+            return None
+        _number_events(job)
+        return dict(job)
+
+
+def _number_events(job: dict) -> None:
+    """Upgrade legacy events in place; IDs remain stable after truncation."""
+    seq = 0
+    for event in job.get("events") or []:
+        seq = max(seq + 1, int(event.get("id") or 0))
+        event["id"] = seq
+    job["event_seq"] = max(seq, int(job.get("event_seq") or 0))
 
 
 def list_jobs(status: str | None = None, limit: int = 50) -> list[dict]:
@@ -213,7 +245,9 @@ def append_event(job_id: str, kind: str, data: Any = None) -> None:
         if not isinstance(job, dict):
             return
         events = job.setdefault("events", [])
-        events.append({"ts": time.time(), "kind": kind, "data": data})
+        _number_events(job)
+        job["event_seq"] += 1
+        events.append({"id": job["event_seq"], "ts": time.time(), "kind": kind, "data": data})
         if len(events) > _MAX_JOB_EVENTS:
             del events[: len(events) - _MAX_JOB_EVENTS]
         _write_json(_job_file(job_id), job)
@@ -276,10 +310,11 @@ def cancel_job(job_id: str) -> tuple[bool, str]:
 
 
 def enqueue_job(job_id: str) -> None:
-    _ensure_worker()
-    assert _queue is not None
     with _lock:
-        _queue.append(job_id)
+        _ensure_worker()
+        assert _queue is not None
+        if job_id not in _queue and (_worker is None or _worker.current_job_id != job_id):
+            _queue.append(job_id)
 
 
 # ---- Worker ----
@@ -291,10 +326,11 @@ class AgentJobWorker(threading.Thread):
     def __init__(self, job_queue: deque):
         super().__init__(daemon=True, name="agent-job-worker")
         self._q = job_queue
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
+        self.current_job_id: str | None = None
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             job_id = None
             with _lock:
                 while self._q:
@@ -302,6 +338,7 @@ class AgentJobWorker(threading.Thread):
                     job = _read_json(_job_file(candidate), None)
                     if isinstance(job, dict) and job.get("status") == "queued":
                         job_id = candidate
+                        self.current_job_id = job_id
                         break
             if not job_id:
                 time.sleep(0.3)
@@ -311,6 +348,7 @@ class AgentJobWorker(threading.Thread):
                 log.error("agent job worker：未注册 handler，跳过 %s", job_id)
                 update_job(job_id, status="failed", finished_at=time.time(),
                            error="任务执行器未初始化")
+                self.current_job_id = None
                 continue
             try:
                 handler(job_id)
@@ -318,6 +356,9 @@ class AgentJobWorker(threading.Thread):
                 log.exception("agent job %s 执行异常", job_id)
                 update_job(job_id, status="failed", finished_at=time.time(),
                            error=f"{type(exc).__name__}: {exc}")
+            finally:
+                with _lock:
+                    self.current_job_id = None
 
 
 def set_job_handler(fn: Callable[[str], None] | None) -> None:
@@ -327,11 +368,29 @@ def set_job_handler(fn: Callable[[str], None] | None) -> None:
 
 def _ensure_worker() -> None:
     global _queue, _worker
-    if _queue is None:
-        _queue = deque()
-    if _worker is None or not _worker.is_alive():
-        _worker = AgentJobWorker(_queue)
-        _worker.start()
+    with _lock:
+        if _queue is None:
+            # Rebuild the index from individual files, including jobs whose
+            # index write was interrupted. Never replay partially executed work.
+            jobs = []
+            for path in _jobs_root().glob("job_*.json"):
+                job = _read_json(path, None)
+                if not isinstance(job, dict) or job.get("id") != path.stem:
+                    continue
+                if job.get("status") in ("running", "waiting_confirm"):
+                    job.update(status="failed", finished_at=time.time(),
+                               error="服务重启，任务执行已中断；请检查结果后手动重试",
+                               pending_ask=None, confirm_request_id="")
+                    _write_json(path, job)
+                jobs.append(job)
+            jobs.sort(key=lambda job: job.get("created_at") or 0)
+            idx = {"jobs": [_summary(job) for job in jobs]}
+            _trim_index(idx)
+            _save_index(idx)
+            _queue = deque(job["id"] for job in jobs if job.get("status") == "queued")
+        if _worker is None or not _worker.is_alive():
+            _worker = AgentJobWorker(_queue)
+            _worker.start()
 
 
 def start_job_worker() -> None:

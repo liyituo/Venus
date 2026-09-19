@@ -1,4 +1,4 @@
-"""统一跨平台测试入口：自动发现并运行全部 tests/*_test.py。
+"""统一跨平台测试入口：递归发现并运行 tests/ 下的全部 *_test.py。
 
 用法：
     python tests/run_all_tests.py            # 使用当前解释器
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TESTS = sorted(ROOT.glob("tests/*_test.py"))
+TESTS = sorted((ROOT / "tests").rglob("*_test.py"))
 PYTHON = sys.executable
 ENV = dict(os.environ)
 ENV.setdefault("PYTHONUTF8", "1")

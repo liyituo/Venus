@@ -56,7 +56,7 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 | 记忆 | `agent_memory.py` | L0-L3 + Skill + CodeGraph |
 | 子 Agent | `subagent_router.py` + `agents/` | 轻异构委派 |
 
-**后端冻结范围（v0.10）**：不再新增后端能力，仅修 bug / 安全；前端按 API 对接。暂缓：多 Job 并行、`llm_server` 拆模块、Telegram 改调 Schedule API。
+**后端冻结范围（v0.10）**：不再新增后端能力，仅修 bug / 安全；前端按 API 对接。暂缓：多 Job 并行、`llm_server` 拆模块。Telegram 定时任务已统一调用 Schedule API，由后端调度。
 
 ## 快速开始（Windows）
 
@@ -66,10 +66,11 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 .venv\Scripts\python src\cli.py
 ```
 
-桌面 Chat（VenusChat V1，本地开发版，未入库）：
+桌面 Chat（VenusChat V1）：
 
 ```
-.venv\Scripts\python -m venuschat_v1
+cd src
+..\.venv\Scripts\python -m venuschat_v1
 ```
 
 或双击 `scripts/一键启动控制台.bat`（需本地存在 `src/venuschat_v1/`）。
@@ -167,7 +168,9 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 | `GET /api/v1/jobs/{id}/events` | 任务进度 SSE |
 | `POST /api/v1/jobs/{id}/cancel` | 取消 |
 
-任务数据在 `.venus/jobs/`；完成后自动写回来源会话（若指定 `session_id`）。
+任务数据在 `.venus/jobs/`；完成后自动写回来源会话（若指定 `session_id`）。服务重启时重新排队尚未执行的任务；执行中或等待确认的任务标记失败并提示检查结果后手动重试，避免重复执行。历史清理只移除已结束任务。
+
+任务事件使用递增 `id`，SSE 客户端可通过 `Last-Event-ID` 续传。每个任务保留最近 100 条事件；游标早于保留范围时先发送 `reset` 事件，再发送仍保留的事件。
 
 ### 记忆 API
 
@@ -186,7 +189,7 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 | `GET/POST /api/v1/schedules` | 列表 / 创建 |
 | `PATCH/DELETE /api/v1/schedules/{id}` | 更新 / 删除 |
 
-到点由 `llm_server` 内置调度器创建异步 Job（与 Telegram `/schedule` 共用 `.venus/schedules.json`）。
+到点由 `llm_server` 内置调度器创建异步 Job。Telegram `/schedule` 通过此 API 管理任务，不再读写调度文件或自行执行；bot 轮询后台任务，转发确认请求和结果，并保存通知记录以避免正常重启后重复推送。旧版数组格式的 `.venus/schedules.json` 仍由后端兼容读取；若旧 bot 与后端使用不同数据目录，需将旧定时任务迁入后端后再启用。升级时须同时重启后端和 bot。
 
 ## 用法：对话就是操作
 

@@ -36,7 +36,8 @@ class BackendBridge:
         self.active_project_id: str = ""
         self.health: dict = {}
         self.jobs_active: int = 0
-        self._queue: queue.Queue = queue.Queue()
+        self._requests: queue.Queue = queue.Queue()
+        self._results: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
         self._stream = ChatStreamWorker(
@@ -51,28 +52,24 @@ class BackendBridge:
         self._message_cb: Callable[[str], Any] | None = None
 
     def submit(self, kind: str, fn: Callable[[], Any]) -> None:
-        self._queue.put((kind, fn))
+        self._requests.put((kind, fn))
 
     def _loop(self) -> None:
         while True:
-            kind, fn = self._queue.get()
+            kind, fn = self._requests.get()
             try:
                 result = fn()
-                self._queue.put(("__result__", (kind, result)))
+                self._results.put((kind, result))
             except Exception as exc:
-                self._queue.put(("__result__", (kind, ("error", str(exc)))))
+                self._results.put((kind, ("error", str(exc))))
 
     def poll(self) -> None:
         while True:
             try:
-                item = self._queue.get_nowait()
+                kind, payload = self._results.get_nowait()
             except queue.Empty:
                 break
-            if item[0] == "__result__":
-                kind, payload = item[1]
-                self.ui(kind, payload)
-            else:
-                break
+            self.ui(kind, payload)
 
     # Bootstrap ----------------------------------------------------------------
     def refresh_all(self) -> None:
@@ -230,13 +227,13 @@ class BackendBridge:
         self._streaming = False
 
     def _on_stream_event(self, kind: str, payload: Any) -> None:
-        self._queue.put(("__result__", ("stream_event", (kind, payload))))
+        self._results.put(("stream_event", (kind, payload)))
 
     def _stream_done(self) -> None:
-        self._queue.put(("__result__", ("stream_event", ("done", None))))
+        self._results.put(("stream_event", ("done", None)))
 
     def _stream_error(self, msg: str) -> None:
-        self._queue.put(("__result__", ("stream_event", ("error", msg))))
+        self._results.put(("stream_event", ("error", msg)))
 
     def handle_stream_event(self, kind: str, payload: Any) -> None:
         if kind == "delta":

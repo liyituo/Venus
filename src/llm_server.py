@@ -42,7 +42,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 # 工具权限元数据与判定 / MCP 接入层（显式导入：import * 不会带入下划线符号；
 # 以下名字是模块级 re-export，测试通过模块属性访问，必须保留）
 from security_policy import (  # noqa: E402,F401
@@ -1542,20 +1542,35 @@ async def api_cancel_job(job_id: str) -> dict:
 
 
 @app.get("/api/v1/jobs/{job_id}/events", summary="任务事件 SSE（进度流）")
-async def api_job_events(job_id: str):
+async def api_job_events(job_id: str, last_event_id: str | None = Header(default=None)):
     job = _agent_jobs.get_job(job_id)
     if not job:
         raise HTTPException(404, "任务不存在")
+    try:
+        cursor = int(last_event_id) if last_event_id is not None else 0
+        if cursor < 0 or cursor > job.get("event_seq", 0):
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(400, "无效的 Last-Event-ID") from exc
 
     async def _stream():
-        seen = 0
+        seen = cursor
         terminal = _agent_jobs.JOB_STATUSES - {"queued", "running", "waiting_confirm"}
         while True:
-            j = _agent_jobs.get_job(job_id) or {}
+            j = _agent_jobs.get_job(job_id)
+            if j is None:
+                yield 'event: error\ndata: {"detail": "任务已移除"}\n\n'
+                break
             events = j.get("events") or []
-            for ev in events[seen:]:
-                seen += 1
-                yield (f"event: {ev.get('kind', 'message')}\n"
+            if events and seen < events[0]["id"] - 1:
+                seen = events[0]["id"] - 1
+                yield (f"id: {seen}\nevent: reset\n"
+                       f"data: {json.dumps({'detail': '部分历史事件已过期', 'oldest_id': seen + 1}, ensure_ascii=False)}\n\n")
+            for ev in events:
+                if ev["id"] <= seen:
+                    continue
+                seen = ev["id"]
+                yield (f"id: {seen}\nevent: {ev.get('kind', 'message')}\n"
                        f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
             st = j.get("status")
             if st in terminal:
@@ -1721,7 +1736,7 @@ async def api_codegraph_rebuild() -> dict:
 
 @app.get("/api/v1/mcp/status", summary="MCP 服务连接状态")
 async def api_mcp_status() -> dict:
-    from mcp_manager import _load_mcp_config, get_manager_state
+    from mcp_manager import get_manager_state
     configured = _load_mcp_config()
     live = {row["name"]: row for row in get_manager_state()}
     servers = []
@@ -5905,25 +5920,36 @@ def _build_agent_messages(messages: list[dict], *, workspace: str = "",
     return messages
 
 
+def _dispatch_due_schedules() -> None:
+    """One scheduler owns all channels; retries reuse the same daily job."""
+    today = time.strftime("%Y-%m-%d")
+    for s in _schedules.due_schedules(today=today):
+        try:
+            prompt = str(s.get("prompt") or "").strip()
+            if not prompt:
+                continue
+            job = _agent_jobs.create_job(
+                messages=[{"role": "user", "content": prompt}],
+                title=prompt[:80],
+                session_id=s.get("session_id"),
+                request_id=f"schedule-{s.get('id')}-{today}",
+                schedule_id=str(s["id"]), channel=s.get("channel", "api"),
+                chat_id=s.get("chat_id"), deduplicate=True,
+            )
+            _agent_jobs.enqueue_job(job["id"])
+            _schedules.mark_ran(s["id"], when=f"{today} {s['time']}")
+            log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
+        except Exception:
+            log.exception("定时任务 %s 派发失败", s.get("id"))
+
+
 def _schedule_loop() -> None:
-    """每分钟检查定时任务，到点创建异步 Job。"""
+    """每 30 秒检查定时任务，到点创建异步 Job。"""
     while True:
         try:
-            for s in _schedules.due_schedules():
-                prompt = str(s.get("prompt") or "").strip()
-                if not prompt:
-                    continue
-                job = _agent_jobs.create_job(
-                    messages=[{"role": "user", "content": prompt}],
-                    title=prompt[:80],
-                    session_id=s.get("session_id"),
-                    request_id=f"schedule-{s.get('id')}",
-                )
-                _agent_jobs.enqueue_job(job["id"])
-                _schedules.mark_ran(s["id"])
-                log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
+            _dispatch_due_schedules()
         except Exception:
-            log.debug("schedule loop 异常", exc_info=True)
+            log.exception("schedule loop 异常")
         time.sleep(30)
 
 

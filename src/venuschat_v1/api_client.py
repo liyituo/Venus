@@ -6,7 +6,6 @@ import json
 import threading
 import urllib.error
 import urllib.request
-import uuid
 from typing import Any, Callable
 
 from .config_store import llm_base, token_for_base
