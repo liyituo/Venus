@@ -2929,9 +2929,11 @@ async def api_job_events(job_id: str, request: Request):
     if not job or not _can_access_job(job, user):
         raise HTTPException(404, "任务不存在")
     try:
-        last_event_id = max(0, int(request.headers.get("Last-Event-ID", "0") or "0"))
-    except ValueError:
-        last_event_id = 0
+        last_event_id = int(request.headers.get("Last-Event-ID", "0") or "0")
+        if last_event_id < 0 or last_event_id > int(job.get("event_seq") or 0):
+            raise ValueError("Last-Event-ID 超出当前事件范围")
+    except ValueError as exc:
+        raise HTTPException(400, "无效的 Last-Event-ID") from exc
 
     async def _stream():
         seen_seq = last_event_id
@@ -4771,6 +4773,12 @@ def _process_reader(proc, lines: deque) -> None:
             lines.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
     except (ValueError, OSError, AttributeError):
         pass   # 管道已关闭（stop 时）：读取线程自然退出
+    finally:
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except (ValueError, OSError):
+                pass
 
 
 def _cleanup_dead_processes() -> None:
@@ -4909,10 +4917,21 @@ def _close_windows_job(job) -> None:
 def _kill_process_tree(proc) -> None:
     """杀整个进程组/控制台组（shell 启动的子进程一并结束），防止残留。"""
     if sys.platform == "win32":
-        # errors="replace"：taskkill 输出可能为 GBK（中文 Windows），防解码崩溃
-        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, text=True, errors="replace")
-        if r.returncode != 0:
+        # Discard taskkill output so a surviving child cannot keep a captured
+        # pipe open after the timeout and block process shutdown indefinitely.
+        result = None
+        try:
+            killer = subprocess.Popen(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                result = killer.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                killer.kill()
+                killer.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if result != 0:
             # taskkill 失败（权限/已退出/无子进程等）：直接 kill 后备，
             # 不提前报告成功；Job Object 句柄关闭时还会再兜底一次。
             try:
@@ -5022,12 +5041,8 @@ def _stop_process_impl(pid: int) -> tuple[bool, str]:
                 e["stop_failed"] = True
         return False, json.dumps({"pid": pid, "stopped": False, "stop_failed": True,
                                   "detail": "进程仍在运行，停止失败"}, ensure_ascii=False)
-    # 关闭输出管道：读取线程随之退出（EOF）
-    try:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    except (ValueError, OSError):
-        pass
+    # 输出管道由读取线程在 EOF 后关闭；这里同步 close 可能等待仍在
+    # readline 的线程并卡住停止 API。
     with _process_lock:
         e = _processes.get(pid)
         if e is not None:
@@ -7961,30 +7976,38 @@ def _build_agent_messages(messages: list[dict], *, workspace: str = "",
     return messages
 
 
+def _dispatch_due_schedules() -> None:
+    """One scheduler owns all channels; retries reuse the same daily job."""
+    now = time.localtime()
+    today = time.strftime("%Y-%m-%d", now)
+    now_hhmm = time.strftime("%H:%M", now)
+    for s in _schedules.due_schedules(now_hhmm=now_hhmm, today=today):
+        try:
+            prompt = str(s.get("prompt") or "").strip()
+            if not prompt:
+                continue
+            job = _agent_jobs.create_job(
+                messages=[{"role": "user", "content": prompt}],
+                title=prompt[:80],
+                session_id=s.get("session_id"),
+                request_id=_schedule_occurrence_request_id(s.get("id"), today),
+                schedule_id=str(s["id"]), channel=s.get("channel", "api"),
+                chat_id=s.get("chat_id"),
+            )
+            _agent_jobs.enqueue_job(job["id"])
+            _schedules.mark_ran(s["id"], when=f"{today} {now_hhmm}")
+            log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
+        except Exception:
+            log.exception("定时任务 %s 派发失败", s.get("id"))
+
+
 def _schedule_loop() -> None:
-    """每分钟检查定时任务，到点创建异步 Job。"""
+    """每 30 秒检查定时任务，到点创建异步 Job。"""
     while True:
         try:
-            # 固定一次检查的本地日期；due_schedules 与 mark_ran 使用相同日期，
-            # 使同日重试幂等、次日触发仍会创建新 Job。
-            now = time.localtime()
-            today = time.strftime("%Y-%m-%d", now)
-            now_hhmm = time.strftime("%H:%M", now)
-            for s in _schedules.due_schedules(now_hhmm=now_hhmm, today=today):
-                prompt = str(s.get("prompt") or "").strip()
-                if not prompt:
-                    continue
-                job = _agent_jobs.create_job(
-                    messages=[{"role": "user", "content": prompt}],
-                    title=prompt[:80],
-                    session_id=s.get("session_id"),
-                    request_id=_schedule_occurrence_request_id(s.get("id"), today),
-                )
-                _agent_jobs.enqueue_job(job["id"])
-                _schedules.mark_ran(s["id"], when=f"{today} {now_hhmm}")
-                log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
+            _dispatch_due_schedules()
         except Exception:
-            log.debug("schedule loop 异常", exc_info=True)
+            log.exception("schedule loop 异常")
         time.sleep(30)
 
 

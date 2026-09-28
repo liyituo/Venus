@@ -7,6 +7,7 @@ from pathlib import Path
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
+os.environ["VENUS_DATA_DIR"] = tempfile.mkdtemp(prefix="venus_secure_test_")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import app as daemon_mod        # noqa: E402

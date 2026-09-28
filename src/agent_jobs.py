@@ -195,6 +195,10 @@ def _summary(job: dict) -> dict:
         "task_id": job.get("task_id") or "",
         "session_id": job.get("session_id"),
         "workspace": job.get("workspace") or "",
+        "request_id": job.get("request_id") or "",
+        "schedule_id": job.get("schedule_id") or "",
+        "channel": job.get("channel") or "",
+        "chat_id": job.get("chat_id"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
@@ -365,6 +369,9 @@ def create_job(
     job_id: str | None = None,
     request_fingerprint: str = "",
     worker_task: bool = False,
+    schedule_id: str = "",
+    channel: str = "",
+    chat_id: int | None = None,
 ) -> dict:
     """创建 queued 任务并写入磁盘。"""
     if not messages:
@@ -395,6 +402,9 @@ def create_job(
         "temperature": temperature,
         "request_id": request_id or "",
         "_request_fingerprint": str(request_fingerprint or ""),
+        "schedule_id": str(schedule_id or ""),
+        "channel": str(channel or ""),
+        "chat_id": chat_id,
         "task_id": "",
         "created_at": now,
         "started_at": None,
@@ -729,7 +739,8 @@ def _recover_persisted_jobs() -> int:
         job = get_job_internal(jid) or {}
         prior_status = str(job.get("status") or "running")
         error = "Hub 重启时任务仍在执行；为避免重复文件或命令副作用，未自动重跑"
-        update_job(jid, status="failed", finished_at=time.time(), error=error)
+        update_job(jid, status="failed", finished_at=time.time(), error=error,
+                   pending_ask=None, confirm_request_id="")
         append_event_once(jid, "interrupted", {"previous_status": prior_status,
                                                 "reason": "hub_restart"})
     if queued_count:

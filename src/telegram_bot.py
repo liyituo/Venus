@@ -40,7 +40,7 @@ CONFIG_PATH = BASE_DIR.parent / "telegram_config.json"
 from data_paths import data_file
 
 CHATS_FILE = data_file("telegram_chats.json")
-SCHEDULES_FILE = data_file("schedules.json")
+NOTIFICATIONS_FILE = data_file("telegram_job_notifications.json")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -113,17 +113,16 @@ class Bot:
         self.opener = _proxy_opener(self.cfg.get("proxy") or "")
         self.llm_url = (self.cfg.get("llm_url") or "http://127.0.0.1:8001").rstrip("/")
         self.chats: dict[int, dict] = self._load_chats()   # chat_id -> {"session_id": int}
-        self.schedules: list[dict] = self._load_schedules()  # 定时任务
+        self._job_notifications = self._load_job_notifications()
         self._stop = threading.Event()
         self.messages: dict[int, list[dict]] = {}          # chat_id -> [user/assistant]
         self.busy: set[int] = set()                        # 正在流式的 chat_id
         self.stream_state: dict[int, dict] = {}            # 流式渲染状态
         self.context_window = 65536                        # 压缩阈值基准（run 时从 health 更新）
         self._offset = 0
-        # ---- 并发保护：每 chat 独立锁（busy/消息顺序）+ schedules 锁 ----
+        # ---- 并发保护：每 chat 独立锁（busy/消息顺序）----
         self._state_lock = threading.Lock()
         self._chat_locks: dict[int, threading.Lock] = {}
-        self._schedules_lock = threading.Lock()
 
     def _chat_lock(self, chat_id: int) -> threading.Lock:
         with self._state_lock:
@@ -217,35 +216,18 @@ class Bot:
         except OSError as exc:
             print(f"[bot] chats 持久化失败：{exc}", file=sys.stderr)
 
-    def _load_schedules(self) -> list[dict]:
+    def _load_job_notifications(self) -> dict:
         try:
-            if SCHEDULES_FILE.exists():
-                data = json.loads(SCHEDULES_FILE.read_text(encoding="utf-8"))
-                return data if isinstance(data, list) else []
-        except Exception:
-            pass
-        return []
+            data = json.loads(NOTIFICATIONS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
-    def _save_schedules(self) -> None:
-        """原子写：临时文件 + replace（须持有 _schedules_lock 或在调用前加锁）。"""
-        try:
-            SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = SCHEDULES_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.schedules, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            tmp.replace(SCHEDULES_FILE)
-        except OSError as exc:
-            log.warning("定时任务保存失败：%s", exc)
-
-    def _next_schedule_id(self) -> str:
-        """持久化单调 ID：取现有最大数字后缀 +1（删除任务后新建不产生重复 ID）。"""
-        mx = 0
-        for s in self.schedules:
-            try:
-                mx = max(mx, int(str(s.get("id", "s0"))[1:]))
-            except (ValueError, TypeError):
-                pass
-        return f"s{mx + 1}"
+    def _save_job_notifications(self) -> None:
+        NOTIFICATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = NOTIFICATIONS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._job_notifications, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(NOTIFICATIONS_FILE)
 
     # ------------------------------------------------------------------ Telegram API
     def api(self, method: str, params: dict | None = None, timeout: float = 30) -> dict:
@@ -424,11 +406,9 @@ class Bot:
             sys.exit(1)
         log.info("已连接 @%s，开始轮询", r['result'].get('username', '?'))
         print(f"[bot] 已连接 @{r['result'].get('username', '?')}，开始轮询…")
-        # 启动定时任务调度线程
-        threading.Thread(target=self._scheduler_loop, daemon=True,
-                         name="scheduler").start()
-        if self.schedules:
-            log.info("定时任务已加载：%d 个", len(self.schedules))
+        # Scheduling belongs to llm_server; this thread only delivers job updates.
+        threading.Thread(target=self._job_notification_loop, daemon=True,
+                         name="job-notifications").start()
         # 拉取上下文窗口（压缩阈值基准）；失败用默认
         status, data = self.llm("GET", "/api/v1/health")
         if status == 200 and data.get("context_window"):
@@ -639,12 +619,17 @@ class Bot:
         /schedule off|on <id>。到点自动执行并推送结果。"""
         parts = text.split()
         if len(parts) == 1:
-            if not self.schedules:
+            status, data = self.llm("GET", "/api/v1/schedules")
+            if status != 200:
+                self.send_message(chat_id, "获取定时任务失败，请检查后端连接")
+                return
+            schedules = [s for s in data.get("schedules", []) if s.get("chat_id") == chat_id]
+            if not schedules:
                 self.send_message(
                     chat_id, "暂无定时任务。\n用法：/schedule add 08:00 搜索今日科技新闻并总结")
                 return
             lines = ["定时任务："]
-            for s in self.schedules:
+            for s in schedules:
                 state = "开" if s.get("enabled", True) else "关"
                 lines.append(f"#{s['id']} [{state}] {s.get('time')} "
                              f"{s.get('prompt', '')[:40]}"
@@ -666,50 +651,85 @@ class Bot:
                 self.send_message(chat_id, f"时间无效：{hhmm}（小时 0-23，分钟 0-59）")
                 return
             prompt = " ".join(parts[3:])
-            with self._schedules_lock:
-                sid = self._next_schedule_id()
-                self.schedules.append({"id": sid, "time": hhmm, "prompt": prompt,
-                                       "chat_id": chat_id, "last_run": "", "enabled": True})
-                self._save_schedules()
+            session_id = self.get_or_create_session(chat_id)
+            if not session_id:
+                self.send_message(chat_id, "创建会话失败，请检查后端连接")
+                return
+            status, data = self.llm("POST", "/api/v1/schedules", {
+                "time": hhmm, "prompt": prompt, "channel": "telegram",
+                "chat_id": chat_id, "session_id": session_id,
+            })
+            if status != 200:
+                self.send_message(chat_id, f"添加定时任务失败：{data.get('detail', status)}")
+                return
+            sid = data["schedule"]["id"]
             self.send_message(chat_id, f"✓ 已添加定时任务 #{sid}：每天 {hhmm} 执行「{prompt[:40]}」")
         elif sub in ("del", "off", "on"):
             if len(parts) < 3:
                 self.send_message(chat_id, f"用法：/schedule {sub} <id>")
                 return
-            with self._schedules_lock:
-                target = next((s for s in self.schedules if s["id"] == parts[2]), None)
-                if target is None:
-                    self.send_message(chat_id, f"定时任务不存在：{parts[2]}（/schedule 查看）")
-                    return
-                if sub == "del":
-                    self.schedules.remove(target)
-                    self.send_message(chat_id, f"已删除定时任务 #{target['id']}")
-                else:
-                    target["enabled"] = (sub == "on")
-                    self.send_message(chat_id, f"定时任务 #{target['id']} 已{'开启' if sub == 'on' else '暂停'}")
-                self._save_schedules()
+            status, data = self.llm("GET", "/api/v1/schedules")
+            if status != 200:
+                self.send_message(chat_id, "获取定时任务失败，请检查后端连接")
+                return
+            target = next((s for s in data.get("schedules", [])
+                           if str(s["id"]) == parts[2] and s.get("chat_id") == chat_id), None)
+            if target is None:
+                self.send_message(chat_id, f"定时任务不存在：{parts[2]}（/schedule 查看）")
+                return
+            path = f"/api/v1/schedules/{target['id']}"
+            status, data = (self.llm("DELETE", path) if sub == "del" else
+                            self.llm("PATCH", path, {"enabled": sub == "on"}))
+            if status != 200:
+                self.send_message(chat_id, f"修改定时任务失败：{data.get('detail', status)}")
+                return
+            action = "删除" if sub == "del" else ("开启" if sub == "on" else "暂停")
+            self.send_message(chat_id, f"定时任务 #{target['id']} 已{action}")
         else:
             self.send_message(chat_id, "未知子命令（add / del / on / off），/schedule 查看用法")
 
-    def _scheduler_loop(self) -> None:
-        """调度线程：每 30 秒检查 HH:MM 是否到点（每天一次），触发 agent_flow 并推送结果。"""
+    def _poll_job_notifications(self) -> None:
+        """Deliver backend confirmations/results without executing another agent."""
+        if not self.configured():
+            return
+        status, data = self.llm("GET", "/api/v1/jobs?limit=200")
+        if status != 200:
+            return
+        for job in reversed(data.get("jobs", [])):
+            chat_id = job.get("chat_id")
+            if (job.get("channel") != "telegram" or not isinstance(chat_id, int)
+                    or not (self.allowed(chat_id) or self.authorized(chat_id, chat_id))):
+                continue
+            jid, state = job["id"], job.get("status")
+            keyboard = None
+            if state == "waiting_confirm":
+                code, detail = self.llm("GET", f"/api/v1/jobs/{jid}")
+                current = detail.get("job") or {}
+                ask = current.get("pending_ask") or {}
+                if code != 200 or current.get("status") != "waiting_confirm" or not ask.get("id"):
+                    continue
+                marker = f"ask:{ask['id']}"
+                text, keyboard = self._confirmation_message(ask)
+            elif state in ("completed", "failed", "cancelled"):
+                marker = state
+                result = job.get("result_summary") if state == "completed" else job.get("error")
+                text = f"定时任务「{job.get('title', jid)}」[{state}]\n{result or '任务已结束'}"
+            else:
+                continue
+            if self._job_notifications.get(jid) == marker:
+                continue
+            response = self.send_message(chat_id, text, keyboard=keyboard)
+            if response and response.get("ok"):
+                self._job_notifications[jid] = marker
+                self._save_job_notifications()
+
+    def _job_notification_loop(self) -> None:
         while not self._stop.is_set():
-            now = time.strftime("%H:%M")
-            today = time.strftime("%Y-%m-%d")
-            with self._schedules_lock:
-                due = [s for s in self.schedules
-                       if s.get("enabled", True) and s.get("time") == now
-                       and not (s.get("last_run") or "").startswith(today)]
-                for s in due:
-                    s["last_run"] = f"{today} {now}"
-                if due:
-                    self._save_schedules()
-            for s in due:
-                log.info("定时任务 %s 触发: %s", s["id"], s.get("prompt", "")[:50])
-                threading.Thread(target=self.agent_flow,
-                                 args=(s.get("chat_id"), s.get("prompt", "")),
-                                 daemon=True).start()
-            self._stop.wait(30)
+            try:
+                self._poll_job_notifications()
+            except Exception:
+                log.exception("后台任务通知失败")
+            self._stop.wait(5)
 
     def cmd_sessions(self, chat_id: int) -> None:
         status, data = self.llm("GET", "/api/v1/sessions")
@@ -964,6 +984,12 @@ class Bot:
     def _ask_user(self, chat_id: int, state: dict, d: dict) -> None:
         """ask 确认：把当前消息替换为带按钮的确认框，等待用户点按钮回传。
         冻结渲染线程，防止后续刷新把确认按钮覆盖掉。"""
+        text, keyboard = self._confirmation_message(d)
+        state["frozen"] = True
+        self.edit_message(chat_id, state["msg_id"], text, keyboard=keyboard)
+
+    @staticmethod
+    def _confirmation_message(d: dict) -> tuple[str, dict]:
         question = d.get("question") or "需要确认"
         diff = d.get("diff")
         text = f"❓ {question}"
@@ -982,8 +1008,7 @@ class Bot:
             {"text": "✓ 允许", "callback_data": f"yes:{d.get('id')}"},
             {"text": "✗ 拒绝", "callback_data": f"no:{d.get('id')}"},
         ]]}
-        state["frozen"] = True
-        self.edit_message(chat_id, state["msg_id"], text, keyboard=keyboard)
+        return text, keyboard
 
 
 def main() -> None:
