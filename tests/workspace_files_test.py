@@ -141,7 +141,14 @@ check("切换后 epoch 变化", L._workspace_epoch > epoch0, "")
 check("旧 epoch 检测到变化", L._workspace_changed(epoch0) is True, "")
 check("新 epoch 一致", L._workspace_changed(L._workspace_epoch) is False, "")
 check("_get_workspace 返回新工作区", L._get_workspace() == ws2, str(L._get_workspace()))
-check("备份目录跟随工作区", str(L._backup_dir()).startswith(str(ws2)), str(L._backup_dir()))
+backup_dir = L._backup_dir().resolve()
+workspace_dir = ws2.resolve()
+try:
+    backup_dir.relative_to(workspace_dir)
+    backup_follows_workspace = True
+except ValueError:
+    backup_follows_workspace = False
+check("备份目录跟随工作区", backup_follows_workspace, str(backup_dir))
 # 切回原工作区（后续文件操作测试继续在 WS 内进行）
 with L._workspace_lock:
     L._workspace_path = WS
