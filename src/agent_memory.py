@@ -355,6 +355,15 @@ def list_memories(*, status: str = "active", limit: int = 100,
                 "status": e.get("status"),
                 "created_at": e.get("created_at"),
                 "updated_at": e.get("updated_at"),
+                "receipts": [
+                    {
+                        "session_id": r.get("session_id"),
+                        "request_id": r.get("request_id"),
+                        "excerpt": str(r.get("excerpt") or "")[:160],
+                    }
+                    for r in (e.get("source_refs") or [])
+                ],
+                "derived_from": e.get("derived_from") or [],
             })
             if len(out) >= limit:
                 break

@@ -52,7 +52,7 @@ def seed_conversation(app: "chat.ChatApp") -> None:
         "history": [],
     }
     app._sessions[2] = {
-        "messages": [], "title": "修复量化中心启动失败", "loaded": True,
+        "messages": [], "title": "修复团队任务切换失败", "loaded": True,
         "count": 6, "history": [],
     }
     app._sessions[3] = {

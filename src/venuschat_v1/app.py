@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
+import json
+import os
 import sys
+import threading
 import tkinter as tk
+from datetime import datetime, timezone
+from pathlib import Path
 
 from . import theme as t
 from .api_client import ApiClient
 from .backend_bridge import BackendBridge
 from .chat_view import ChatView
-from .config_store import load_config
+from .config_store import (active_project_for_origin, load_config,
+                           personal_backend_for_team,
+                           project_preference_key, save_active_project_for_origin,
+                           save_local_config)
 from .settings_view import SettingsView
 from .widgets import Dot, FlatButton, MenuPopup, separator
-
-try:   # 量化中心控制层可选：缺失时 V1 仍可运行，按钮降级为提示
-    from quant_integration import (
-        QuantIntegrationConfig, QuantLaunchError, QuantServiceController)
-except ModuleNotFoundError:  # pragma: no cover
-    QuantIntegrationConfig = QuantLaunchError = QuantServiceController = None
-
 
 class HeaderLink(tk.Frame):
     """Text navigation item with a quiet active underline."""
@@ -127,8 +129,21 @@ class VenusChatV1:
     MIN_WIDTH = 1120
     MIN_HEIGHT = 700
 
+    @property
+    def client(self) -> ApiClient:
+        bridge = self.__dict__.get("bridge")
+        return bridge.client if bridge is not None else self.__dict__["_client"]
+
+    @client.setter
+    def client(self, value: ApiClient) -> None:
+        self.__dict__["_client"] = value
+        bridge = self.__dict__.get("bridge")
+        if bridge is not None and bridge._default_client is not value:
+            bridge.set_client(value)
+
     def __init__(self, root: tk.Tk, *, custom_chrome: bool = True) -> None:
         self.root = root
+        self._backend_switch_lock = threading.RLock()
         self.custom_chrome = bool(custom_chrome)
         self.model_name = load_config().get("model") or "deepseek-v4-flash"
         self._toast_job: str | None = None
@@ -138,8 +153,50 @@ class VenusChatV1:
         self._restore_geometry = ""
         self._restore_override_pending = False
         self._online = False
+        self._current_view = "chat"
+        self._model_change_pending = False
+        self._active_project_change_serial = 0
+        self._drag_moved = False
+        self._initial_session_loaded = False
+        self._backend_context_pending = False
+        self._backend_session_preferences: dict[str, int | None] = {}
+        self._backend_drafts: dict[str, dict[int, str]] = {}
+        self._backend_unbound_drafts: dict[str, str] = {}
+        active_project_map = load_config().get("active_project_by_hub") or {}
+        if not isinstance(active_project_map, dict):
+            active_project_map = {}
+        self._backend_project_preferences: dict[str, str] = {
+            str(k).rstrip("/"): str(v)
+            for k, v in active_project_map.items()
+        }
+        self._pending_backend_switch: tuple[str, str] | None = None
 
+        config = load_config()
         self.client = ApiClient()
+        initial_base = self.client.base.rstrip("/")
+        self._personal_backend_base = initial_base
+        self._team_backend_origin = ""
+        self._team_backend_name = "团队 Hub"
+        joined = [row for row in (config.get("team_connections") or [])
+                  if row.get("status") == "joined" and row.get("origin")]
+        local_hub_base = str(config.get("team_hub_local_base") or "").rstrip("/")
+        connection = (next((row for row in reversed(joined)
+                            if str(row.get("origin") or "").rstrip("/") == initial_base), None)
+                      or (joined[-1] if joined else None))
+        if connection:
+            origin = str(connection.get("origin") or "").rstrip("/")
+            if local_hub_base and initial_base == local_hub_base:
+                # Local llm_base may address the Hub service on its host;
+                # use the enrolled HTTPS origin so its device token is scoped
+                # correctly and the switch control starts in team context.
+                self.client = ApiClient(base=origin)
+                initial_base = origin
+            self._team_backend_origin = origin
+            self._team_backend_name = str(connection.get("team_name") or "团队 Hub")
+            previous = str(connection.get("previous_llm_base") or "").rstrip("/")
+            if origin == initial_base:
+                self._personal_backend_base = personal_backend_for_team(
+                    origin, previous, config)
         self.bridge = BackendBridge(self.client, self._on_backend_event)
 
         t.enable_dpi_awareness()
@@ -151,39 +208,224 @@ class VenusChatV1:
         self._apply_windows_taskbar_style()
         self.show_chat()
         self.bridge.refresh_all()
+        self.bridge.submit("agents", lambda: self.client.get("/api/v1/agents", timeout=8))
         self._poll_backend()
-        self.root.after(1600, self._quant_probe)
+        self.root.after(30000, self._periodic_health)
+
+    def _periodic_health(self) -> None:
+        self.bridge.submit("health", lambda: ("ok", self.client.get("/api/v1/health", timeout=5)))
+        self.root.after(30000, self._periodic_health)
+
+    def configure_team_backend(self, origin: str, name: str,
+                               personal_base: str = "") -> None:
+        """Remember the joined Hub and activate its isolated conversation store."""
+        self._team_backend_origin = str(origin or "").rstrip("/")
+        self._team_backend_name = str(name or "团队 Hub")
+        if personal_base:
+            self._personal_backend_base = str(personal_base).rstrip("/")
+        self._refresh_backend_switch_control()
+        self.switch_backend_context(self._team_backend_origin,
+                                    self._team_backend_name)
+
+    def set_active_project(self, project_id: str) -> None:
+        """Ask the Hub to set this user's current project, then update locally."""
+        project_id = str(project_id or "")
+        if project_id:
+            selected = next((row for row in self.bridge.projects
+                             if str(row.get("id") or "") == project_id), None)
+            if not selected:
+                self.toast("项目列表已变化，请刷新后重新选择")
+                return
+            if str(selected.get("status") or "") == "pending_claim":
+                self.toast("请先认领项目，再设为当前派活项目")
+                return
+        self._active_project_change_serial += 1
+        serial = self._active_project_change_serial
+        self.toast("正在更新 Hub 当前项目…")
+        self.bridge.submit(
+            "active_project_update",
+            lambda: self._post_active_project(project_id, serial))
+
+    def _post_active_project(self, project_id: str, serial: int):
+        code, data = self.client.post("/api/v1/projects/active", {
+            "project_id": project_id,
+        }, timeout=10)
+        data = dict(data) if isinstance(data, dict) else {"detail": str(data)}
+        data["_requested_active"] = project_id
+        data["_request_serial"] = serial
+        return ("ok", (code, data))
+
+    def apply_active_project(self, project_id: str) -> None:
+        """Apply a Hub-confirmed active project to this VenusChat client."""
+        project_id = str(project_id or "")
+        origin = self.client.base.rstrip("/")
+        self.bridge.active_project_id = project_id
+        self._backend_project_preferences[project_preference_key(origin)] = project_id
+        save_active_project_for_origin(origin, project_id)
+        self.chat_view.refresh_projects()
+
+    def toggle_backend_context(self) -> None:
+        current = self.client.base.rstrip("/")
+        if self._team_backend_origin and current == self._team_backend_origin:
+            target = self._personal_backend_base
+            label = "个人对话"
+        elif self._team_backend_origin:
+            target = self._team_backend_origin
+            label = self._team_backend_name
+        else:
+            self.toast("尚未连接团队 Hub；请先在设置的「团队与成员」中加入团队")
+            return
+        self.switch_backend_context(target, label)
+
+    def switch_backend_context(self, base: str, label: str) -> None:
+        """Switch between the personal server and a team Hub without mixing state."""
+        target = str(base or "").rstrip("/")
+        current = self.client.base.rstrip("/")
+        if not target:
+            self._pending_backend_switch = None
+            self._refresh_backend_switch_control()
+            return
+        if target == current:
+            # A quick reverse click cancels a queued switch instead of allowing
+            # the old destination to win after the background queue drains.
+            self._pending_backend_switch = None
+            self._refresh_backend_switch_control()
+            return
+        if self.bridge._streaming or self.chat_view._creating_session:
+            self.toast("当前对话操作尚未结束，请完成或停止后再切换空间")
+            return
+        self._pending_backend_switch = None
+        unbound_draft = self.chat_view.prepare_backend_context_switch()
+        self._backend_session_preferences[current] = self.bridge.current_sid
+        self._backend_drafts[current] = dict(self.chat_view._drafts)
+        self._backend_unbound_drafts[current] = unbound_draft
+        self._backend_project_preferences[project_preference_key(current)] = self.bridge.active_project_id
+        save_active_project_for_origin(current, self.bridge.active_project_id)
+
+        # New work is bound to a fresh client; older queued work retains its
+        # captured client and results are dropped by the bridge epoch check.
+        with self._backend_switch_lock:
+            save_local_config({"llm_base": target})
+            self.client = ApiClient(base=target)
+        settings = getattr(self, "settings_view", None)
+        if settings is not None:
+            settings.reset_backend_context_state()
+        # Always refetch sessions from the selected origin. Session ids overlap
+        # between local Venus and the Hub, so sharing cached SessionState objects
+        # here can display one server's messages in the other's conversation.
+        self.bridge.sessions = {}
+        self.bridge.current_sid = None
+        self.bridge.projects = []
+        self.bridge.active_project_id = (
+            self._backend_project_preferences.get(project_preference_key(target))
+            or active_project_for_origin(target))
+        self.chat_view.reset_backend_context(
+            label, self._backend_drafts.get(target, {}),
+            self._backend_unbound_drafts.get(target, ""))
+        self._backend_context_pending = True
+        self._model_change_pending = False
+        self._active_project_change_serial += 1
+        self.chat_view._deleting_sid = None
+        self.chat_view._mode_menu_pending = False
+        self.chat_view._mode_change_pending = False
+        self._refresh_backend_switch_control()
+        self.bridge.refresh_all()
+
+    def _retry_backend_switch(self) -> None:
+        request = self._pending_backend_switch
+        if request is None:
+            return
+        if self.bridge._streaming or self.chat_view._creating_session:
+            self._pending_backend_switch = None
+            self.toast("当前对话操作尚未结束，空间切换已取消")
+            return
+        self._pending_backend_switch = None
+        self.switch_backend_context(*request)
+
+    def _refresh_backend_switch_control(self) -> None:
+        view = getattr(self, "chat_view", None)
+        if view is not None:
+            view.refresh_backend_switch_button()
 
     def _poll_backend(self) -> None:
-        self.bridge.poll()
-        self.root.after(80, self._poll_backend)
+        try:
+            self.bridge.poll()
+        finally:
+            try:
+                self.root.after(80, self._poll_backend)
+            except tk.TclError:
+                pass
 
     def _on_backend_event(self, kind: str, payload) -> None:
         try:
             if kind == "health":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 if code == 200:
-                    self._set_online(True, data.get("model") or "")
+                    configured = bool(data.get("configured"))
+                    self._set_online(configured, data.get("model") or ("已连接" if configured else "未配置"))
                     self.model_name = data.get("model") or self.model_name
                     self.bridge._apply_health(code, data)
                     self.chat_view.on_health(data)
                 else:
                     self._set_online(False, "")
+                    self.chat_view.set_offline()
             elif kind == "sessions":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 self.bridge._apply_sessions(code, data)
                 self.chat_view.refresh_sidebar()
+                if code == 200 and self._backend_context_pending:
+                    self._backend_context_pending = False
+                    preferred = self._backend_session_preferences.get(
+                        self.client.base.rstrip("/"))
+                    if preferred in self.bridge.sessions:
+                        self.bridge.current_sid = preferred
+                    sid = self.bridge.current_sid
+                    if sid is not None:
+                        self.bridge.load_session(sid)
+                    else:
+                        self.chat_view.show_empty_backend_context()
+                elif code == 200 and not self._initial_session_loaded:
+                    self._initial_session_loaded = True
+                    sid = self.bridge.current_sid
+                    if sid and not self.bridge.sessions[sid].loaded:
+                        self.bridge.load_session(sid)
+                elif code != 200:
+                    self._backend_context_pending = False
             elif kind == "projects":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 self.bridge._apply_projects(code, data)
                 self.chat_view.refresh_projects()
+            elif kind == "active_project_update":
+                code, data = self._api_result(payload)
+                serial = int(data.get("_request_serial") or 0)
+                requested = str(data.get("_requested_active") or "")
+                if serial != self._active_project_change_serial:
+                    return
+                active = str(data.get("active") or "")
+                if code == 200 and active == requested:
+                    self.apply_active_project(requested)
+                    if requested:
+                        project = next((row for row in self.bridge.projects
+                                        if str(row.get("id") or "") == requested), {})
+                        name = str(project.get("name") or project.get("title") or "项目")
+                        self.toast(f"已设为当前派活项目：{name}")
+                    else:
+                        self.toast("已清除当前派活项目")
+                else:
+                    detail = str(data.get("detail") or f"HTTP {code}")
+                    self.toast(f"切换当前项目失败：{detail}", duration=5000)
+                    self.bridge.refresh_all()
             elif kind == "jobs":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 if code == 200:
                     self.bridge.jobs_active = int((data.get("active_count") or 0))
                     self.chat_view.refresh_jobs(data.get("jobs") or [])
+                elif self._backend_context_pending:
+                    # Never leave the previous origin's task list visible when
+                    # the newly selected backend is offline or rejects access.
+                    self.chat_view.refresh_jobs([])
             elif kind == "session_new":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 sid = 0
                 if code == 200:
                     sid = int((data.get("session") or {}).get("id")
@@ -194,14 +436,18 @@ class VenusChatV1:
                         sid=sid, title="新对话", loaded=True, messages=[])
                     self.bridge.current_sid = sid
                     self.chat_view.on_new_session(sid)
+                else:
+                    self.chat_view.on_session_create_failed(str(data.get("detail") or "创建会话失败"))
             elif kind == "session_load":
-                _, (code, data) = payload
-                sid = self.bridge.current_sid or 0
+                sid, result = payload
+                code, data = result
                 self.bridge._apply_session_load(code, data, sid)
+                if code != 200:
+                    self.chat_view.on_session_load_failed(sid)
             elif kind == "session_ready":
                 self.chat_view.render_session(int(payload))
             elif kind == "dispatch":
-                _, (code, data) = payload
+                code, data = self._api_result(payload)
                 if code == 200 and data.get("job"):
                     jid = data["job"].get("id", "?")
                     self.toast(f"任务已派发 {jid}")
@@ -218,19 +464,66 @@ class VenusChatV1:
                 self.toast(str(payload))
             elif kind == "error":
                 self.toast(str(payload))
+            elif kind == "model_change":
+                self._model_change_pending = False
+                code, data = self._api_result(payload)
+                if code == 200:
+                    cfg = data.get("config") or {}
+                    self.model_name = str(cfg.get("model") or self.model_name)
+                    self.toast(f"当前模型：{self.model_name}")
+                    self.bridge.submit("health", lambda: ("ok", self.client.get("/api/v1/health")))
+                else:
+                    self.toast(f"模型切换失败：{data.get('detail', code)}", duration=4200)
+            elif kind == "worker_error":
+                source, detail = payload
+                if str(source).startswith("settings_"):
+                    self.settings_view.handle_backend(str(source), ("error", str(detail)))
+                elif source == "model_change":
+                    self._model_change_pending = False
+                    self.toast(f"模型切换失败：{detail}", duration=4200)
+                elif source == "session_new":
+                    self.chat_view.on_session_create_failed(str(detail))
+                elif source == "session_load":
+                    self.chat_view.on_session_load_failed(self.bridge.current_sid or 0)
+                    self.toast(f"加载会话失败：{detail}", duration=4200)
+                elif source == "session_delete":
+                    self.chat_view._deleting_sid = None
+                    self.toast(f"删除会话失败：{detail}", duration=4200)
+                elif source in {"mode_list", "mode_change"}:
+                    if source == "mode_list":
+                        self.chat_view.handle_backend(source, (0, {"detail": str(detail)}))
+                    else:
+                        self.chat_view.handle_backend(source, ("", (0, {"detail": str(detail)})))
+                else:
+                    self.toast(f"操作失败：{detail}", duration=4200)
+            elif kind.startswith("settings_"):
+                self.settings_view.handle_backend(kind, payload)
             else:
                 self.chat_view.handle_backend(kind, payload)
         except tk.TclError:
             pass
+
+    @staticmethod
+    def _api_result(payload) -> tuple[int, dict]:
+        """Normalize successful bridge results and worker failures."""
+        if isinstance(payload, tuple) and len(payload) == 2 and payload[0] == "ok":
+            result = payload[1]
+            if isinstance(result, tuple) and len(result) == 2:
+                code, data = result
+                return int(code), data if isinstance(data, dict) else {"detail": str(data)}
+        detail = payload[1] if isinstance(payload, tuple) and len(payload) == 2 else payload
+        return 0, {"detail": str(detail)}
 
     def _on_confirm(self, allowed: bool, request_id: str) -> None:
         self.bridge.respond_confirm(allowed, request_id)
 
     def _set_online(self, online: bool, model: str) -> None:
         self._online = online
+        if self._online_dot is not None:
+            self._online_dot.set_color(t.SUCCESS if online else t.WARNING)
         if self._online_label is not None:
             self._online_label.configure(
-                text=(model[:18] + "…") if online and len(model) > 18 else (model if online else "离线"),
+                text=(model[:18] + "…") if online and len(model) > 18 else (model or "离线"),
                 fg=t.SUCCESS if online else t.WARNING,
             )
 
@@ -258,6 +551,8 @@ class VenusChatV1:
         self.root.bind("<Map>", self._on_map, add="+")
 
     def _build_shell(self) -> None:
+        self._online_dot: Dot | None = None
+        self._online_label: tk.Label | None = None
         self.shell = tk.Frame(
             self.root,
             bg=t.CANVAS,
@@ -280,9 +575,6 @@ class VenusChatV1:
         self.settings_view = SettingsView(self.view_host, self, self.fonts, self.client)
         self.chat_view.grid(row=0, column=0, sticky="nsew")
         self.settings_view.grid(row=0, column=0, sticky="nsew")
-
-        self._online_dot: Dot | None = None
-        self._online_label: tk.Label | None = None
 
         self.toast_frame = tk.Frame(
             self.shell,
@@ -318,7 +610,7 @@ class VenusChatV1:
         self.header.grid(row=0, column=0, sticky="new")
         self.header.pack_propagate(False)
 
-        brand_zone = tk.Frame(self.header, bg=t.HEADER, width=t.s(310), cursor="fleur")
+        brand_zone = tk.Frame(self.header, bg=t.HEADER, width=t.s(260), cursor="fleur")
         brand_zone.pack(side="left", fill="y")
         brand_zone.pack_propagate(False)
         brand_row = tk.Frame(brand_zone, bg=t.HEADER)
@@ -370,10 +662,9 @@ class VenusChatV1:
         self.pro_badge.pack(side="right", padx=t.s(16), pady=t.s(14))
 
         self.header_links: dict[str, HeaderLink] = {}
-        # Packing from the right keeps the visual order: 量化中心 / 设置 / 模型.
+        # Packing from the right keeps the visual order: 设置 / 模型.
         for key, label, callback, has_dot in reversed(
             (
-                ("quant", "量化中心", self._open_quant_center, True),
                 ("settings", "设置", self.show_settings, False),
                 ("model", "模型", self._open_model_menu, False),
             )
@@ -388,38 +679,67 @@ class VenusChatV1:
                 widget.bind("<ButtonPress-1>", self._start_drag, add="+")
                 widget.bind("<B1-Motion>", self._drag_window, add="+")
                 widget.bind("<Double-Button-1>", lambda _event: self.toggle_maximize(), add="+")
+            for widget in (brand_zone, self.brand_label):
+                widget.bind("<ButtonRelease-1>", self._release_brand, add="+")
+
+    def _ensure_taskbar_style(self) -> None:
+        """Keep the taskbar/Alt-Tab entry (APPWINDOW, no TOOLWINDOW).
+
+        Toggling overrideredirect recreates window styles and wipes the bits
+        set at startup; without re-applying, the window vanishes from the
+        taskbar after the first minimize-restore cycle and cannot be restored.
+        """
+        if not self.custom_chrome or sys.platform != "win32":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.root.winfo_id())
+            style = user32.GetWindowLongW(hwnd, -20)
+            user32.SetWindowLongW(hwnd, -20, (style & ~0x00000080) | 0x00040000)
+        except Exception:
+            pass
 
     def _apply_windows_taskbar_style(self) -> None:
         if not self.custom_chrome or sys.platform != "win32":
             return
         try:
             self.root.update_idletasks()
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.root.winfo_id())
-            style = user32.GetWindowLongW(hwnd, -20)
-            style = (style & ~0x00000080) | 0x00040000  # no TOOLWINDOW, add APPWINDOW
-            user32.SetWindowLongW(hwnd, -20, style)
+            self._ensure_taskbar_style()
             self.root.withdraw()
-            self.root.after(12, self.root.deiconify)
+            self.root.after(80, self._show_startup_window)
         except Exception:
+            pass
+
+    def _show_startup_window(self) -> None:
+        """Make a freshly launched custom-chrome window visible and active."""
+        try:
+            if not self.root.winfo_exists():
+                return
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
             pass
 
     # Routing ----------------------------------------------------------------
     def show_chat(self) -> None:
         self.chat_view.tkraise()
+        self._current_view = "chat"
         self.set_header_section("chat")
 
     def show_settings(self) -> None:
+        self.settings_view.on_open()
         self.settings_view.tkraise()
+        self._current_view = "settings"
         self.set_header_section("settings")
 
     def show_settings_page(self, key: str) -> None:
         """Jump straight into one settings page (workspace card, rail links)."""
+        if key not in self.settings_view.page_keys:
+            return
         self.settings_view.tkraise()
-        try:
-            self.settings_view.select_page(key)
-        except Exception:
-            pass
+        self._current_view = "settings"
+        self.settings_view.select_page(key)
         self.set_header_section("settings")
 
     def set_header_section(self, section: str) -> None:
@@ -427,126 +747,34 @@ class VenusChatV1:
             link.set_active(section == key)
 
     def set_model(self, model: str) -> None:
-        code, data = self.client.post("/api/v1/config", {"model": model})
-        if code == 200:
-            self.model_name = model
-            self.toast(f"当前模型：{model}")
-            self.bridge.submit("health",
-                               lambda: ("ok", self.client.get("/api/v1/health")))
-        else:
-            self.toast(f"模型切换失败：{data.get('detail', code)}")
+        if self._model_change_pending:
+            self.toast("正在切换模型，请稍候")
+            return
+        if not model or model == self.model_name:
+            return
+        self._model_change_pending = True
+        self.toast("正在切换模型…")
+        self.bridge.submit("model_change", lambda: ("ok", self.client.post("/api/v1/config", {"model": model})))
 
     def _open_model_menu(self, anchor=None) -> None:
-        presets = ("deepseek-v4-flash", "deepseek-reasoner", "本地模型")
+        presets = ("deepseek-v4-flash", "deepseek-reasoner")
         names = ([self.model_name] if self.model_name else []) + \
                 [m for m in presets if m != self.model_name]
-        items = [{"label": n, "desc": "输入框模型芯片可快速识别当前档",
+        items = [{"label": n, "desc": "当前使用" if n == self.model_name else "切换模型",
                   "current": n == self.model_name} for n in names]
+        items.append({"label": "配置其他模型…", "desc": "填写模型标识与连接信息"})
 
         def choose(index: int) -> None:
-            self.set_model(names[index])
+            if index == len(names):
+                self.show_settings_page("model")
+            else:
+                self.set_model(names[index])
         anchor_widget = anchor if anchor is not None else self.header_links["model"]
         MenuPopup(anchor_widget, items, self.fonts, choose,
                   min_width=230, align_right=anchor is None)
 
     def _top_view(self):
-        try:
-            name = self.view_host.tk.call("winfo", "containing", self.view_host.winfo_rootx() + 5,
-                                         self.view_host.winfo_rooty() + 5)
-            widget = self.root.nametowidget(name) if name else None
-            while widget is not None and widget.master is not self.view_host:
-                widget = widget.master
-            return widget
-        except (tk.TclError, KeyError):
-            return self.chat_view
-
-    # 量化中心 ---------------------------------------------------------------
-    # 注意：后台动作一律经 bridge.submit（队列回主线程 poll），工作线程绝不
-    # 直接触碰 Tk 接口。
-    def _quant_link(self):
-        return self.header_links.get("quant")
-
-    def _quant_probe(self) -> None:
-        """Read-only health check of the isolated quant services (loopback)."""
-        if QuantServiceController is None:
-            self._quant_probe_result(False, unavailable=True)
-            return
-        try:
-            cfg = QuantIntegrationConfig.from_mapping(load_config())
-        except Exception:
-            self._quant_probe_result(False, misconfig=True)
-            return
-        if not cfg.enabled:
-            self._quant_probe_result(False, disabled=True)
-            return
-        self.bridge.submit("quant_probe",
-                           lambda: bool(QuantServiceController(cfg).probe().ready))
-        self.root.after(15000, self._quant_probe)
-
-    def _quant_probe_result(self, ready, *, unavailable=False, misconfig=False,
-                            disabled=False) -> None:
-        link = self._quant_link()
-        if link is None:
-            return
-        if unavailable:
-            link.set_status(t.INK_FAINT, suffix=" · 不可用")
-        elif misconfig:
-            link.set_status(t.WARNING, suffix=" · 配置错误")
-        elif disabled:
-            link.set_status(t.INK_FAINT, suffix=" · 已禁用")
-        else:
-            link.set_status(t.SUCCESS if ready else t.INK_FAINT,
-                            suffix=" · 可用" if ready else "")
-
-    def _open_quant_center(self) -> None:
-        """Check, start if needed, and open the loopback quant dashboard."""
-        if getattr(self, "_quant_busy", False):
-            return
-        if QuantServiceController is None:
-            self.toast("量化控制层不可用（quant_integration 未安装）")
-            return
-        try:
-            cfg = QuantIntegrationConfig.from_mapping(load_config())
-        except Exception as exc:
-            self.toast(f"量化中心配置错误：{str(exc)[:120]}")
-            return
-        if not cfg.enabled:
-            self.toast("量化中心已禁用，可在设置 → 量化中启用")
-            return
-        self._quant_busy = True
-        controller = QuantServiceController(cfg)
-
-        def progress(stage: str) -> None:
-            self.bridge.submit("quant_progress", lambda: stage)
-
-        def job():
-            try:
-                controller.open_quant_center(progress=progress)
-                return ("ok", None)
-            except Exception as exc:      # QuantLaunchError 或意外错误
-                return ("err", str(getattr(exc, "user_message", None) or exc)[:160])
-        self.bridge.submit("quant_open", job)
-
-    def _quant_progress(self, stage) -> None:
-        link = self._quant_link()
-        labels = {"checking": "检查中…", "starting-backend": "启动后端…",
-                  "starting-gui": "启动 GUI…", "opening": "打开中…"}
-        if link is not None:
-            link.set_status(t.WARNING,
-                            suffix=f" · {labels.get(str(stage), '启动中…')}")
-
-    def _quant_open_done(self, result) -> None:
-        self._quant_busy = False
-        status, detail = result if isinstance(result, tuple) else ("ok", None)
-        link = self._quant_link()
-        if status == "ok":
-            if link is not None:
-                link.set_status(t.SUCCESS, suffix=" · 已打开")
-            self.toast("量化中心已打开（Paper Trading only）")
-        else:
-            if link is not None:
-                link.set_status(t.DANGER, suffix=" · 启动失败")
-            self.toast(f"量化中心：{detail}", duration=4200)
+        return self.settings_view if self._current_view == "settings" else self.chat_view
 
     # Toast ------------------------------------------------------------------
     def toast(self, text: str, *, duration: int = 2200) -> None:
@@ -571,13 +799,21 @@ class VenusChatV1:
     def _start_drag(self, event: tk.Event) -> None:
         if self._maximized:
             return
+        self._drag_moved = False
         self._drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
     def _drag_window(self, event: tk.Event) -> None:
         if self._drag_origin is None or self._maximized:
             return
         start_x, start_y, window_x, window_y = self._drag_origin
+        if abs(event.x_root - start_x) + abs(event.y_root - start_y) > t.s(5):
+            self._drag_moved = True
         self.root.geometry(f"+{window_x + event.x_root - start_x}+{window_y + event.y_root - start_y}")
+
+    def _release_brand(self, _event=None) -> None:
+        if not self._drag_moved:
+            self.show_chat()
+        self._drag_origin = None
 
     def _start_resize(self, event: tk.Event) -> None:
         if self._maximized:
@@ -641,7 +877,18 @@ class VenusChatV1:
     def _on_map(self, _event=None) -> None:
         if self.custom_chrome and self._restore_override_pending:
             self._restore_override_pending = False
-            self.root.after(20, lambda: self.root.overrideredirect(True))
+            self.root.after(20, self._restore_custom_chrome)
+
+    def _restore_custom_chrome(self) -> None:
+        try:
+            self.root.overrideredirect(True)
+        except tk.TclError:
+            return
+        self._ensure_taskbar_style()
+        try:
+            self.root.lift()
+        except tk.TclError:
+            pass
 
     def _escape(self, _event=None) -> None:
         if self._top_view() is self.settings_view:
@@ -664,17 +911,69 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _claim_gui_instance():
+    """Keep one GUI per checkout, including launches outside the batch file."""
+    if sys.platform != "win32":
+        return None, None, False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    suffix = hashlib.sha256(str(Path(__file__).resolve().parents[2]).casefold().encode()).hexdigest()[:16]
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, f"Local\\VenusChat-{suffix}")
+    if not handle:
+        return kernel32, None, False
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return kernel32, None, True
+    return kernel32, handle, False
+
+
+def _set_window_icon(root: tk.Tk) -> None:
+    assets = Path(__file__).resolve().parents[2] / "assets"
+    png = assets / "venuschat-icon.png"
+    ico = assets / "venuschat.ico"
+    try:
+        if png.exists():
+            root._venus_icon_photo = tk.PhotoImage(file=str(png))
+            root.iconphoto(True, root._venus_icon_photo)
+        if sys.platform == "win32" and ico.exists():
+            root.iconbitmap(default=str(ico))
+    except tk.TclError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    t.enable_dpi_awareness()
-    root = tk.Tk()
-    app = VenusChatV1(root, custom_chrome=not args.native_frame)
-    if args.geometry:
-        root.geometry(args.geometry)
-    if args.settings:
-        app.show_settings()
-    root.mainloop()
-    return 0
+    kernel32, mutex, duplicate = _claim_gui_instance()
+    if duplicate:
+        return 0
+    marker = Path(__file__).resolve().parents[2] / ".venus" / "venuschat-gui.json"
+    try:
+        t.enable_dpi_awareness()
+        root = tk.Tk()
+        _set_window_icon(root)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}
+        temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(metadata), encoding="utf-8")
+        temporary.replace(marker)
+        app = VenusChatV1(root, custom_chrome=not args.native_frame)
+        if args.geometry:
+            root.geometry(args.geometry)
+        if args.settings:
+            app.show_settings()
+        root.mainloop()
+        return 0
+    finally:
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")).get("pid") == os.getpid():
+                marker.unlink()
+        except (OSError, ValueError, TypeError):
+            pass
+        if kernel32 is not None and mutex:
+            kernel32.CloseHandle(mutex)
 
 
 if __name__ == "__main__":

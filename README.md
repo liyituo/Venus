@@ -2,7 +2,7 @@
 
 **个人 Agent 调度台** — 派活即走，本地可控。把 LLM 接到你的电脑上，让它能读写文件、跑命令、管 Git、操作屏幕；长任务后台异步执行，跨会话记住你的偏好。
 
-> **v0.11.0** — 协作 M0/M1 落地：团队身份层（每人独立 token + 角色 + 审计日志）、敏感操作多人复核投票、V1 团队项目；量化买入预算改为现金感知（含卖出释放额度）；CI 修复（chat.py 孤儿测试移除、ruff F/E9 清零）。
+> **v0.11.0** — 团队项目支持独立 Git 版本库、隔离任务 worktree、变更审阅/合并/回退；Hub 增加 Tailscale Serve 入队、管理员邀请、审核及独立设备凭证撤销；CI 修复（chat.py 孤儿测试移除、ruff F/E9 清零）。
 >
 > **v0.10.1** — VenusChat V1 桌面端接入 llm_server（会话/SSE/确认/派活/设置）；旧 `chat.py` 已移除。CLI 与 Web UI（`/venus`）可并行验证后端能力。
 
@@ -10,12 +10,11 @@
 
 **请在使用本仓库任何代码、模型、策略或界面之前仔细阅读。**
 
-Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`RAG`](RAG/README.md)、策略与回测模块）仅供**技术演示、工程研究与个人学习**使用。
+Venus、[`RAG`](RAG/README.md) 与仓库中的示例模型仅供**技术演示、工程研究与个人学习**使用。
 
 - **不构成投资建议**：本仓库中的任何内容（包括但不限于策略信号、回测结果、LLM 生成的买卖建议、排序结果、研报摘要或 Agent 输出）均**不构成**证券投资咨询、财务建议、交易推荐或任何形式的专业意见。
 - **不保证盈利**：历史回测、模拟交易（Paper Trading）或样本外表现**不代表**未来收益；作者不对任何盈利承诺或暗示负责。
 - **实盘风险自负**：若你自行将本仓库代码用于真实账户或实盘交易，**一切后果由你本人承担**，包括但不限于资金损失、滑点、流动性风险、模型失效、数据错误、系统故障与合规风险。
-- **默认禁止实盘**：量化子项目中的 `LiveBroker` 保持禁用；请勿在未充分理解风险、未完成独立验证、未满足当地监管要求的情况下启用真实下单能力。
 - **AI 与自动化风险**：Agent 可读写文件、执行命令并操作本机；错误配置或误用可能导致数据丢失或系统损坏。请在隔离环境中测试，并为敏感操作启用确认模式。
 - **按原样提供**：本软件按 **「AS IS」** 提供，不提供任何明示或暗示的保证（见 [LICENSE](LICENSE)）。
 
@@ -62,39 +61,25 @@ Venus 及其子项目（含 [`quant-agent-lab`](quant-agent-lab/README.md)、[`R
 
 ## 快速开始（Windows）
 
-双击 `scripts/一键启动控制台.bat`：首次自动建 `.venv` 装依赖，之后直接弹聊天窗口。手动起也一样：
+双击 `scripts/一键启动控制台.bat`：首次自动建 `.venv` 并安装依赖，检查或启动本机 `llm_server`，等后端就绪后打开 VenusChat。重复双击会复用已有后端与窗口。启动失败时保留控制台提示，日志位于 `.venus/launcher/`。`scripts/启动VenusChat V1.bat` 使用同一启动流程。
+
+双击 `scripts/创建VenusChat桌面快捷方式.bat` 可安装带 Venus 图标的桌面快捷方式；GUI 窗口和任务栏也使用 `assets/venuschat.ico`。若 `chat_config.json` 的 `llm_base` 指向远端，启动器只检查该地址并打开 GUI，不会在本机另起一个无关后端。团队 Hub 仍用 `scripts/start_team_hub.ps1` 启动。
+
+手动启动 CLI：
 
 ```
 .venv\Scripts\python src\cli.py
 ```
 
-桌面 Chat（VenusChat V1，本地开发版，未入库）：
+手动启动桌面 Chat（先确保后端运行）：
 
 ```
 .venv\Scripts\python -m venuschat_v1
 ```
 
-或双击 `scripts/一键启动控制台.bat`（需本地存在 `src/venuschat_v1/`）。
-
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
 
-### 量化中心
-
-> **量化相关功能同样适用[上方免责声明](#免责声明)**：仅为演示与研究，不构成投资建议；实盘交易需自行承担全部风险。
-
-桌面 ChatApp 顶部工具栏的「量化中心」按钮会在后台检查并按需启动仓库内隔离的量化后端与正式 standalone host，然后打开 Dashboard。它不会清空当前对话、切换会话、停止主 Agent，也不会生成报告、审批计划或执行交易。
-
-- 后端：`http://127.0.0.1:8014`；GUI：`http://127.0.0.1:4173/#/dashboard`
-- 量化项目：仓库内的 [`quant-agent-lab`](quant-agent-lab/README.md)，默认自动发现，无需填写绝对路径
-- 设置：打开「设置 → 量化」可修改项目路径、loopback 地址、自动启动和退出清理策略
-- 手动启动后端：`cd quant-agent-lab; $env:PYTHONPATH='src'; python -m uvicorn quant_agent.api.app:app --host 127.0.0.1 --port 8014`
-- 手动启动 GUI：`cd quant-agent-lab\plugins\quant-agent-dashboard; node scripts\build.mjs; node standalone\server.mjs`
-- Dashboard 包含 K 线与信号、策略实验室、回测、风控、审批和审计；当前仅允许 Paper Trading，`LiveBroker` 保持禁用
-- **Tiny-MoE 横截面排序**（默认 `strategy.id: tiny-moe-ranker`）：对 CSI300 成分股日级排序，Top-20 买入信号；权重已入库（`var/models/A4_tiny_moe_v2/`），CPU 推理，详见 [`quant-agent-lab/README.md`](quant-agent-lab/README.md)
-- **LLM 基本面信号**（`strategy.id: llm-fundamental`）：DeepSeek 每天读取 RAG 财报 + 自动拉取的行情（美股 yfinance / A股 akshare），输出日级 BUY/SELL/HOLD 信号——风险/审批/执行链不绕过，失败降级 HOLD 不伪造信号。财报经 `RAG` 服务的 ingest 入库（`financial-reports` 集合，meta 含 symbol/report_date，防未来函数）。配置与决策记录见 [`quant-agent-lab/docs/llm-fundamental.md`](quant-agent-lab/docs/llm-fundamental.md)
-- 接入边界、端口、进程生命周期和验证记录见 [`docs/quant-integration.md`](docs/quant-integration.md)
-
-运行量化中心需要 Python 3.12+、主项目依赖，以及本机可用的 Node.js。按钮只启动绑定在 `127.0.0.1` 的本地服务；重复点击会复用已有健康进程。
+**团队协作：**团队 Hub 必须通过 Tailscale Serve HTTPS 运行；管理员邀请指定 Tailscale 登录名，成员申请后由管理员审核。不要复用模型 API Key 作为团队凭证。部署和两台电脑完整演示见 [`docs/collaboration-plan.md`](docs/collaboration-plan.md) 与 [`docs/venuschat-v1.md`](docs/venuschat-v1.md)。
 
 ### 本地 AI 额度桌面组件
 
@@ -170,6 +155,25 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 | `POST /api/v1/jobs/{id}/cancel` | 取消 |
 
 任务数据在 `.venus/jobs/`；完成后自动写回来源会话（若指定 `session_id`）。
+
+#### 团队项目版本协作
+
+团队项目的版本仓库按需初始化在 Hub 数据目录 `.venus/team_projects/<project_id>/repo/`。初始化 API 必须收到明确的 `shared_paths`，仅从 Hub 配置的工作区复制这些安全文件；不会导入整个工作区。团队任务自动获得独立分支和 worktree，且不关联成员私人会话或记忆；个人任务保持原工作区行为。成员通过 VenusChat「团队协作」查看差异、审阅和合并；任务发起人从后台任务卡片提交明确的文件路径集合。
+
+| 端点 | 作用 |
+| --- | --- |
+| `POST /api/v1/projects/{id}/versions/init` | 用 `shared_paths` 明确初始化团队仓库 |
+| `GET /api/v1/projects/{id}/versions` | 读取仓库状态和共享路径 |
+| `GET /api/v1/projects/{id}/changes` | 列出项目变更单 |
+| `GET /api/v1/projects/{id}/changes/{change_id}` | 读取变更目的、作者、SHA 和审阅记录 |
+| `GET /api/v1/projects/{id}/changes/{change_id}/diff` | 查看文件差异 |
+| `POST /api/v1/jobs/{job_id}/changes/commit` | 对显式 `paths` 创建提交并送审 |
+| `POST /api/v1/projects/{id}/changes/{change_id}/review` | 另一名成员按 `reviewed_sha` 批准或拒绝 |
+| `POST /api/v1/projects/{id}/changes/{change_id}/merge` | 仅在目标 HEAD 仍等于基础 SHA 时快进合并 |
+| `POST /api/v1/projects/{id}/changes/{change_id}/rebase` | 显式刷新过期基线；提交 SHA 改变后旧批准失效 |
+| `POST /api/v1/projects/{id}/changes/{change_id}/revert` | 为已合并改动生成新的待审阅回退变更 |
+
+`GET /api/v1/jobs` 支持 `scope=mine|team|all`，并按 owner、visibility、project_id 过滤；详情、SSE、取消和确认待办也按相同权限检查。远程 Hub 仅在 `--isolated` 下接受 Tailscale tailnet 请求，并要求有效的团队成员 token。启动、初始成员配置、冲突处理和 VenusChat 手工验收见 [`docs/collaboration-plan.md`](docs/collaboration-plan.md)。
 
 ### 记忆 API
 
@@ -445,12 +449,11 @@ src/subagent_router.py         子 Agent 智能路由（成本模型、信封、
 src/agent_memory.py            记忆系统（L0-L3 分层 + 动态 Skill + CodeGraph，见上节）
 scripts/            一键启动 .bat、start_wsl.sh、start_telegram.sh、systemd 单元
 static/index.html   网页控制台
-quant-agent-lab/    隔离的量化研究、策略调试、回测、MCP Apps GUI 与 Paper Trading 子项目
 local-quota-widget/ Windows 透明桌面组件：Cursor + Codex 剩余额度（凭据在 .local/，不入库）
 skills/             技能包（用户自建或插件安装：<名称>/SKILL.md）
 plugins/            插件 catalog 与内置包（bundled/）
 tests/              三十套自动测试 + 评测入口（含记忆系统 L0-L3/Skill/CodeGraph）
-.github/workflows/  CI（主 Agent 双平台 + RAG + 量化子项目独立验证）
+.github/workflows/  CI（主 Agent 双平台 + RAG 独立验证）
 chat_config.example.json   API 配置样例（无密钥，复制为 chat_config.json 后填 Key）
 mcp_config.example.json    MCP server 配置样例（无密钥，复制为 mcp_config.json 后填 token）
 chat_config.json    API 配置（含 Key，已 gitignore，别提交）
@@ -485,14 +488,11 @@ mcp_config.json     MCP server 配置（含 PAT，已 gitignore，别提交）
 .venv\Scripts\python tests\token_opt_test.py    # Token 优化基础模块（68 断言：能力/预算/压缩/检索/缓存/路由）
 .venv\Scripts\python tests\token_opt_integration_test.py # Token 优化集成（26 断言：去重/缓存/fetch/校验/usage）
 .venv\Scripts\python tests\settings_save_test.py # 设置保存回归（20 断言：下拉收集/显示匹配/候选地址）
-.venv\Scripts\python tests\quant_integration_test.py # 量化中心控制器（安全 URL/复用/进程归属/并发）
-.venv\Scripts\python tests\quant_gui_contract_test.py # 主 Chat 与量化 Dashboard 的 GUI 合同
-.venv\Scripts\python tests\quant_integration_e2e_test.py # 真实量化后端 + standalone GUI 联调
 .venv\Scripts\python tests\token_eval.py        # Token/质量评测（12 类匿名案例；--live 追加真实 API 对比）
 .venv\Scripts\python src\mock_llm.py            # 无 Key 时本地假 API 验证全链路
 ```
 
-推送后 GitHub Actions 会分别验证主 Agent（Windows + Ubuntu）、RAG 服务和隔离量化子项目；量化任务覆盖 29 个 Python 测试、静态检查、Dashboard 构建及 Node 合同测试。
+推送后 GitHub Actions 会分别验证主 Agent（Windows + Ubuntu）和 RAG 服务。
 
 注意：`.bat` 要 ASCII + CRLF，`.sh` 要 LF；Windows 控制台是 GBK，CLI 中文乱码先 `chcp 65001`。
 

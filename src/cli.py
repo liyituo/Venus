@@ -4,7 +4,7 @@ Venus CLI — 在 Linux 虚拟机 / 任意终端使用 Venus（零依赖，纯�
 
 通过 HTTP 连接 Windows 主机上运行的 llm_server（:8001）：
   - Agent 对话：模型可调用工具（click/type_text/press_key/…）操作主机屏幕
-  - 流式输出（打字机效果）+ 工具调用实时显示（ANSI 彩色，自动检测 TTY）
+  - 流式输出（打字机效果）+ 工具调用实时显示与可展开执行摘要（/trace）
   - 多会话管理（新建/切换/清空）
   - Ctrl+C 中止当前任务；/quit 退出
   - --once 单次模式（脚本/自动化调用）
@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -471,25 +472,41 @@ def _try_json(text: str) -> dict:
         return {"raw": text}
 
 
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)(['\"]?)(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|"
+    r"secret|authorization|cookie|credential)(['\"]?(?:\s*[:=]\s*|\s+)['\"]?)"
+    r"[^\s,;\"']+(['\"]?)"
+)
+
+
+def _redact_trace_text(value: str) -> str:
+    """隐藏常见凭据格式，避免终端步骤摘要回显工具输出中的秘密。"""
+    text = str(value or "")
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <已隐藏>", text)
+    text = _SECRET_TEXT_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}<已隐藏>{m.group(4)}", text)
+    return text
+
+
 def _summarize_result(result: str, ok: bool) -> str:
     """工具结果 UI 精简：成功显示 stdout 首行；失败只报简短原因，不刷原始 stderr。
     仅影响界面显示——完整结果仍由后端回传模型用于修正。"""
     try:
         d = json.loads(result)
     except Exception:
-        return (result or "").strip()[:60]
+        return _redact_trace_text((result or "").strip()[:60])
     if isinstance(d, dict):
         if ok:
             out = (d.get("stdout") or "").strip()
             if out:
                 lines = out.splitlines()
-                return lines[0][:60] + (" …" if len(lines) > 1 else "")
+                return _redact_trace_text(lines[0][:60]) + (" …" if len(lines) > 1 else "")
             return "完成"
         if d.get("error"):
-            return str(d["error"])[:60]
+            return _redact_trace_text(str(d["error"])[:60])
         rc = d.get("exit_code")
         return f"失败（exit {rc}）" if rc is not None else "失败"
-    return (result or "").strip()[:60]
+    return _redact_trace_text((result or "").strip()[:60])
 
 
 def _fmt_args(arguments: str, limit: int = 70) -> str:
@@ -498,11 +515,17 @@ def _fmt_args(arguments: str, limit: int = 70) -> str:
     try:
         args = json.loads(arguments or "{}")
     except Exception:
-        return str(arguments or "—")[:limit]
+        return _redact_trace_text(str(arguments or "—"))[:limit]
     if not isinstance(args, dict) or not args:
         return "—"
     parts = []
     for k, v in args.items():
+        normalized_key = str(k).lower().replace("-", "_")
+        if any(secret in normalized_key for secret in (
+                "token", "password", "secret", "api_key", "apikey",
+                "authorization", "cookie", "credential", "private_key")):
+            parts.append(f"{k}=<已隐藏>")
+            continue
         s = str(v)
         if k in ("text", "content", "code", "old", "new", "command", "prompt",
                  "task", "message", "steps"):
@@ -511,6 +534,21 @@ def _fmt_args(arguments: str, limit: int = 70) -> str:
             parts.append(f"{k}={s[:40]}")
     text = ", ".join(parts)
     return text[:limit] + (" …" if len(text) > limit else "")
+
+
+def _trace_label(entry: dict, index: int) -> str:
+    """返回可放进终端步骤菜单的一行短标签。"""
+    kind = entry.get("kind")
+    if kind == "tool":
+        state = entry.get("state") or "执行中"
+        result = entry.get("result") or ""
+        suffix = f" — {result}" if result else ""
+        return f"{index:02d}. {entry.get('name') or '工具'} · {state}{suffix}"[:110]
+    if kind == "confirm":
+        return f"{index:02d}. 用户确认 · {entry.get('result') or '已处理'}"[:110]
+    if kind == "todo":
+        return f"{index:02d}. 任务清单 · {entry.get('result') or '已更新'}"[:110]
+    return f"{index:02d}. {entry.get('title') or '执行步骤'}"[:110]
 
 
 def _fmt_time(ts) -> str:
@@ -553,6 +591,9 @@ class Cli:
         self.sessions: Dict[int, dict] = {}
         self.current = 0
         self._last_content = ""
+        self._trace_entries: List[dict] = []
+        self._trace_tool_entries: Dict[str, dict] = {}
+        self._trace_truncated = False
         self._compress_log: List[str] = []
         self.context_window = 65536
         self.available_tools: List[str] = []
@@ -617,8 +658,84 @@ class Cli:
         print(color("已清空当前会话历史", "cyan"))
 
     # ---- 事件渲染（紧凑模式：工具行单行显示，不刷长参数/长结果）----
+    def _add_trace(self, entry: dict) -> Optional[dict]:
+        """保存有界的可展示执行摘要；不保存模型隐藏推理或完整工具内容。"""
+        if len(self._trace_entries) >= 100:
+            if not self._trace_truncated:
+                self._trace_entries.append({
+                    "kind": "note", "title": "后续步骤过多，已省略；保留前 100 项"
+                })
+                self._trace_truncated = True
+            return None
+        self._trace_entries.append(entry)
+        return entry
+
+    def _print_trace_collapsed(self) -> None:
+        if self._trace_entries:
+            print(color(f"  ▸ 执行过程摘要（{len(self._trace_entries)} 项，输入 /trace 展开）", "dim"))
+
+    def show_trace(self, args: Optional[List[str]] = None) -> None:
+        entries = self._trace_entries
+        if not entries:
+            print(color("当前没有可展开的执行过程。", "dim"))
+            return
+
+        def show_one(index: int) -> None:
+            if not 0 <= index < len(entries):
+                print(color(f"步骤编号应在 1–{len(entries)} 之间。", "yellow"))
+                return
+            entry = entries[index]
+            print(color(f"  ▾ {_trace_label(entry, index + 1)}", "cyan"))
+            if entry.get("kind") == "tool":
+                print(color(f"      工具: {entry.get('name') or '—'}", "reset"))
+                if entry.get("step"):
+                    print(color(f"      Agent 轮次: {entry['step']} / {entry.get('max_steps') or '—'}", "dim"))
+                print(color(f"      参数: {entry.get('arguments') or '—'}", "dim"))
+                if entry.get("result"):
+                    print(color(f"      结果: {entry['result']}", "green" if entry.get("ok") else "yellow"))
+            elif entry.get("kind") in ("confirm", "todo", "note"):
+                print(color(f"      {entry.get('detail') or entry.get('result') or entry.get('title') or '—'}", "dim"))
+
+        if args:
+            target = args[0].lower()
+            if target in ("all", "全部"):
+                print(color("▾ 执行过程摘要（工具活动与任务事件）", "cyan"))
+                for i in range(len(entries)):
+                    show_one(i)
+                return
+            if target.isdigit():
+                show_one(int(target) - 1)
+                return
+            print(color("用法：/trace [all | 步骤编号]", "yellow"))
+            return
+
+        # 交互终端提供方向键步骤菜单；重定向/管道场景直接展开全部，方便日志查看。
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print(color("▾ 执行过程摘要（工具活动与任务事件）", "cyan"))
+            for i in range(len(entries)):
+                show_one(i)
+            return
+        options = ["展开全部"] + [_trace_label(entry, i + 1)
+                                   for i, entry in enumerate(entries)] + ["返回"]
+        selected = select_menu("执行过程摘要 · 方向键选择要展开的步骤", options)
+        if selected is None or selected == len(options) - 1:
+            return
+        if selected == 0:
+            self.show_trace(["all"])
+        else:
+            show_one(selected - 1)
+
     def on_event(self, kind: str, payload) -> Optional[str]:
         if kind == "tool_call":
+            arguments = _fmt_args(payload.get("arguments") or "", limit=240)
+            entry = self._add_trace({
+                "kind": "tool", "name": str(payload.get("name") or "工具")[:80],
+                "arguments": arguments, "step": payload.get("step"),
+                "max_steps": payload.get("max_steps"),
+                "state": "执行中", "ok": None, "result": "",
+            })
+            if entry is not None and payload.get("id"):
+                self._trace_tool_entries[str(payload["id"])] = entry
             arg_str = _fmt_args(payload.get("arguments") or "")
             step = payload.get("step")
             step_str = f"({step}/{payload.get('max_steps')})" if step else ""
@@ -626,6 +743,13 @@ class Cli:
         elif kind == "tool_result":
             ok = payload.get("ok")
             summary = _summarize_result(payload.get("result") or "", ok)
+            entry = self._trace_tool_entries.get(str(payload.get("id") or ""))
+            if entry is not None:
+                entry["ok"] = bool(ok)
+                entry["state"] = "完成" if ok else "失败"
+                entry["result"] = summary[:100]
+            else:
+                self._add_trace({"kind": "note", "title": "工具结果", "result": summary[:100]})
             print(color(f"    {'✓' if ok else '✗'} {summary}",
                         "green" if ok else "red"), flush=True)
         elif kind == "delta":
@@ -665,17 +789,30 @@ class Cli:
             try:
                 line = input(color("  选择 (数字 / yes / no，直接回车=允许): ", "bold")).strip()
             except (EOFError, KeyboardInterrupt):
-                return "no"   # 中断视为取消
+                choice = "no"   # 中断视为取消
+                self._add_trace({"kind": "confirm", "result": "已拒绝", "detail": "确认输入被中断，按拒绝处理"})
+                return choice
             if line.isdigit() and 1 <= int(line) <= len(options):
-                return options[int(line) - 1]
+                choice = options[int(line) - 1]
+                self._add_trace({"kind": "confirm", "result": "已允许" if str(choice).lower() in ("yes", "y", "允许") else "已拒绝"})
+                return choice
             # 只有明确的 no 才是拒绝；回车 / 其他输入一律允许
             if line.lower() in ("n", "no", "不", "否", "拒绝", "取消"):
+                self._add_trace({"kind": "confirm", "result": "已拒绝"})
                 return "no"
+            self._add_trace({"kind": "confirm", "result": "已允许"})
             return "yes"
         elif kind == "todo_update":
             todos = (payload or {}).get("todos") or []
             if not todos:
                 return None
+            counts: Dict[str, int] = {}
+            for todo in todos:
+                status = str(todo.get("status") or "pending")
+                counts[status] = counts.get(status, 0) + 1
+            summary = f"共 {len(todos)} 项：完成 {counts.get('completed', 0)}，进行中 {counts.get('in_progress', 0)}，待办 {counts.get('pending', 0)}"
+            if not self._trace_entries or self._trace_entries[-1].get("kind") != "todo" or self._trace_entries[-1].get("result") != summary:
+                self._add_trace({"kind": "todo", "result": summary})
             print()
             print(color("  ☑ 任务清单", "cyan"))
             for t in todos[-10:]:
@@ -707,9 +844,14 @@ class Cli:
                 self._compress_log.append(r.get("summary", ""))
             else:
                 print(color(f"  ◇ 压缩未执行：{r.get('stats', {}).get('reason', r.get('detail', '?'))}", "yellow"))
+        self._last_content = ""
+        self._trace_entries = []
+        self._trace_tool_entries = {}
+        self._trace_truncated = False
         print(color("  ◌ 思考中…", "dim"))
         err = self.client.stream_chat(snapshot, self.on_event)
         print()
+        self._print_trace_collapsed()
         # 持久化：user 消息必存；回复成功再存 assistant
         persist = [{"role": "user", "content": text}]
         if err:
@@ -908,6 +1050,8 @@ class Cli:
                 self.switch(int(parts[1]))
         elif cmd == "/clear":
             self.clear()
+        elif cmd == "/trace":
+            self.show_trace(parts[1:])
         elif cmd == "/stats":
             self.show_stats()
         elif cmd == "/status":
@@ -1203,6 +1347,8 @@ class Cli:
         print(color("  /sessions         列出全部会话", "reset"))
         print(color("  /switch <N>       切换到会话 N", "reset"))
         print(color("  /clear            清空当前会话历史", "reset"))
+        print(color("  /trace            展开最近一轮的执行过程摘要（方向键选择）", "reset"))
+        print(color("  /trace all        展开全部工具步骤", "reset"))
         print()
         print(color("== 状态与统计 ==", "cyan"))
         print(color("  /status           上下文容量（窗口/用量/剩余/压缩记录）", "reset"))
@@ -1305,8 +1451,12 @@ def main() -> int:
 
     if args.once:
         cli._last_content = ""
+        cli._trace_entries = []
+        cli._trace_tool_entries = {}
+        cli._trace_truncated = False
         err = cli.client.stream_chat([{"role": "user", "content": args.once}], cli.on_event)
         print()
+        cli._print_trace_collapsed()
         if err:
             print(color(f"✗ {err}", "red"))
             return 1

@@ -1,0 +1,21 @@
+[Unit]
+Description=Venus Hub (isolated, loopback behind Tailscale Serve)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/venus-hub
+EnvironmentFile=%h/.config/venus-hub/hub.env
+Environment=PYTHONUTF8=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=NO_PROXY=localhost,127.0.0.1
+ExecStart=%h/venus-hub/.venv/bin/python -u %h/venus-hub/src/llm_server.py --host 127.0.0.1 --port 8001 --isolated --team-serve --team-host ${VENUS_TEAM_HOST}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

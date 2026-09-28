@@ -13,7 +13,7 @@ from typing import Any
 from data_paths import data_dir
 
 _LOCK = threading.RLock()
-_PROJECT_STATUSES = frozenset({"active", "paused", "completed", "archived"})
+_PROJECT_STATUSES = frozenset({"pending_claim", "active", "paused", "completed", "archived", "expired"})
 _MILESTONE_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
 _MAX_CHECKPOINT_NOTE = 4000
 _MAX_GOAL = 2000
@@ -34,7 +34,10 @@ def _active_file() -> Path:
 
 
 def _project_dir(project_id: str) -> Path:
-    return _projects_root() / project_id
+    pid = str(project_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-\u4e00-\u9fff]{1,80}", pid):
+        return _projects_root() / "__invalid_project_id__"
+    return _projects_root() / pid
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -77,15 +80,35 @@ def _save_index(data: dict) -> None:
     _write_json(_index_file(), data)
 
 
-def get_active_project_id() -> str:
+def get_active_project_id(*, user_id: str = "", device_id: str = "") -> str:
+    if user_id or device_id:
+        if not user_id or not device_id:
+            return ""
+        try:
+            import project_access
+            return project_access.get_active_project(user_id, device_id)
+        except Exception:
+            # A configured Serve Hub fails closed rather than falling back to
+            # another user's legacy global active-project file.
+            return ""
     data = _read_json(_active_file(), {})
     if isinstance(data, dict):
         return str(data.get("project_id") or "").strip()
     return ""
 
 
-def set_active_project(project_id: str) -> tuple[bool, str]:
+def set_active_project(project_id: str, *, user_id: str = "", device_id: str = "") -> tuple[bool, str]:
     pid = (project_id or "").strip()
+    if user_id or device_id:
+        if not user_id or not device_id:
+            return False, "user_id 和 device_id 必须同时提供"
+        try:
+            import project_access
+            project_access.set_active_project(pid, user_id=user_id, device_id=device_id)
+            return True, pid or "（无活跃项目）"
+        except Exception as exc:
+            detail = getattr(exc, "detail", "项目活跃状态无法保存")
+            return False, str(detail)
     if pid and _project_dir(pid).joinpath("meta.json").exists() is False:
         return False, f"项目不存在：{pid}"
     _write_json(_active_file(), {"project_id": pid, "updated": int(time.time())})
@@ -97,6 +120,11 @@ def list_projects(status: str | None = None) -> list[dict]:
         items = list(_load_index().get("projects") or [])
     if status:
         items = [p for p in items if p.get("status") == status]
+    for item in items:
+        meta = _read_json(_project_dir(str(item.get("id") or "")) / "meta.json", {})
+        if isinstance(meta, dict):
+            item.setdefault("owner_id", meta.get("owner_id") or "owner")
+            item.setdefault("owner_name", meta.get("owner_name") or "Owner")
     return sorted(items, key=lambda p: p.get("updated", 0), reverse=True)
 
 
@@ -145,6 +173,13 @@ def create_project(
     milestones: list[dict] | None = None,
     *,
     is_team: bool = False,
+    owner_id: str = "owner",
+    owner_name: str = "Owner",
+    creator_id: str = "",
+    creator_device_id: str = "",
+    status: str = "active",
+    description: str | None = None,
+    access_control_managed: bool = False,
 ) -> tuple[bool, str | dict]:
     title = (title or "").strip()
     goal = (goal or "").strip()[:_MAX_GOAL]
@@ -154,12 +189,24 @@ def create_project(
         return False, "title 过长（≤200 字符）"
     pid = _slug_id(title)
     now = int(time.time())
+    state = str(status or "active").strip()
+    if state not in _PROJECT_STATUSES:
+        return False, f"无效状态：{state}"
+    summary_text = goal if description is None else (str(description or "").strip()[:_MAX_GOAL])
     meta = {
         "id": pid,
         "title": title,
+        "name": title,
         "goal": goal,
-        "status": "active",
+        "description": summary_text,
+        "status": state,
         "is_team": bool(is_team),
+        "owner_id": "" if state == "pending_claim" else str(owner_id or "owner"),
+        "owner_name": str(owner_name or owner_id or "Owner"),
+        "creator_user_id": str(creator_id or owner_id or "owner"),
+        "creator_device_id": str(creator_device_id or ""),
+        "creator_name": str(owner_name or owner_id or "Owner"),
+        "access_control_managed": bool(access_control_managed),
         "created": now,
         "updated": now,
     }
@@ -183,7 +230,7 @@ def create_project(
         _write_json(_project_dir(pid) / "milestones.json", ms)
         _write_json(_project_dir(pid) / "linked_todos.json", [])
         idx = _load_index()
-        summary = {k: meta[k] for k in ("id", "title", "goal", "status", "is_team", "created", "updated")}
+        summary = {k: meta[k] for k in ("id", "title", "name", "goal", "description", "status", "is_team", "owner_id", "owner_name", "creator_user_id", "creator_device_id", "created", "updated")}
         summary["milestone_count"] = len(ms)
         idx["projects"].append(summary)
         _save_index(idx)
@@ -196,10 +243,26 @@ def update_project(project_id: str, **fields: Any) -> tuple[bool, str | dict]:
     if proj is None:
         return False, f"项目不存在：{pid}"
     meta = proj["meta"]
+    if str(meta.get("status") or "") == "archived":
+        requested_status = str(fields.get("status", "archived") or "").strip()
+        if any(key != "status" for key in fields) or requested_status != "archived":
+            return False, "归档项目只读且不能重新激活"
     if "title" in fields and fields["title"]:
         meta["title"] = str(fields["title"]).strip()[:_MAX_TITLE]
+        meta["name"] = meta["title"]
     if "goal" in fields:
         meta["goal"] = str(fields["goal"] or "").strip()[:_MAX_GOAL]
+        meta["description"] = meta["goal"]
+    if "name" in fields and fields["name"]:
+        meta["name"] = str(fields["name"]).strip()[:_MAX_TITLE]
+        meta["title"] = meta["name"]
+    if "description" in fields:
+        meta["description"] = str(fields["description"] or "").strip()[:_MAX_GOAL]
+        meta["goal"] = meta["description"]
+    if "owner_id" in fields:
+        meta["owner_id"] = str(fields["owner_id"] or "")
+    if "owner_name" in fields:
+        meta["owner_name"] = str(fields["owner_name"] or "")
     if "status" in fields:
         st = str(fields["status"] or "").strip()
         if st not in _PROJECT_STATUSES:
@@ -213,7 +276,9 @@ def update_project(project_id: str, **fields: Any) -> tuple[bool, str | dict]:
         idx = _load_index()
         for item in idx.get("projects") or []:
             if item.get("id") == pid:
-                item.update({k: meta[k] for k in ("title", "goal", "status", "is_team", "updated")})
+                item.update({k: meta[k] for k in (
+                    "title", "name", "goal", "description", "status", "is_team",
+                    "owner_id", "owner_name", "updated")})
         _save_index(idx)
     return True, {"updated": meta}
 
@@ -223,6 +288,8 @@ def add_milestone(project_id: str, title: str, notes: str = "") -> tuple[bool, s
     proj = get_project(pid, include_checkpoints=0)
     if proj is None:
         return False, f"项目不存在：{pid}"
+    if str((proj.get("meta") or {}).get("status") or "") == "archived":
+        return False, "归档项目只读且不能重新激活"
     label = (title or "").strip()[:120]
     if not label:
         return False, "title 不能为空"
@@ -246,6 +313,8 @@ def update_milestone(
     proj = get_project(pid, include_checkpoints=0)
     if proj is None:
         return False, f"项目不存在：{pid}"
+    if str((proj.get("meta") or {}).get("status") or "") == "archived":
+        return False, "归档项目只读且不能重新激活"
     ms = proj["milestones"]
     found = None
     for m in ms:
@@ -277,6 +346,8 @@ def save_checkpoint(
     proj = get_project(pid, include_checkpoints=0)
     if proj is None:
         return False, f"项目不存在：{pid}"
+    if str((proj.get("meta") or {}).get("status") or "") == "archived":
+        return False, "归档项目只读且不能重新激活"
     text = (summary or "").strip()
     if not text:
         return False, "summary 不能为空"
@@ -297,6 +368,8 @@ def link_todo(project_id: str, todo_id: int) -> tuple[bool, str | dict]:
     proj = get_project(pid, include_checkpoints=0)
     if proj is None:
         return False, f"项目不存在：{pid}"
+    if str((proj.get("meta") or {}).get("status") or "") == "archived":
+        return False, "归档项目只读且不能重新激活"
     try:
         tid = int(todo_id)
     except (TypeError, ValueError):

@@ -72,6 +72,39 @@ def catalog_entry(plugin_id: str) -> dict | None:
     return None
 
 
+def _entry_permissions(entry: dict) -> list[str]:
+    perms = entry.get("permissions")
+    if isinstance(perms, list) and perms:
+        return [str(p) for p in perms if str(p).strip()][:20]
+    # 回退：从插件 manifest.json 读取
+    src = _plugin_source_dir(entry)
+    if src is not None:
+        manifest = _read_json(src / "manifest.json", {})
+        if isinstance(manifest, dict):
+            perms = manifest.get("permissions")
+            if isinstance(perms, list) and perms:
+                return [str(p) for p in perms if str(p).strip()][:20]
+    # 按类型给默认声明（DISPLAY ONLY：实际执行仍走沙箱 + 确认流）
+    ptype = str(entry.get("type") or "")
+    if ptype == "mcp":
+        return ["network", "run_commands"]
+    if ptype == "skill":
+        return ["read_files"]
+    if ptype == "agent":
+        return ["read_files"]
+    return []
+
+
+def _risk_of(perms: list[str]) -> str:
+    high = {"run_commands", "write_files", "mcp", "system"}
+    medium = {"network", "browser"}
+    if any(p in high for p in perms):
+        return "high"
+    if any(p in medium for p in perms):
+        return "medium"
+    return "low"
+
+
 def list_extensions() -> dict:
     catalog = load_catalog()
     state = load_state()
@@ -81,11 +114,14 @@ def list_extensions() -> dict:
     items = []
     for entry in catalog:
         pid = entry["id"]
+        perms = _entry_permissions(entry)
         items.append({
             **{k: entry.get(k) for k in ("id", "name", "version", "type", "description", "author")},
             "builtin": bool(entry.get("builtin")),
             "installed": pid in installed_ids or bool(entry.get("builtin")),
             "enabled": pid in enabled,
+            "permissions": perms,
+            "risk": _risk_of(perms),
         })
     return {"ok": True, "extensions": items, "enabled": sorted(enabled)}
 

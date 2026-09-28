@@ -51,8 +51,10 @@ def _dpapi_protect(data: bytes) -> bytes:
     crypt32.CryptProtectData.argtypes = [
         ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB)]
-    blob_in = DATA_BLOB(len(data), ctypes.cast(
-        ctypes.create_string_buffer(data), ctypes.c_void_p))
+    # 注意：buffer 必须保存在局部变量中，否则临时对象在本语句结束即被释放，
+    # blob_in 变成悬空指针（偶发加解密失败 / 存下损坏密钥）。
+    _protect_buf = ctypes.create_string_buffer(data)
+    blob_in = DATA_BLOB(len(data), ctypes.cast(_protect_buf, ctypes.c_void_p))
     blob_out = DATA_BLOB()
     if not crypt32.CryptProtectData(ctypes.byref(blob_in), None, None, None,
                                     None, 0, ctypes.byref(blob_out)):
@@ -75,8 +77,8 @@ def _dpapi_unprotect(data: bytes) -> bytes:
     crypt32.CryptUnprotectData.argtypes = [
         ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB)]
-    blob_in = DATA_BLOB(len(data), ctypes.cast(
-        ctypes.create_string_buffer(data), ctypes.c_void_p))
+    _unprotect_buf = ctypes.create_string_buffer(data)
+    blob_in = DATA_BLOB(len(data), ctypes.cast(_unprotect_buf, ctypes.c_void_p))
     blob_out = DATA_BLOB()
     if not crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None,
                                       None, 0, ctypes.byref(blob_out)):
@@ -168,7 +170,7 @@ def store(key: str, value: str) -> None:
 
 
 def load(key: str) -> str:
-    """读取密钥；不存在返回 ''。"""
+    """读取密钥；不存在返回 ''。DPAPI 偶发系统级失败时重试 3 次。"""
     global _loaded
     with _store_lock:
         if not _loaded:
@@ -176,11 +178,20 @@ def load(key: str) -> str:
         enc = _secrets.get(key, "")
         if not enc:
             return ""
-        try:
-            return _decode(enc)
-        except Exception as exc:
-            log.warning("密钥 %s 解密失败：%s", key, exc)
-            return ""
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                return _decode(enc)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    try:
+                        import time as _time
+                        _time.sleep(0.05 * (attempt + 1))
+                    except Exception:
+                        pass
+        log.warning("密钥 %s 解密失败：%s", key, last_exc)
+        return ""
 
 
 def delete(key: str) -> None:

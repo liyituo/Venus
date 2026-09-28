@@ -118,11 +118,11 @@ def _pointer_inside(widget: tk.Misc) -> bool:
         return False
 
 
-def _alive(widget: tk.Misc) -> bool:
+def _alive(widget: tk.Misc | None) -> bool:
     """winfo_exists() itself raises on destroyed widgets; this never does."""
     try:
         return bool(widget.winfo_exists())
-    except tk.TclError:
+    except (AttributeError, tk.TclError):
         return False
 
 
@@ -150,7 +150,7 @@ class FlatButton(tk.Canvas):
         variant: str = "ghost",
         height: int = 34,
         padx: int = 15,
-        radius: int = 8,
+        radius: int = 10,
         parent_bg: str | None = None,
         min_width: int = 0,
         anchor: str = "center",
@@ -180,7 +180,11 @@ class FlatButton(tk.Canvas):
         self.hovered = False
         self.pressed = False
         self.active = False
+        self.focused = False
         self._photo: "ImageTk.PhotoImage | None" = None
+        self._image_cache: dict[tuple[int, int, str, str], "ImageTk.PhotoImage"] = {}
+        self._image_size: tuple[int, int] | None = None
+        self._render_signature: tuple | None = None
         self._settle_job: str | None = None
         self._label = tk.Label(self, text=text, bg=self.parent_bg, font=self.font, cursor="hand2")
         self.bind("<Configure>", self._render, add="+")
@@ -192,8 +196,10 @@ class FlatButton(tk.Canvas):
         self.bind("<Leave>", self._leave, add="+")
         self.bind("<ButtonPress-1>", self._press, add="+")
         self.bind("<ButtonRelease-1>", self._release, add="+")
-        self.bind("<space>", lambda _event: self.invoke(), add="+")
-        self.bind("<Return>", lambda _event: self.invoke(), add="+")
+        self.bind("<space>", self._keyboard_invoke, add="+")
+        self.bind("<Return>", self._keyboard_invoke, add="+")
+        self.bind("<FocusIn>", lambda _event: self._focus_changed(True), add="+")
+        self.bind("<FocusOut>", lambda _event: self._focus_changed(False), add="+")
         self._render()
 
     def _palette(self) -> tuple[str, str, str]:
@@ -202,12 +208,15 @@ class FlatButton(tk.Canvas):
         if not self.enabled:
             return t.SURFACE_ALT, t.INK_FAINT, t.LINE_FAINT
         if self.pressed:
-            return pressed, ink, hover_line or line or pressed
-        if self.hovered or self.active:
+            fill, border = pressed, hover_line or line or pressed
+        elif self.hovered or self.active:
             if self.active and self.variant == "ghost":
-                return t.TERRACOTTA_SOFT, t.TERRACOTTA, t.TERRACOTTA_SOFT
-            return hover, ink, hover_line or line or hover
-        return base, ink, line or base
+                fill, ink, border = t.TERRACOTTA_SOFT, t.TERRACOTTA, t.TERRACOTTA_SOFT
+            else:
+                fill, border = hover, hover_line or line or hover
+        else:
+            fill, border = base, line or base
+        return fill, ink, t.TERRACOTTA if self.focused else border
 
     def _enter(self, _event=None) -> None:
         if self._settle_job:
@@ -221,6 +230,8 @@ class FlatButton(tk.Canvas):
             self._render()
 
     def _leave(self, _event=None) -> None:
+        if self._settle_job:
+            self.after_cancel(self._settle_job)
         self._settle_job = self.after(24, self._settle)
 
     def _settle(self) -> None:
@@ -233,6 +244,7 @@ class FlatButton(tk.Canvas):
     def _press(self, _event=None) -> None:
         if self.enabled:
             self.pressed = True
+            self.focus_set()
             self._render()
 
     def _release(self, _event=None) -> None:
@@ -247,10 +259,21 @@ class FlatButton(tk.Canvas):
             return
         w, h = _canvas_size(self, int(self.cget("width")), self.height_px)
         fill, ink, line = self._palette()
+        signature = (w, h, fill, ink, line, self.text, self.anchor)
+        if signature == self._render_signature:
+            return
+        self._render_signature = signature
         self.delete("all")
         if HAS_PIL:
-            self._photo = ImageTk.PhotoImage(
-                _rounded_image(w, h, self.radius, fill, line or None, 1 if line else 0))
+            if self._image_size != (w, h):
+                self._image_cache.clear()
+                self._image_size = (w, h)
+            key = (w, h, fill, line)
+            self._photo = self._image_cache.get(key)
+            if self._photo is None:
+                self._photo = ImageTk.PhotoImage(
+                    _rounded_image(w, h, self.radius, fill, line or None, 1 if line else 0))
+                self._image_cache[key] = self._photo
             self.create_image(0, 0, image=self._photo, anchor="nw")
         else:
             rounded_rect(self, 1, 1, w - 1, h - 1, self.radius,
@@ -272,6 +295,14 @@ class FlatButton(tk.Canvas):
         if self.enabled and callable(self.command):
             self.command()
 
+    def _keyboard_invoke(self, _event=None) -> str:
+        self.invoke()
+        return "break"
+
+    def _focus_changed(self, focused: bool) -> None:
+        self.focused = focused
+        self._render()
+
     def set_text(self, text: str) -> None:
         self.text = text
         super().configure(width=max(self.min_width, self.font.measure(text) + self.padx * 2 + 2))
@@ -283,7 +314,11 @@ class FlatButton(tk.Canvas):
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
+        if not self.enabled:
+            self.hovered = False
+            self.pressed = False
         self.configure(cursor="hand2" if enabled else "arrow")
+        self._label.configure(cursor="hand2" if enabled else "arrow")
         self._render()
 
 
@@ -317,53 +352,113 @@ class RoundButton(tk.Canvas):
         )
         self.hovered = False
         self.pressed = False
+        self.enabled = True
+        self.focused = False
         self._photo: "ImageTk.PhotoImage | None" = None
+        self._image_cache: dict[tuple[int, str], "ImageTk.PhotoImage"] = {}
+        self._image_size: int | None = None
+        self._draw_signature: tuple | None = None
+        self._settle_job: str | None = None
         self._label = tk.Label(self, text=glyph, font=self.font, fg=t.ON_ACCENT,
                                bg=t.TERRACOTTA, cursor="hand2")
         self.bind("<Configure>", self._draw, add="+")
         for widget in (self, self._label):
             widget.bind("<Enter>", lambda _e: self._set_state(True, self.pressed), add="+")
             widget.bind("<Leave>", self._leave, add="+")
-            widget.bind("<ButtonPress-1>", lambda _e: self._set_state(True, True), add="+")
+            widget.bind("<ButtonPress-1>", self._press, add="+")
             widget.bind("<ButtonRelease-1>", self._release, add="+")
-        self.bind("<Return>", lambda _e: self.command(), add="+")
+        self.bind("<Return>", self._keyboard_invoke, add="+")
+        self.bind("<space>", self._keyboard_invoke, add="+")
+        self.bind("<FocusIn>", lambda _event: self._focus_changed(True), add="+")
+        self.bind("<FocusOut>", lambda _event: self._focus_changed(False), add="+")
         self._draw()
 
     def _set_state(self, hover: bool, press: bool) -> None:
+        if not self.enabled:
+            return
+        if (self.hovered, self.pressed) == (hover, press):
+            return
         self.hovered, self.pressed = hover, press
         self._draw()
 
+    def _press(self, _event=None) -> None:
+        if self.enabled:
+            self.focus_set()
+            self._set_state(True, True)
+
     def _leave(self, _event=None) -> None:
-        self.after(24, self._settle)
+        if self._settle_job:
+            self.after_cancel(self._settle_job)
+        self._settle_job = self.after(24, self._settle)
 
     def _settle(self) -> None:
+        self._settle_job = None
         if not _pointer_inside(self):
             self._set_state(False, False)
 
     def _release(self, _event=None) -> None:
         was_pressed = self.pressed
         self._set_state(self.hovered, False)
-        if was_pressed and _pointer_inside(self):
+        if was_pressed and self.enabled and _pointer_inside(self):
+            self.invoke()
+
+    def invoke(self) -> None:
+        if self.enabled and callable(self.command):
             self.command()
+
+    def _keyboard_invoke(self, _event=None) -> str:
+        self.invoke()
+        return "break"
+
+    def _focus_changed(self, focused: bool) -> None:
+        self.focused = focused
+        self._draw()
 
     def _draw(self, _event=None) -> None:
         if not _alive(self):
             return
         size = min(_canvas_size(self, self.size_px, self.size_px))
-        fill = t.TERRACOTTA_PRESS if self.pressed else (
-            t.TERRACOTTA_HOVER if self.hovered else t.TERRACOTTA)
+        if not self.enabled:
+            fill = t.LINE_STRONG
+        else:
+            fill = t.TERRACOTTA_PRESS if self.pressed else (
+                t.TERRACOTTA_HOVER if self.hovered else t.TERRACOTTA)
+        ink = t.ON_ACCENT if self.enabled else t.INK_SOFT
+        signature = (size, fill, ink, self.glyph, self.focused)
+        if signature == self._draw_signature:
+            return
+        self._draw_signature = signature
         self.delete("all")
         if HAS_PIL:
-            self._photo = ImageTk.PhotoImage(_circle_image(size, fill, inset=2))
+            if self._image_size != size:
+                self._image_cache.clear()
+                self._image_size = size
+            key = (size, fill)
+            self._photo = self._image_cache.get(key)
+            if self._photo is None:
+                self._photo = ImageTk.PhotoImage(_circle_image(size, fill, inset=2))
+                self._image_cache[key] = self._photo
             self.create_image(size / 2, size / 2, image=self._photo, anchor="center")
         else:
             self.create_oval(2, 2, size - 2, size - 2, fill=fill, outline=fill)
             self._label.place_forget()
             self.create_text(size / 2, size / 2 - 1, text=self.glyph,
-                             fill=t.ON_ACCENT, font=self.font)
-            return
-        self._label.configure(bg=fill)
-        self._label.place(x=size / 2, y=size / 2 - 1, anchor="center")
+                             fill=ink,
+                             font=self.font)
+        if HAS_PIL:
+            self._label.configure(bg=fill, fg=ink)
+            self._label.place(x=size / 2, y=size / 2 - 1, anchor="center")
+        if self.focused and self.enabled:
+            self.create_oval(1, 1, size - 2, size - 2, outline=t.TERRACOTTA, width=1)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            self.hovered = False
+            self.pressed = False
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self._label.configure(cursor="hand2" if enabled else "arrow")
+        self._draw()
 
 
 class Dot(tk.Canvas):
@@ -524,7 +619,9 @@ class HoverSurface(tk.Frame):
 
     def set_active(self, active: bool) -> None:
         self.active = bool(active)
-        self.configure(highlightbackground=self.active_line if active else self.resting_line)
+        self.configure(highlightbackground=(
+            self.active_line if active else
+            self.hover_line if _pointer_inside(self) else self.resting_line))
 
 
 class MinimalField(HoverSurface):
@@ -594,11 +691,11 @@ class MinimalField(HoverSurface):
         self.after_idle(self._update_hint)
 
     def _focus_in(self, _event=None) -> None:
-        self.configure(highlightbackground=t.TERRACOTTA)
+        self.set_active(True)
         self._update_hint()
 
     def _focus_out(self, _event=None) -> None:
-        self.configure(highlightbackground=self.resting_line)
+        self.set_active(False)
         self._update_hint()
 
     def _update_hint(self, *_args) -> None:
@@ -635,6 +732,7 @@ class SelectField(HoverSurface):
         bg: str = t.SURFACE,
     ) -> None:
         super().__init__(parent, bg=bg, resting_line=t.LINE, hover_line=t.LINE_STRONG)
+        self.configure(takefocus=1)
         self.values = list(values)
         self._font = font
         self.variable = tk.StringVar(value=value or (self.values[0] if self.values else ""))
@@ -661,24 +759,40 @@ class SelectField(HoverSurface):
         for widget in (self, self.label, self.arrow):
             widget.bind("<Button-1>", self._open_menu, add="+")
         self.watch(self.label, self.arrow)
+        for sequence in ("<Return>", "<space>", "<Down>"):
+            self.bind(sequence, self._keyboard_open, add="+")
+
+    def _keyboard_open(self, _event=None) -> str:
+        self._open_menu()
+        return "break"
 
     def _open_menu(self, _event=None) -> None:
         from types import SimpleNamespace
         if not self.values:
             return
-        self.configure(highlightbackground=t.TERRACOTTA)
+        self.focus_set()
+        self.set_active(True)
         fonts = SimpleNamespace(small=self._font, kicker=self._font)
         items = [{"label": v, "current": v == self.variable.get()}
                  for v in self.values]
 
         def choose(index: int) -> None:
             self.variable.set(self.values[index])
-            self.configure(highlightbackground=self.resting_line)
 
-        MenuPopup(self, items, fonts, choose, min_width=170)
+        popup = MenuPopup(self, items, fonts, choose, min_width=170)
+
+        def restore_border(event: tk.Event) -> None:
+            if event.widget is popup and _alive(self):
+                self.set_active(False)
+
+        popup.bind("<Destroy>", restore_border, add="+")
 
     def get(self) -> str:
         return self.variable.get()
+
+    def set_values(self, values: Iterable[str]) -> None:
+        """Replace the dropdown options (e.g. models fetched from a provider)."""
+        self.values = list(values)
 
 
 class SearchField(MinimalField):
@@ -735,10 +849,26 @@ class Switch(tk.Canvas):
         self.value = bool(value)
         self.command = command
         self._pos = 1.0 if value else 0.0
+        self.focused = False
         self._job: str | None = None
         self._photo: "ImageTk.PhotoImage | None" = None
-        self.bind("<Button-1>", lambda _event: self.toggle(), add="+")
-        self.bind("<space>", lambda _event: self.toggle(), add="+")
+        self.bind("<Button-1>", self._click, add="+")
+        self.bind("<space>", self._keyboard_toggle, add="+")
+        self.bind("<Return>", self._keyboard_toggle, add="+")
+        self.bind("<FocusIn>", lambda _event: self._focus_changed(True), add="+")
+        self.bind("<FocusOut>", lambda _event: self._focus_changed(False), add="+")
+        self._draw()
+
+    def _click(self, _event=None) -> None:
+        self.focus_set()
+        self.toggle()
+
+    def _keyboard_toggle(self, _event=None) -> str:
+        self.toggle()
+        return "break"
+
+    def _focus_changed(self, focused: bool) -> None:
+        self.focused = focused
         self._draw()
 
     def toggle(self) -> None:
@@ -790,6 +920,9 @@ class Switch(tk.Canvas):
             x = (11 + 19 * self._pos) * u
             self.create_oval(x - 7 * u, 5 * u, x + 7 * u, 19 * u,
                              fill=t.SURFACE, outline=t.SURFACE)
+            if self.focused:
+                rounded_rect(self, 1, 1, self.W - 1, self.H - 1,
+                             11 * u, fill="", outline=t.TERRACOTTA)
             return
         img = Image.new("RGBA", (self.W * _SS, self.H * _SS), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
@@ -801,6 +934,9 @@ class Switch(tk.Canvas):
         d.ellipse([x - 7 * sc, 5 * sc, x + 7 * sc, 19 * sc], fill="#FFFFFF")
         self._photo = ImageTk.PhotoImage(img.resize((self.W, self.H), Image.LANCZOS))
         self.create_image(0, 0, image=self._photo, anchor="nw")
+        if self.focused:
+            rounded_rect(self, 1, 1, self.W - 1, self.H - 1,
+                         11 * u, fill="", outline=t.TERRACOTTA)
 
 
 class SegmentedControl(tk.Frame):
@@ -816,7 +952,8 @@ class SegmentedControl(tk.Frame):
         command: Callable[[str], object] | None = None,
         bg: str = t.CANVAS,
     ) -> None:
-        super().__init__(parent, bg=t.SURFACE, highlightthickness=1, highlightbackground=t.LINE)
+        super().__init__(parent, bg=t.SURFACE, highlightthickness=1,
+                         highlightbackground=t.LINE, takefocus=1)
         self.values = list(values)
         self.value = value or (self.values[0] if self.values else "")
         self.command = command
@@ -835,11 +972,28 @@ class SegmentedControl(tk.Frame):
                 pady=t.s(8),
             )
             label.pack(side="left", fill="both", expand=True)
-            label.bind("<Button-1>", lambda _event, selected=item: self.set(selected), add="+")
+            label.bind("<Button-1>", lambda _event, selected=item: self._choose(selected), add="+")
             label.bind("<Enter>", lambda _event, selected=item: self._hover(selected, True), add="+")
             label.bind("<Leave>", lambda _event, selected=item: self._hover(selected, False), add="+")
             self.labels[item] = label
+        self.bind("<Left>", lambda _event: self._move(-1), add="+")
+        self.bind("<Right>", lambda _event: self._move(1), add="+")
+        self.bind("<FocusIn>", lambda _event: self.configure(
+            highlightbackground=t.TERRACOTTA), add="+")
+        self.bind("<FocusOut>", lambda _event: self.configure(
+            highlightbackground=t.LINE), add="+")
         self._render()
+
+    def _choose(self, value: str) -> None:
+        self.focus_set()
+        self.set(value)
+
+    def _move(self, delta: int) -> str:
+        if self.values:
+            index = (self.values.index(self.value) if self.value in self.values
+                     else (-1 if delta > 0 else 0))
+            self.set(self.values[(index + delta) % len(self.values)])
+        return "break"
 
     def _hover(self, item: str, entered: bool) -> None:
         if item != self.value:
@@ -854,7 +1008,7 @@ class SegmentedControl(tk.Frame):
             )
 
     def set(self, value: str) -> None:
-        if value not in self.labels:
+        if value not in self.labels or value == self.value:
             return
         self.value = value
         self._render()
@@ -879,11 +1033,13 @@ class NavRow(tk.Frame):
         height: int = 38,
         bg: str = t.SIDEBAR,
     ) -> None:
-        super().__init__(parent, bg=bg, height=t.s(height), cursor="hand2")
+        super().__init__(parent, bg=bg, height=t.s(height), cursor="hand2",
+                         takefocus=1)
         self.pack_propagate(False)
         self.base_bg = bg
         self.command = command
         self.active = False
+        self.focused = False
         self.marker = tk.Frame(self, bg=bg, width=2)
         self.marker.pack(side="left", fill="y")
         self.icon = None
@@ -906,19 +1062,36 @@ class NavRow(tk.Frame):
                         padx=(t.s(10) if self.icon is None else t.s(2), t.s(10)))
         children = [self, self.marker, self.label] + ([self.icon] if self.icon else [])
         for widget in children:
-            widget.bind("<Button-1>", lambda _event: self.command(), add="+")
+            widget.bind("<Button-1>", self._click, add="+")
             widget.bind("<Enter>", lambda _event: self._hover(True), add="+")
             widget.bind("<Leave>", lambda _event: self.after(16, self._settle), add="+")
+        self.bind("<Return>", self._keyboard_invoke, add="+")
+        self.bind("<space>", self._keyboard_invoke, add="+")
+        self.bind("<FocusIn>", lambda _event: self._focus_changed(True), add="+")
+        self.bind("<FocusOut>", lambda _event: self._focus_changed(False), add="+")
+
+    def _click(self, _event=None) -> None:
+        self.focus_set()
+        self.command()
+
+    def _keyboard_invoke(self, _event=None) -> str:
+        self.command()
+        return "break"
+
+    def _focus_changed(self, focused: bool) -> None:
+        self.focused = focused
+        if _alive(self):
+            self._hover(focused)
 
     def _settle(self) -> None:
         try:
-            if not _pointer_inside(self):
+            if not _pointer_inside(self) and not self.focused:
                 self._hover(False)
         except tk.TclError:
             pass
 
     def _hover(self, entered: bool) -> None:
-        bg = t.ACTIVE if self.active else (t.HOVER if entered else self.base_bg)
+        bg = t.ACTIVE if self.active else (t.HOVER if entered or self.focused else self.base_bg)
         ink = t.TERRACOTTA if self.active else t.INK_SOFT
         widgets = [self, self.label] + ([self.icon] if self.icon else [])
         for widget in widgets:
@@ -973,20 +1146,32 @@ class ScrollArea(tk.Frame):
             self.scrollbar = ttk.Scrollbar(
                 self,
                 orient="vertical",
-                command=self.canvas.yview,
+                command=self._scrollbar_yview,
                 style="Venus.Vertical.TScrollbar",
             )
             self.canvas.configure(yscrollcommand=self._on_yview)
+        self.on_user_scroll: Callable[[], None] | None = None
         self.inner.bind("<Configure>", self._sync_region, add="+")
         self.canvas.bind("<Configure>", self._sync_width, add="+")
         self.canvas.bind("<Enter>", self._enter, add="+")
         self.canvas.bind("<Leave>", self._leave, add="+")
         self.inner.bind("<Enter>", self._enter, add="+")
         self.inner.bind("<Leave>", self._leave, add="+")
-        # Permanent global wheel hook, pointer-guarded.  (The old code called
-        # unbind_class() with an illegal fourth argument on every leave, which
-        # spammed tracebacks; a guarded handler never needs to be removed.)
-        self.canvas.bind_all("<MouseWheel>", self._wheel, add="+")
+        self._wheel_residue = 0.0
+        self._wheel_root = self.winfo_toplevel()
+        self._wheel_binding = self._wheel_root.bind(
+            "<MouseWheel>", self._wheel, add="+")
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        try:
+            if self._wheel_binding and _alive(self._wheel_root):
+                self._wheel_root.unbind("<MouseWheel>", self._wheel_binding)
+                self._wheel_binding = None
+        except tk.TclError:
+            pass
 
     def _sync_region(self, _event=None) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -1002,6 +1187,11 @@ class ScrollArea(tk.Frame):
                     self.scrollbar.pack_forget()   # 仅当完全无溢出
             except (TypeError, ValueError):
                 pass
+
+    def _scrollbar_yview(self, *args) -> None:
+        self.canvas.yview(*args)
+        if self.on_user_scroll is not None:
+            self.on_user_scroll()
 
     def _enter(self, _event=None) -> None:
         if self.scrollbar is not None:
@@ -1025,7 +1215,13 @@ class ScrollArea(tk.Frame):
             if first <= 0.0 and last >= 1.0:
                 return None      # 内容未超过视口：完全不滚
             if event.delta:
-                self.canvas.yview_scroll(-int(event.delta / 120) * 3, "units")
+                self._wheel_residue += -event.delta / 120 * 3
+                steps = int(self._wheel_residue)
+                if steps:
+                    self._wheel_residue -= steps
+                    self.canvas.yview_scroll(steps, "units")
+                    if self.on_user_scroll is not None:
+                        self.on_user_scroll()
             return "break"
         return None
 
@@ -1093,31 +1289,45 @@ class ProgressBar(tk.Canvas):
         self._job = None
         if not _alive(self) or not self._indeterminate:
             return
-        self._pos = (self._pos + 0.035) % 1.4 - 0.2
-        self._draw()
-        self._job = self.after(40, self._step)
+        if self.winfo_ismapped():
+            self._pos += 0.07
+            if self._pos > 1.0:
+                self._pos = -0.28
+            self._draw()
+            delay = 80
+        else:
+            delay = 250
+        self._job = self.after(delay, self._step)
 
     def _draw(self) -> None:
         self.delete("all")
-        if not HAS_PIL:
-            self.create_rectangle(0, 0, self.w_px, self.h_px, fill=self.trough, outline=self.trough)
-            return
-        img = Image.new("RGBA", (self.w_px * _SS, self.h_px * _SS), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        r = self.h_px * _SS / 2
-        d.rounded_rectangle([0, 0, self.w_px * _SS - 1, self.h_px * _SS - 1],
-                            radius=r, fill=self.trough)
+        if HAS_PIL:
+            if self._photo is None:
+                self._photo = ImageTk.PhotoImage(
+                    _rounded_image(self.w_px, self.h_px, self.h_px / 2,
+                                   self.trough))
+            self.create_image(0, 0, image=self._photo, anchor="nw")
+        else:
+            rounded_rect(self, 0, 0, self.w_px, self.h_px,
+                         self.h_px / 2, fill=self.trough, outline=self.trough)
         if self._indeterminate:
             bw = self.w_px * 0.28
             x0 = self._pos * self.w_px
             x1 = x0 + bw
-            d.rounded_rectangle([max(0, x0) * _SS, 0, min(self.w_px, x1) * _SS - 1,
-                                 self.h_px * _SS - 1], radius=r, fill=self.fill)
+            x0, x1 = max(0.0, x0), min(float(self.w_px), x1)
         elif self._value:
-            d.rounded_rectangle([0, 0, max(2, self._value * self.w_px) * _SS - 1,
-                                 self.h_px * _SS - 1], radius=r, fill=self.fill)
-        self._photo = ImageTk.PhotoImage(img.resize((self.w_px, self.h_px), Image.LANCZOS))
-        self.create_image(0, 0, image=self._photo, anchor="nw")
+            x0, x1 = 0.0, max(2.0, self._value * self.w_px)
+        else:
+            return
+        if x1 <= x0:
+            return
+        if x1 - x0 <= self.h_px:
+            self.create_oval(x0, 0, x1, self.h_px,
+                             fill=self.fill, outline=self.fill)
+        else:
+            radius = self.h_px / 2
+            self.create_line(x0 + radius, radius, x1 - radius, radius,
+                             width=self.h_px, capstyle="round", fill=self.fill)
 
 
 class TodoIcon(tk.Canvas):
@@ -1241,11 +1451,17 @@ class MenuPopup(tk.Toplevel):
                  command: Callable[[int], None], *, min_width: int = 180,
                  align_right: bool = False) -> None:
         root = anchor.winfo_toplevel()
+        return_focus = root.focus_get()
         for old in list(MenuPopup._instances):   # 任何时刻只保留一个菜单
             if old is not self:
                 old._dismiss()
         super().__init__(root)
         MenuPopup._instances.append(self)
+        self._anchor = anchor
+        self._return_focus = return_focus
+        self._owner_root = root
+        self._root_press_binding: str | None = None
+        self._closing = False
         self.command = command
         self.fonts = fonts
         self.overrideredirect(True)
@@ -1283,17 +1499,21 @@ class MenuPopup(tk.Toplevel):
             dl = None
             desc = str(item.get("desc") or "")
             if desc:
-                dl = tk.Label(col, text=desc, bg=t.SURFACE, fg=t.INK_FAINT,
-                              font=fonts.kicker, anchor="w", justify="left",
+                dl = tk.Label(col, text=desc, bg=t.SURFACE,
+                              fg=t.INK_FAINT if disabled else t.INK_MUTED,
+                              font=getattr(fonts, "caption", fonts.small),
+                              anchor="w", justify="left",
                               wraplength=t.s(min_width + 140))
                 dl.pack(anchor="w", pady=(t.s(1), 0))
-            row._parts = [row, inner, mark, col]
-            if dot is not None:
-                row._parts.append(dot)
+            row._parts = [part for part in (row, inner, mark, col, lab, dot, dl)
+                          if part is not None]
             row._lab, row._dl = lab, dl
             row._disabled = disabled
             row._current = current
-            for w in (row, inner, mark, col, lab):
+            click_parts = (row, inner, mark, col, lab, dot, dl)
+            for w in click_parts:
+                if w is None:
+                    continue
                 w.bind("<Enter>", lambda _e, i=index: self._set_hover(i), add="+")
                 w.bind("<Button-1>", lambda _e, i=index: self._pick(i), add="+")
             self._rows.append(row)
@@ -1319,24 +1539,35 @@ class MenuPopup(tk.Toplevel):
         self.bind("<Escape>", lambda _e: self._dismiss())
         self.bind("<Up>", lambda _e: self._move(-1))
         self.bind("<Down>", lambda _e: self._move(1))
-        self.bind("<Return>", lambda _e: self._pick(self._hover, fire=True))
+        self.bind("<Return>", lambda _e: self._pick(self._hover))
         self.bind("<Button-1>", self._outside_guard, add="+")
-        self._watcher_active = False
+        self.bind("<FocusOut>", self._focus_out, add="+")
         self.after(20, self._engage)
 
     def _engage(self) -> None:
-        """No pointer grab: overrideredirect windows on Windows cannot rely
-        on grab_set (it frequently fails silently, leaving the popup
-        undismissable).  A permanent bind_all press-watcher is the same
-        mechanism the scroll wheel hook uses."""
+        """Track clicks in the owning window without leaving global bindings behind."""
         if not _alive(self):
             return
         try:
-            self.bind_all("<ButtonPress-1>", self._global_press, add="+")
-            self._watcher_active = True
+            self._root_press_binding = self._owner_root.bind(
+                "<ButtonPress-1>", self._global_press, add="+")
             self.focus_force()
         except tk.TclError:
             pass
+
+    def _focus_out(self, _event=None) -> None:
+        if not self._closing:
+            self.after_idle(self._dismiss_if_unfocused)
+
+    def _dismiss_if_unfocused(self) -> None:
+        if not _alive(self):
+            return
+        try:
+            focus = self.focus_get()
+            if focus is None or focus.winfo_toplevel() is not self:
+                self._dismiss()
+        except tk.TclError:
+            self._dismiss()
 
     def _inside_px(self, x_root: int, y_root: int) -> bool:
         try:
@@ -1364,11 +1595,13 @@ class MenuPopup(tk.Toplevel):
             self._dismiss()
 
     def _set_hover(self, index: int) -> None:
-        if self._items[index].get("disabled"):
+        hover = (index if 0 <= index < len(self._items)
+                 and not self._items[index].get("disabled") else -1)
+        if hover == self._hover:
             return
-        self._hover = index
+        self._hover = hover
         for i, row in enumerate(self._rows):
-            hover = i == index
+            hover = i == self._hover
             bg = t.TERRACOTTA_SOFT if hover else t.SURFACE
             for part in getattr(row, "_parts", ()):
                 try:
@@ -1396,17 +1629,18 @@ class MenuPopup(tk.Toplevel):
 
     def _move(self, delta: int) -> None:
         n = len(self._items)
-        i = self._hover if self._hover >= 0 else (0 if delta > 0 else n - 1)
+        if not n:
+            return
+        i = self._hover if self._hover >= 0 else (-1 if delta > 0 else 0)
         for _ in range(n):
             i = (i + delta) % n
             if not self._items[i].get("disabled"):
-                break
-        self._set_hover(i)
+                self._set_hover(i)
+                return
+        self._set_hover(-1)
 
-    def _pick(self, index: int, fire: bool = False) -> None:
-        if index < 0:
-            return
-        if not fire and self._items[index].get("disabled"):
+    def _pick(self, index: int) -> None:
+        if index < 0 or index >= len(self._items) or self._items[index].get("disabled"):
             return
         command, self.command = self.command, None
         self._dismiss()
@@ -1414,23 +1648,22 @@ class MenuPopup(tk.Toplevel):
             command(index)
 
     def _dismiss(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        try:
-            if self._watcher_active:
-                self.unbind_all("<ButtonPress-1>")
-                self._watcher_active = False
+            if self._root_press_binding and _alive(self._owner_root):
+                self._owner_root.unbind("<ButtonPress-1>", self._root_press_binding)
+                self._root_press_binding = None
         except tk.TclError:
             pass
         if self in MenuPopup._instances:
             MenuPopup._instances.remove(self)
         try:
-            master = self.master
             self.destroy()
-            if master is not None and _alive(master):
-                master.focus_force()
+            focus = self._return_focus if _alive(self._return_focus) else self._anchor
+            if _alive(focus):
+                focus.focus_set()
         except tk.TclError:
             pass
 
@@ -1444,7 +1677,9 @@ class MessageDialog(tk.Toplevel):
                  message: str, confirm_text: str = "确定",
                  cancel_text: str = "取消", danger: bool = False,
                  on_choice: Callable[[bool], None]) -> None:
+        return_focus = root.focus_get()
         super().__init__(root)
+        self._return_focus = return_focus if _alive(return_focus) else root
         self.on_choice = on_choice
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -1504,12 +1739,16 @@ class MessageDialog(tk.Toplevel):
             pass
 
     def _answer(self, ok: bool) -> None:
+        if self.on_choice is None:
+            return
         try:
             self.grab_release()
         except tk.TclError:
             pass
         callback, self.on_choice = self.on_choice, None
         self.destroy()
+        if _alive(self._return_focus):
+            self._return_focus.focus_set()
         if callback:
             callback(ok)
 
@@ -1528,7 +1767,9 @@ class ApprovalDialog(tk.Toplevel):
 
     def __init__(self, root: tk.Misc, fonts: "t.Fonts", data: dict,
                  on_choice) -> None:
+        return_focus = root.focus_get()
         super().__init__(root)
+        self._return_focus = return_focus if _alive(return_focus) else root
         self.on_choice = on_choice
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -1622,12 +1863,16 @@ class ApprovalDialog(tk.Toplevel):
             pass
 
     def _answer(self, choice: str) -> None:
+        if self.on_choice is None:
+            return
         try:
             self.grab_release()
         except tk.TclError:
             pass
         callback, self.on_choice = self.on_choice, None
         self.destroy()
+        if _alive(self._return_focus):
+            self._return_focus.focus_set()
         if callback:
             callback(choice)
 

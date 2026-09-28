@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import difflib
 import fnmatch
 import hashlib
+import ipaddress
 import itertools
 import json
 import logging
@@ -43,6 +45,7 @@ from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 # 工具权限元数据与判定 / MCP 接入层（显式导入：import * 不会带入下划线符号；
 # 以下名字是模块级 re-export，测试通过模块属性访问，必须保留）
 from security_policy import (  # noqa: E402,F401
@@ -64,13 +67,18 @@ from subagent_router import should_delegate, RISK_LOW, RISK_MEDIUM  # noqa: E402
 import agent_memory as _agent_memory
 import extension_registry as _extensions
 import project_store as _projects  # noqa: E402
+import project_access
+import worker_hub
 from brand import APP_VERSION, SYSTEM_IDENTITY, env_is_set
 import team_collab
+import team_enrollment
+import team_versions
 from data_paths import workspace_data_dir
 import browser_tools as _browser  # noqa: E402
 import sandbox_runner as _sandbox  # noqa: E402
 import agent_jobs as _agent_jobs  # noqa: E402
 import schedule_store as _schedules  # noqa: E402
+import plan_store as _plans  # noqa: E402
 from dispatch_router import analyze_dispatch  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -141,6 +149,8 @@ def _submit_memory_record(record: dict, status: str | None = None) -> None:
     status 非 None 时兜底覆盖（loop 异常退出未填充状态的情况）。
     """
     try:
+        if record.get("team_job"):
+            return
         if not _memory_enabled():
             return
         if status is not None:
@@ -245,6 +255,10 @@ def _memory_process_run(record: dict) -> None:
             pass    # LLM 兜底失败：用规则结果（cursor 幂等防重试）
         if items:
             now = time.time()
+            user_texts = [str(m.get("content") or "")
+                          for m in (record.get("input_messages") or [])
+                          if m.get("role") == "user" and str(m.get("content") or "").strip()]
+            excerpt = (user_texts[-1][:160] if user_texts else "")
             for it in items:
                 it.setdefault("id", _uuid.uuid4().hex[:12])
                 it.setdefault("scope", "global")
@@ -252,7 +266,7 @@ def _memory_process_run(record: dict) -> None:
                 it.setdefault("status", "active")
                 it.setdefault("pinned", False)
                 it.setdefault("source_refs",
-                              [{"session_id": sid, "request_id": rid}])
+                              [{"session_id": sid, "request_id": rid, "excerpt": excerpt}])
                 it.setdefault("supersedes", [])
                 it.setdefault("created_at", now)
                 it.setdefault("updated_at", now)
@@ -291,6 +305,7 @@ MAX_CONSECUTIVE_FAILURES = 4    # 连续失败熔断阈值：达到即停止整�
 MAX_AGENT_SECONDS = 900         # 单次 agent 请求总耗时上限（含上游生成时间；50 次工具调用任务约需 15 分钟）
 MAX_TEXT_LENGTH = 5000          # type_text 文本长度上限
 _agent_lock = threading.Lock()  # 并发互斥：同一时刻只允许一个 agent 循环
+_job_create_lock = threading.Lock()  # request_id 检查与团队工作区创建保持原子顺序
 
 # ---- 敏感操作确认机制 ----
 CONFIRM_TIMEOUT = 120          # 等待用户确认超时（秒），超时默认拒绝（安全方向）
@@ -325,6 +340,8 @@ class ConfirmModeRequest(BaseModel):
 
 
 ISOLATED = False
+TEAM_SERVE_MODE = False
+TEAM_SERVE_HOST = ""
 
 # ---- 文件/系统工具安全限制 ----
 MAX_FILE_SIZE = 200_000      # read_file 单文件上限（字节）
@@ -828,10 +845,12 @@ class JobCreateRequest(BaseModel):
     messages: list[dict] = Field(..., description="OpenAI 格式消息（通常含 user 任务描述）")
     title: str | None = Field(default=None, description="任务标题（默认从首条 user 消息截取）")
     session_id: int | None = Field(default=None, description="来源会话 ID（完成后可写回）")
-    request_id: str | None = Field(default=None, description="幂等请求 ID")
+    request_id: str | None = Field(default=None, max_length=100,
+                                   description="幂等请求 ID")
     workspace: str | None = Field(default=None, description="工作区路径")
     session_version: int | None = Field(default=None, description="会话版本")
     project_id: str | None = Field(default=None, description="绑定的长任务项目 ID")
+    visibility: str | None = Field(default=None, description="private / team；团队项目固定为 team")
     model: str | None = Field(default=None, description="覆盖配置中的模型")
     temperature: float = Field(default=0.7, ge=0, le=2)
 
@@ -846,6 +865,9 @@ class DispatchRequest(BaseModel):
     messages: list[dict] | None = Field(default=None, description="完整上下文（省略则仅 user 消息）")
     session_id: int | None = None
     workspace: str | None = None
+    project_id: str | None = None
+    request_id: str | None = None
+    title: str | None = None
     force_mode: str | None = Field(default=None, description="sync / async 强制模式")
 
 
@@ -878,10 +900,78 @@ class ProjectActiveUpdate(BaseModel):
 
 
 class ProjectCreate(BaseModel):
-    title: str = Field(..., description="项目标题")
+    title: str | None = Field(default=None, description="项目标题")
+    name: str | None = Field(default=None, description="项目名称")
     goal: str = Field(default="", description="项目目标")
-    is_team: bool = Field(default=False, description="团队项目（敏感操作需多人复核）")
+    description: str | None = Field(default=None, description="项目简介")
+    is_team: bool = Field(default=False, description="团队项目（Hub 模式下统一启用）")
     milestones: list[dict] | None = Field(default=None, description="可选里程碑")
+
+
+class ProjectClaimRequest(BaseModel):
+    claim_code: str = Field(..., min_length=1, max_length=256)
+
+
+class ProjectInviteCreate(BaseModel):
+    terminal_display_code: str = Field(..., min_length=4, max_length=32)
+    user_id: str = Field(..., min_length=1, max_length=80)
+    role: str = Field(default="member", max_length=16)
+    expires_in: int | None = Field(default=None, ge=60, le=2592000)
+
+
+class ProjectInvitePreviewRequest(BaseModel):
+    invite_code: str = Field(..., min_length=1, max_length=256)
+
+
+class ProjectInviteAcceptRequest(BaseModel):
+    invite_code: str = Field(..., min_length=1, max_length=256)
+
+
+class ProjectMemberAction(BaseModel):
+    reason: str = Field(default="", max_length=500)
+
+
+class ProjectPolicyUpdate(BaseModel):
+    required_approvals: int = Field(..., ge=1, le=50)
+
+
+class ProjectMemberRoleUpdate(BaseModel):
+    role: str = Field(..., max_length=16)
+
+
+class ProjectOwnerTransferRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=80)
+
+
+class GovernanceProposalCreateRequest(BaseModel):
+    action: str = Field(..., min_length=1, max_length=40)
+    request_id: str = Field(..., min_length=1, max_length=100)
+    target_user_id: str = Field(default="", max_length=80)
+    required_approvals: int | None = Field(default=None, ge=1, le=50)
+
+
+class GovernanceProposalVoteRequest(BaseModel):
+    decision: str = Field(..., min_length=1, max_length=16)
+
+
+class TeamVersionInit(BaseModel):
+    shared_paths: list[str] = Field(..., description="从配置工作区明确指定的共享文件或目录")
+
+
+class TeamChangeCommit(BaseModel):
+    paths: list[str] = Field(..., description="明确的提交路径集合")
+    purpose: str = Field(..., description="变更目的 / 提交说明")
+    request_id: str = Field(default="", description="可选幂等请求 ID")
+
+
+class TeamChangeReview(BaseModel):
+    decision: str = Field(..., description="approve / reject")
+    comment: str = Field(default="")
+    reviewed_sha: str = Field(default="", description="界面实际展示的提交 SHA")
+
+
+class TeamChangeRevert(BaseModel):
+    request_id: str = Field(default="", description="幂等请求 ID")
 
 
 class ExtensionAction(BaseModel):
@@ -922,6 +1012,25 @@ class LlmError(Exception):
 
 
 app = FastAPI(title="LLM Backend", version=APP_VERSION)
+app.include_router(worker_hub.router)
+
+
+@app.exception_handler(RequestValidationError)
+async def _redacted_validation_error(request: Request,
+                                    exc: RequestValidationError) -> JSONResponse:
+    """Keep Pydantic's useful field errors without echoing submitted secrets."""
+    safe_errors = []
+    sensitive_enrollment = (request.url.path.startswith("/api/v1/team/join")
+                            or request.url.path.endswith("/claim"))
+    for error in exc.errors():
+        safe_errors.append({
+            "type": str(error.get("type") or "value_error"),
+            "loc": [str(part) if not isinstance(part, int) else part
+                    for part in (error.get("loc") or ())],
+            "msg": ("Invalid enrollment request" if sensitive_enrollment
+                    else str(error.get("msg") or "Invalid value")),
+        })
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 # 晨星 Web UI：由 llm_server 同源伺服（same-origin → 免 CORS；
 # 仍受 host_guard 回环限制与可选 token 鉴权保护，不暴露到局域网）
@@ -975,28 +1084,250 @@ async def set_confirm_mode(req: ConfirmModeRequest) -> dict:
     return {"ok": True, "mode": req.mode, "description": CONFIRM_MODE_DESC[req.mode]}
 
 
+class TeamBootstrapRequest(BaseModel):
+    team_name: str = Field(..., min_length=1, max_length=100)
+    admin_login: str = Field(..., min_length=1, max_length=254)
+    admin_name: str = Field(..., min_length=1, max_length=80)
+    device_name: str = Field(default="Hub 管理设备", max_length=80)
+
+
+class TeamInviteRequest(BaseModel):
+    expected_login: str = Field(..., min_length=1, max_length=254)
+    role: str = Field(default="member", max_length=16)
+
+
+class TeamJoinPreviewRequest(BaseModel):
+    invite_code: str = Field(..., min_length=1, max_length=256)
+
+
+class TeamJoinRequest(BaseModel):
+    invite_code: str = Field(..., min_length=1, max_length=256)
+    display_name: str = Field(..., min_length=1, max_length=80)
+    device_name: str = Field(..., min_length=1, max_length=80)
+    claim_secret: str = Field(..., min_length=32, max_length=256)
+    request_id: str = Field(..., min_length=16, max_length=72)
+    installation_code: str | None = Field(default=None, max_length=64,
+                                          description="公开本机安装标识，仅用于申请核对")
+
+
+class TeamClaimRequest(BaseModel):
+    claim_secret: str = Field(..., min_length=1, max_length=256)
+    installation_code: str | None = Field(default=None, max_length=64,
+                                          description="申请时绑定的公开本机安装标识")
+
+
+class TeamApplicationReview(BaseModel):
+    decision: str = Field(..., max_length=16)
+    note: str = Field(default="", max_length=500)
+
+
 class TeamUserCreate(BaseModel):
     name: str = Field(..., description="显示名")
     role: str = Field(default="member", description="admin / member")
     color: str = Field(default="#2F8A5B", description="UI 色点")
 
 
+def _enrollment_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except team_enrollment.EnrollmentError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+def _project_access_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except project_access.ProjectAccessError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    except team_enrollment.EnrollmentError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+def _trusted_login(request: Request) -> str:
+    return str(getattr(request.state, "trusted_tailscale_login", "") or "")
+
+
+def _require_team_admin(request: Request) -> dict:
+    user = _request_user(request)
+    if not team_collab.is_admin(user):
+        raise HTTPException(403, "此操作仅限活跃团队管理员")
+    return user
+
+
+@app.get("/api/v1/team/public", summary="查看 Hub 团队名称与 team_id")
+async def team_public_info(request: Request) -> dict:
+    if not TEAM_SERVE_MODE:
+        raise HTTPException(404, "Hub 未启用 Tailscale Serve 入队模式")
+    if not team_enrollment.is_initialized():
+        return {"ok": True, "initialized": False, "team_id": "", "team_name": "",
+                "serve_host": TEAM_SERVE_HOST,
+                "tailscale_login": _trusted_login(request)}
+    return {"ok": True, "initialized": True,
+            **_enrollment_call(team_enrollment.public_team),
+            "serve_host": TEAM_SERVE_HOST,
+            "tailscale_login": _trusted_login(request)}
+
+
+@app.post("/api/v1/team/bootstrap", summary="Hub 本机一次性初始化团队")
+async def team_bootstrap(req: TeamBootstrapRequest, request: Request) -> dict:
+    peer = str(getattr(getattr(request, "client", None), "host", "") or "")
+    host = request.headers.get("host", "")
+    if not TEAM_SERVE_MODE or not ISOLATED:
+        raise HTTPException(403, "团队初始化仅支持 --isolated --team-serve Hub")
+    if not _is_loopback(peer) or not _is_loopback(host):
+        raise HTTPException(403, "团队只能从 Hub 本机初始化")
+    credential = request.headers.get("X-Team-Bootstrap-Token", "")
+    result = _enrollment_call(
+        team_enrollment.bootstrap_team,
+        credential=credential, team_name=req.team_name,
+        admin_login=req.admin_login, admin_name=req.admin_name,
+        device_name=req.device_name)
+    return {"ok": True, **result}
+
+
+@app.post("/api/v1/team/join/preview", summary="核对邀请码归属与 Tailscale 身份")
+async def team_join_preview(req: TeamJoinPreviewRequest, request: Request) -> dict:
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.preview_invite, code=req.invite_code,
+        tailscale_login=_trusted_login(request))}
+
+
+@app.post("/api/v1/team/join-requests", summary="提交团队加入申请")
+async def team_join_request(req: TeamJoinRequest, request: Request) -> dict:
+    result = _enrollment_call(
+        team_enrollment.submit_application, code=req.invite_code,
+        tailscale_login=_trusted_login(request), display_name=req.display_name,
+        device_name=req.device_name, claim_secret=req.claim_secret,
+        request_id=req.request_id, installation_code=req.installation_code)
+    return {"ok": True, **result}
+
+
+@app.get("/api/v1/team/join-requests/{application_id}",
+         summary="申请人查询自己的加入状态")
+async def team_join_status(application_id: str, request: Request) -> dict:
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.application_status, application_id,
+        tailscale_login=_trusted_login(request))}
+
+
+@app.post("/api/v1/team/join-requests/{application_id}/claim",
+          summary="申请人一次性领取已批准的设备凭证")
+async def team_join_claim(application_id: str, req: TeamClaimRequest,
+                           request: Request) -> dict:
+    result = _enrollment_call(
+        team_enrollment.claim_device, application_id,
+        tailscale_login=_trusted_login(request), claim_secret=req.claim_secret,
+        installation_code=req.installation_code)
+    return {"ok": True, **result}
+
+
+@app.post("/api/v1/team/invites", summary="管理员创建 24 小时一次性邀请码")
+async def team_invite_create(req: TeamInviteRequest, request: Request) -> dict:
+    actor = _require_team_admin(request)
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.create_invite, actor=actor,
+        expected_login=req.expected_login, role=req.role)}
+
+
+@app.get("/api/v1/team/invites", summary="管理员查看邀请码状态")
+async def team_invite_list(request: Request) -> dict:
+    _require_team_admin(request)
+    return {"ok": True, "invites": _enrollment_call(team_enrollment.list_invites)}
+
+
+@app.delete("/api/v1/team/invites/{invite_id}", summary="撤销邀请码")
+async def team_invite_revoke(invite_id: str, request: Request) -> dict:
+    actor = _require_team_admin(request)
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.revoke_invite, invite_id, actor=actor)}
+
+
+@app.get("/api/v1/team/applications", summary="管理员查看加入申请")
+async def team_application_list(request: Request) -> dict:
+    _require_team_admin(request)
+    return {"ok": True, "applications": _enrollment_call(
+        team_enrollment.list_applications)}
+
+
+@app.post("/api/v1/team/applications/{application_id}/review",
+          summary="管理员批准或拒绝加入申请")
+async def team_application_review(application_id: str,
+                                  req: TeamApplicationReview,
+                                  request: Request) -> dict:
+    actor = _require_team_admin(request)
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.review_application, application_id, actor=actor,
+        decision=req.decision, note=req.note)}
+
+
+@app.get("/api/v1/team/me", summary="当前团队成员与设备身份")
+async def team_me(request: Request) -> dict:
+    user = _request_user(request)
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.current_identity, str(user.get("id") or ""),
+        str(user.get("device_id") or ""))}
+
+
+@app.get("/api/v1/team/me/devices", summary="查看当前成员的设备记录")
+async def team_my_devices(request: Request) -> dict:
+    user = _request_user(request)
+    return {"ok": True, "devices": _enrollment_call(
+        team_enrollment.list_user_devices, str(user.get("id") or ""))}
+
+
+@app.get("/api/v1/team/members", summary="团队成员与设备列表（管理员）")
+async def team_member_list(request: Request) -> dict:
+    _require_team_admin(request)
+    return {"ok": True, "members": _enrollment_call(team_enrollment.list_members)}
+
+
+@app.post("/api/v1/team/members/{user_id}/deactivate", summary="停用团队成员")
+async def team_member_deactivate(user_id: str, request: Request) -> dict:
+    actor = _require_team_admin(request)
+    result = _enrollment_call(team_enrollment.deactivate_member,
+                              user_id, actor=actor)
+    _invalidate_inactive_team_reviews(str(actor.get("id") or ""))
+    return {"ok": True, **result}
+
+
+@app.post("/api/v1/team/devices/{device_id}/revoke", summary="撤销成员设备凭证")
+async def team_device_revoke(device_id: str, request: Request) -> dict:
+    actor = _request_user(request)
+    return {"ok": True, **_enrollment_call(
+        team_enrollment.revoke_device, device_id, actor=actor,
+        own_device_id=str(actor.get("device_id") or ""))}
+
+
 @app.get("/api/v1/team", summary="团队成员列表（不含 token）")
-async def team_list() -> dict:
-    users = team_collab.public_users()
+async def team_list(request: Request) -> dict:
+    viewer = _request_user(request)
+    if team_enrollment.is_initialized():
+        if team_collab.is_admin(viewer):
+            users = team_enrollment.list_members()
+        else:
+            # Members need names/roles for shared review UI, not other
+            # people's Tailscale logins or per-device inventory.
+            users = [team_collab.public_user(row)
+                     for row in team_collab.active_users()]
+    else:
+        users = team_collab.public_users()
+    team = team_enrollment.get_team() or {}
     return {
         "ok": True,
         "team_enabled": team_collab.team_enabled(),
-        "users": users,
-        "owner": team_collab.OWNER_USER,
+        "team_id": team.get("team_id", ""), "team_name": team.get("name", ""),
+        "users": users, "owner": team_collab.OWNER_USER,
+        "active_members": len(team_enrollment.active_user_ids()) if team else len(users),
     }
 
 
-@app.post("/api/v1/team/users", summary="创建团队成员（admin；token 仅返回一次）")
+@app.post("/api/v1/team/users", summary="旧建员接口（新入队 Hub 禁用）")
 async def team_create_user(req: TeamUserCreate, request: Request) -> dict:
     user = _request_user(request)
     if not team_collab.is_admin(user):
-        raise HTTPException(403, "仅 admin 可创建成员")
+        raise HTTPException(403, "仅活跃 admin 可创建成员")
+    if TEAM_SERVE_MODE or team_enrollment.is_initialized():
+        raise HTTPException(410, "直接创建成员已停用；请创建邀请并审核加入申请")
     try:
         public, token = team_collab.create_user(
             name=req.name, role=req.role, color=req.color)
@@ -1006,10 +1337,28 @@ async def team_create_user(req: TeamUserCreate, request: Request) -> dict:
     return {"ok": True, "user": public, "token": token}
 
 
-@app.get("/api/v1/audit", summary="协作审计日志（只读）")
-async def audit_list(limit: int = 100) -> dict:
+@app.get("/api/v1/audit", summary="团队协作审计日志")
+async def audit_list(request: Request, limit: int = 100) -> dict:
     limit = max(1, min(int(limit or 100), 500))
-    return {"ok": True, "entries": team_collab.read_audit(limit=limit)}
+    if team_enrollment.is_initialized():
+        user = _request_user(request)
+        entries = team_enrollment.read_audit_for(user, limit=limit)
+        if TEAM_SERVE_MODE:
+            visible = []
+            for row in entries:
+                detail = row.get("detail") or {}
+                project_id = str(detail.get("project_id") or "")
+                action = str(row.get("action") or "")
+                if project_id and not _can_access_project(project_id, user):
+                    continue
+                if (not project_id and action.startswith((
+                        "project.", "team.change.", "team.version."))):
+                    continue
+                visible.append(row)
+            entries = visible[-limit:]
+    else:
+        entries = team_collab.read_audit(limit=limit)
+    return {"ok": True, "entries": entries}
 
 
 @app.get("/api/v1/confirm/pending", summary="当前用户待审批确认")
@@ -1017,6 +1366,24 @@ async def confirm_pending(request: Request) -> dict:
     user = _request_user(request)
     with _confirm_lock:
         pending = team_collab.pending_for_user(str(user.get("id")), _confirm_table)
+    visible = []
+    for item in pending:
+        job = _agent_jobs.find_job_by_task_id(str(item.get("task_id") or ""))
+        if TEAM_SERVE_MODE and (job is None or job.get("visibility") != "team"):
+            continue
+        if TEAM_SERVE_MODE and project_access.member_role(
+                str(job.get("project_id") or ""), str(user.get("id") or "")) \
+                not in {"owner", "admin", "member"}:
+            continue
+        if job is None or _can_access_job(job, user):
+            if TEAM_SERVE_MODE:
+                with _confirm_lock:
+                    entry = _confirm_table.get(str(item.get("request_id") or ""))
+                    if not entry or not _can_vote_on_confirmation(entry, user):
+                        continue
+                    item.update(_confirm_vote_status(entry))
+            visible.append(item)
+    pending = visible
     return {"ok": True, "pending": pending, "count": len(pending)}
 
 
@@ -1069,13 +1436,115 @@ def _is_loopback(host: str) -> bool:
     return hostname in _LOOPBACK_HOSTS
 
 
+def _is_tailnet_ip(host: str) -> bool:
+    value = _parse_host_header(host) or str(host or "").strip().lower()
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    networks = (ipaddress.ip_network("100.64.0.0/10"),
+                ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+    return any(address in network for network in networks)
+
+
+def _configured_team_hosts() -> set[str]:
+    return {part.strip().lower() for part in
+            os.environ.get("VENUS_TEAM_HOSTS", "").split(",") if part.strip()}
+
+
+def _test_peer(peer: str) -> bool:
+    return (env_is_set(("VENUS_ALLOW_TEST_HOST", "PCAGENT_ALLOW_TEST_HOST"))
+            and peer in ("testserver", "testclient", "localhost"))
+
+
+def _trusted_serve_login(request: Request) -> str:
+    """Tailscale identity is trusted only behind configured loopback Serve."""
+    if not (TEAM_SERVE_MODE and ISOLATED and TEAM_SERVE_HOST):
+        return ""
+    peer = str(getattr(getattr(request, "client", None), "host", "") or "")
+    raw_host = str(request.headers.get("host", "") or "").strip().casefold()
+    proxy_peer = _is_loopback(peer) or _test_peer(peer)
+    if not proxy_peer or raw_host != TEAM_SERVE_HOST:
+        return ""
+    value = str(request.headers.get("Tailscale-User-Login", "") or "").strip()
+    # Reject tagged nodes (Serve leaves this header empty) and malformed input.
+    if not value or len(value) > 254 or any(ch.isspace() or ord(ch) < 32 for ch in value):
+        return ""
+    return value.casefold()
+
+
+def _team_serve_api_allowed(method: str, path: str) -> bool:
+    """Keep a shared Hub's legacy machine-wide APIs off the team surface.
+
+    Project and Job routes perform their own object checks. All other legacy
+    routes can expose the Hub's workspace, memory, sessions, configuration or
+    host execution controls, so they are unavailable through Serve.
+    """
+    if path.startswith(("/api/v1/team", "/api/v1/projects",
+                        "/api/v1/project-invites", "/api/v1/jobs",
+                        "/api/v1/worker")):
+        return True
+    if method == "GET" and path in {
+        "/api/v1/confirm/pending", "/api/v1/ready", "/api/v1/audit",
+    }:
+        return True
+    if method == "POST" and path in {
+        "/api/v1/agent/respond", "/api/v1/chat/stream", "/api/v1/dispatch",
+    }:
+        return True
+    return False
+
+
 @app.middleware("http")
 async def host_guard(request, call_next):
     """Host/Origin 限制：防 DNS rebinding（恶意域名解析到本机）与跨站请求。
 
-    - Host 必须是本机回环地址（或 ::1）；
-    - Origin 若存在必须是本机来源（浏览器跨站防护）。
+    - 默认只允许本机回环；
+    - --isolated 下可选放行 Tailscale tailnet 地址，且必须配置精确 Hub Host 或使用 tailnet IP；
+    - 远程请求随后仍须通过团队成员 token 鉴权。
     """
+    peer = str(getattr(getattr(request, "client", None), "host", "") or "")
+    request_host = _parse_host_header(request.headers.get("host", ""))
+    test_peer = _test_peer(peer)
+    if TEAM_SERVE_MODE:
+        # In Serve mode the backend must bind to loopback. Serve's peer is a
+        # loopback proxy, while the public Host must exactly match the one
+        # configured at startup. Direct LAN/tailnet sockets are always denied.
+        local_peer = _is_loopback(peer) or test_peer
+        raw_host = str(request.headers.get("host", "") or "").strip().casefold()
+        serve_host = bool(local_peer and TEAM_SERVE_HOST
+                          and raw_host == TEAM_SERVE_HOST)
+        local_host = bool(local_peer and request_host in _LOOPBACK_HOSTS)
+        if not ISOLATED or not local_peer or not (serve_host or local_host):
+            return JSONResponse(status_code=403,
+                                content={"detail": "Hub 仅接受本机或配置的 Tailscale Serve 代理请求"})
+        origin = request.headers.get("origin")
+        if origin:
+            from urllib.parse import urlparse as _up
+            try:
+                parsed_origin = _up(origin)
+                origin_host = (parsed_origin.hostname or "").lower()
+            except Exception:
+                parsed_origin = None
+                origin_host = ""
+            allowed_origin = origin_host in _LOOPBACK_HOSTS or (
+                serve_host and origin_host == TEAM_SERVE_HOST
+                and parsed_origin is not None and parsed_origin.scheme == "https"
+                and parsed_origin.port in (None, 443))
+            if not allowed_origin:
+                return JSONResponse(status_code=403,
+                                    content={"detail": "非法 Origin"})
+        request.state.trusted_tailscale_login = _trusted_serve_login(request)
+        return await call_next(request)
+
+    tailnet_peer = bool(ISOLATED and _is_tailnet_ip(peer))
+    configured_hosts = _configured_team_hosts()
+    tailnet_host_allowed = bool(
+        tailnet_peer and request_host
+        and (request_host in configured_hosts or _is_tailnet_ip(request_host)))
+    if not _is_loopback(peer) and not test_peer and not tailnet_host_allowed:
+        return JSONResponse(status_code=403,
+                            content={"detail": "仅允许本机或已配置的 Tailscale tailnet 请求"})
     # Origin 检查先于 Host（与 Host 白名单分支互不影响）
     origin = request.headers.get("origin")
     if origin:
@@ -1086,12 +1555,14 @@ async def host_guard(request, call_next):
             ohost = (o.hostname or "").lower()
         except Exception:
             ohost = ""
-        if ohost not in _LOOPBACK_HOSTS or o.scheme not in ("http", "https"):
+        origin_allowed = ohost in _LOOPBACK_HOSTS or (tailnet_host_allowed
+                                                       and ohost == request_host)
+        if not origin_allowed or o.scheme not in ("http", "https"):
             return JSONResponse(status_code=403,
-                                content={"detail": "非法 Origin（仅允许本机来源）"})
+                                content={"detail": "非法 Origin"})
     host = request.headers.get("host", "")
     hostname = _parse_host_header(host)
-    if hostname is None or hostname not in _LOOPBACK_HOSTS:
+    if hostname is None or (hostname not in _LOOPBACK_HOSTS and not tailnet_host_allowed):
         # 测试环境（TestClient 默认 testserver）白名单：不放开任意 Host
         if (env_is_set(("VENUS_ALLOW_TEST_HOST", "PCAGENT_ALLOW_TEST_HOST"))
                 and hostname in ("testserver", "testclient", "localhost")):
@@ -1113,6 +1584,63 @@ async def log_requests(request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request, call_next):
+    if TEAM_SERVE_MODE:
+        peer = str(getattr(getattr(request, "client", None), "host", "") or "")
+        host = _parse_host_header(request.headers.get("host", ""))
+        local_peer = _is_loopback(peer) or _test_peer(peer)
+        is_bootstrap = request.url.path == "/api/v1/team/bootstrap"
+        is_public = request.method == "GET" and request.url.path == "/api/v1/team/public"
+        is_preview = request.method == "POST" and request.url.path == "/api/v1/team/join/preview"
+        is_join_post = request.method == "POST" and request.url.path == "/api/v1/team/join-requests"
+        is_join_status = (request.method == "GET" and
+                          request.url.path.startswith("/api/v1/team/join-requests/"))
+        is_claim = (request.method == "POST" and
+                    request.url.path.endswith("/claim") and
+                    request.url.path.startswith("/api/v1/team/join-requests/"))
+        if is_bootstrap:
+            if not local_peer or host not in _LOOPBACK_HOSTS:
+                return JSONResponse(status_code=403,
+                                    content={"detail": "团队初始化仅允许 Hub 本机访问"})
+            request.state.user = dict(team_collab.OWNER_USER)
+            return await call_next(request)
+        if is_public:
+            request.state.trusted_tailscale_login = _trusted_serve_login(request)
+            return await call_next(request)
+        if is_preview or is_join_post or is_join_status or is_claim:
+            login = _trusted_serve_login(request)
+            if not login:
+                return JSONResponse(status_code=401,
+                                    content={"detail": "缺少可信的 Tailscale 用户身份；请从已登录用户设备通过 Serve HTTPS 地址访问"})
+            request.state.trusted_tailscale_login = login
+            return await call_next(request)
+        if not team_enrollment.is_initialized():
+            return JSONResponse(status_code=401,
+                                content={"detail": "Hub 尚未初始化团队"})
+        login = _trusted_serve_login(request)
+        token = request.headers.get("X-Team-Device-Token", "")
+        user, auth_detail = team_enrollment.authenticate_device_result(token, login)
+        if not user:
+            return JSONResponse(status_code=401,
+                                content={"detail": auth_detail})
+        request.state.trusted_tailscale_login = login
+        request.state.user = user
+        local_hub_admin = (str(user.get("role") or "").lower() == "admin"
+                           and not login)
+        if (not _team_serve_api_allowed(request.method, request.url.path)
+                and not local_hub_admin):
+            return JSONResponse(status_code=403,
+                                content={"detail": "此 Hub API 不向团队终端开放"})
+        return await call_next(request)
+
+    peer = str(getattr(getattr(request, "client", None), "host", "") or "")
+    if _is_tailnet_ip(peer):
+        raw_team_token = (request.headers.get("X-User-Token", "")
+                          or request.headers.get("X-Api-Token", ""))
+        if not team_collab.match_token(raw_team_token):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "远程 Hub 请求需要有效的团队成员 token"},
+            )
     try:
         request.state.user = team_collab.resolve_request_user(
             request.headers.get("X-User-Token", ""),
@@ -1471,40 +1999,682 @@ async def list_agents() -> dict:
         {k: v for k, v in a.items() if k != "system_prompt"} for a in _scan_agents()]}
 
 
-@app.get("/api/v1/projects", summary="长任务项目列表")
-async def api_list_projects(status: str | None = None) -> dict:
-    items = _projects.list_projects(status=status or None)
-    return {"ok": True, "projects": items, "active": _projects.get_active_project_id()}
+def _project_summary(project_id: str, user: dict, *, source: dict | None = None) -> dict:
+    project = _projects.get_project(project_id, include_checkpoints=0) or {}
+    meta = project.get("meta") or {}
+    pending_claim = (str(meta.get("status") or "") == "pending_claim"
+                     and project_access.can_view_pending_claim(project_id, user))
+    access = project_access.access(project_id, str(user.get("id") or ""),
+                                   str(user.get("device_id") or ""))
+    role = (access or {}).get("role") or ("claimant" if pending_claim else
+           "owner" if str(meta.get("owner_id") or "") == str(user.get("id") or "")
+           and not meta.get("is_team") else "")
+    row = dict(source or {})
+    row.update({"id": project_id,
+                "name": str(meta.get("name") or meta.get("title") or project_id),
+                "description": str(meta.get("description") or meta.get("goal") or ""),
+                "status": str(meta.get("status") or "active"),
+                "role": role,
+                "owner_id": str(meta.get("owner_id") or ""),
+                "owner_name": str(meta.get("owner_name") or ""),
+                "device_status": ((access or {}).get("device_status")
+                                  or ("claim_pending" if pending_claim else "")),
+                "is_team": bool(meta.get("is_team")),
+                "created": meta.get("created"), "updated": meta.get("updated"),
+                "claim_expires_at": (project_access.pending_claim_expires_at(project_id, user)
+                                     if pending_claim else None)})
+    # Pending-claim creators have no membership yet; do not expose project policy
+    # until the claim is complete and the caller has a real project grant.
+    if access and meta.get("is_team"):
+        row["required_approvals"] = project_access.required_approvals(project_id)
+        row["policy_version"] = project_access.policy_version(project_id)
+    pending_approvals = 0
+    recent_job = None
+    if access and meta.get("is_team"):
+        try:
+            pending_approvals = sum(1 for change in team_versions.list_changes(project_id, limit=500)
+                                    if change.get("status") in ("pending_review", "approved"))
+        except team_versions.VersionError:
+            pass
+        for job in _agent_jobs.list_jobs(limit=200):
+            if str(job.get("project_id") or "") == project_id and _can_access_job(job, user):
+                recent_job = {"id": job.get("id"), "title": job.get("title"),
+                              "status": job.get("status"), "created_at": job.get("created_at")}
+                break
+    row["pending_approvals"] = pending_approvals
+    row["recent_job"] = recent_job
+    return row
+
+
+@app.get("/api/v1/projects", summary="列出当前用户和终端获准访问的项目")
+async def api_list_projects(request: Request, status: str | None = None) -> dict:
+    user = _request_user(request)
+    items = []
+    for source in _projects.list_projects(status=status or None):
+        pid = str(source.get("id") or "")
+        if _can_view_project(pid, user) or project_access.can_view_pending_claim(pid, user):
+            items.append(_project_summary(pid, user, source=source))
+    if TEAM_SERVE_MODE:
+        active = (project_access.get_active_project(str(user.get("id") or ""),
+                                                    str(user.get("device_id") or ""))
+                  if user.get("id") and user.get("device_id") else "")
+    else:
+        active = _projects.get_active_project_id()
+    if active and not _can_access_project(active, user):
+        active = ""
+    return {"ok": True, "projects": items, "active": active}
 
 
 @app.get("/api/v1/projects/{project_id}", summary="读取单个项目")
-async def api_get_project(project_id: str) -> dict:
+async def api_get_project(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
     proj = _projects.get_project(project_id)
-    if proj is None:
+    if proj is None or not (_can_view_project(project_id, user)
+                            or project_access.can_view_pending_claim(project_id, user)):
         raise HTTPException(404, f"项目不存在：{project_id}")
-    return {"ok": True, **proj}
+    summary = _project_summary(project_id, user)
+    return {"ok": True, "project": summary, **proj}
+
+
+@app.post("/api/v1/projects/{project_id}/archive", summary="归档团队项目并关闭未完成工作")
+async def api_archive_project(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    project = _projects.get_project(project_id, include_checkpoints=0)
+    if not project or not (project.get("meta") or {}).get("is_team"):
+        raise HTTPException(404, "团队项目不存在")
+    meta = project.get("meta") or {}
+    status = str(meta.get("status") or "active")
+    if status not in {"active", "archived"}:
+        raise HTTPException(409, "当前项目状态不能归档")
+    uid = str(user.get("id") or "")
+    did = str(user.get("device_id") or "")
+    access = project_access.access(project_id, uid, did)
+    role = str((access or {}).get("role") or "")
+    if (not role and not TEAM_SERVE_MODE
+            and not meta.get("access_control_managed")
+            and str(meta.get("owner_id") or "") == uid):
+        role = "owner"
+    if not access and role != "owner":
+        raise HTTPException(404, "团队项目不存在")
+    if role != "owner":
+        raise HTTPException(403, "只有项目 owner 可以归档项目")
+
+    already_archived = status == "archived"
+    if not already_archived:
+        ok, result = _projects.update_project(project_id, status="archived")
+        if not ok:
+            raise HTTPException(409, str(result))
+    try:
+        cleanup = _project_access_call(project_access.finalize_archive,
+                                       project_id, actor=user)
+        worker_calls_revoked = worker_hub.cancel_project_calls(
+            project_id, reason="project_archived")
+    except Exception as exc:
+        log.exception("Project archive cleanup needs retry for %s", project_id)
+        raise HTTPException(503, "项目已进入归档只读状态；请重试归档请求完成清理") from exc
+
+    archive_audited = any(
+        row.get("action") == "project.archive"
+        and str((row.get("detail") or {}).get("project_id") or "") == project_id
+        for row in team_collab.read_audit(limit=5000))
+    if not archive_audited:
+        _invalidate_project_reviews(project_id, uid, reason="project_archived")
+        team_collab.audit(uid, "project.archive", {
+            "project_id": project_id, "already_archived": already_archived,
+            "worker_calls_revoked": worker_calls_revoked,
+            "invites_revoked": cleanup.get("invites_revoked", 0),
+            "transfers_cancelled": cleanup.get("transfers_cancelled", 0)})
+    return {"ok": True, "project": _project_summary(project_id, user),
+            "already_archived": already_archived,
+            "worker_calls_revoked": worker_calls_revoked,
+            "invites_revoked": cleanup.get("invites_revoked", 0),
+            "transfers_cancelled": cleanup.get("transfers_cancelled", 0)}
 
 
 @app.post("/api/v1/projects", summary="创建长任务项目")
 async def api_create_project(req: ProjectCreate, request: Request) -> dict:
+    user = _request_user(request)
+    title = str(req.title or req.name or "").strip()
+    description = str(req.description if req.description is not None else req.goal or "")
+    if not title:
+        raise HTTPException(422, "项目名称不能为空")
+    if TEAM_SERVE_MODE:
+        creator_id = str(user.get("id") or "")
+        device_id = str(user.get("device_id") or "")
+        if not creator_id or not device_id:
+            raise HTTPException(401, "创建项目需要已认证的 Hub 终端")
+        ok, result = _projects.create_project(
+            title, description, req.milestones, is_team=True,
+            owner_id="", owner_name=str(user.get("name") or creator_id),
+            creator_id=creator_id, creator_device_id=device_id,
+            status="pending_claim", description=description,
+            access_control_managed=True)
+        if not ok:
+            raise HTTPException(422, str(result))
+        project_meta = result["created"]
+        try:
+            claim_code = project_access.create_claim(project_meta["id"], creator_id, device_id)
+        except Exception:
+            # Cross-store compensation: a project without a usable claim stays
+            # hidden from everyone and is archived for an auditable retry.
+            _projects.update_project(project_meta["id"], status="expired")
+            raise
+        team_collab.audit(creator_id, "project.create", {"project_id": project_meta["id"],
+                                                           "status": "pending_claim"})
+        summary = _project_summary(project_meta["id"], user)
+        return {"ok": True, "project": summary, "claim_code": claim_code,
+                **result}
     ok, result = _projects.create_project(
-        req.title, req.goal, req.milestones, is_team=req.is_team)
+        title, description, req.milestones, is_team=req.is_team,
+        owner_id=str(user.get("id") or "owner"),
+        owner_name=str(user.get("name") or "Owner"),
+        description=description)
     if not ok:
         raise HTTPException(422, str(result))
-    user = _request_user(request)
     team_collab.audit(str(user.get("id")), "project.create", {
         "project_id": result["created"]["id"],
         "is_team": req.is_team,
     })
-    return {"ok": True, **result}
+    return {"ok": True, "project": _project_summary(
+        str(result["created"]["id"]), user), **result}
 
 
 @app.post("/api/v1/projects/active", summary="设置当前活跃项目")
-async def api_set_active_project(req: ProjectActiveUpdate) -> dict:
-    ok, msg = _projects.set_active_project(req.project_id)
+async def api_set_active_project(req: ProjectActiveUpdate, request: Request) -> dict:
+    user = _request_user(request)
+    if req.project_id and not _can_access_project(req.project_id, user):
+        raise HTTPException(404, "项目不存在")
+    ok, msg = _projects.set_active_project(
+        req.project_id,
+        user_id=str(user.get("id") or "") if TEAM_SERVE_MODE else "",
+        device_id=str(user.get("device_id") or "") if TEAM_SERVE_MODE else "")
     if not ok:
         raise HTTPException(422, msg)
     return {"ok": True, "active": req.project_id, "message": msg}
+
+
+@app.post("/api/v1/projects/{project_id}/claim", summary="使用一次性认领码认领新项目")
+async def api_claim_project(project_id: str, req: ProjectClaimRequest,
+                            request: Request) -> dict:
+    user = _request_user(request)
+    result = _project_access_call(
+        project_access.claim_project, project_id,
+        user_id=str(user.get("id") or ""),
+        device_id=str(user.get("device_id") or ""),
+        claim_code=req.claim_code)
+    project = _projects.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "项目不存在")
+    return {"ok": True, "project": _project_summary(project_id, user),
+            "role": "owner", "status": "active", **result}
+
+
+@app.post("/api/v1/projects/{project_id}/claim-code", summary="为未认领项目重新生成认领码")
+async def api_reissue_project_claim(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    code = _project_access_call(project_access.reissue_claim, project_id,
+                                user_id=str(user.get("id") or ""),
+                                device_id=str(user.get("device_id") or ""))
+    return {"ok": True, "project_id": project_id, "claim_code": code,
+            "expires_in": 900}
+
+
+@app.post("/api/v1/projects/{project_id}/invites", summary="创建绑定用户与终端的项目邀请")
+async def api_project_invite_create(project_id: str, req: ProjectInviteCreate,
+                                    request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"})
+    result = _project_access_call(
+        project_access.create_invite, project_id, actor=user,
+        terminal_display_code=req.terminal_display_code,
+        expected_user_id=req.user_id, role_name=req.role,
+        expires_in=req.expires_in)
+    return {"ok": True, **result}
+
+
+@app.get("/api/v1/projects/{project_id}/invites", summary="列出项目邀请状态")
+async def api_project_invite_list(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"}, write=False)
+    return {"ok": True, "invites": _project_access_call(
+        project_access.list_invites, project_id)}
+
+
+@app.delete("/api/v1/projects/{project_id}/invites/{invite_id}", summary="撤销未接受的项目邀请")
+async def api_project_invite_revoke(project_id: str, invite_id: str,
+                                    request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"})
+    return {"ok": True, "invite": _project_access_call(
+        project_access.revoke_invite, project_id, invite_id,
+        actor_id=str(user.get("id") or ""))}
+
+
+@app.post("/api/v1/project-invites/preview", summary="核对项目邀请、用户与终端绑定信息")
+async def api_project_invite_preview(req: ProjectInvitePreviewRequest,
+                                     request: Request) -> dict:
+    user = _request_user(request)
+    invite = _project_access_call(
+        project_access.preview_invite, req.invite_code,
+        user_id=str(user.get("id") or ""),
+        device_id=str(user.get("device_id") or ""))
+    return {"ok": True, "invite": invite}
+
+
+@app.post("/api/v1/project-invites/{invite_id}/accept", summary="接受绑定到本终端的项目邀请")
+async def api_project_invite_accept(invite_id: str, req: ProjectInviteAcceptRequest,
+                                    request: Request) -> dict:
+    user = _request_user(request)
+    result = _project_access_call(
+        project_access.accept_invite, invite_id, code=req.invite_code,
+        user_id=str(user.get("id") or ""),
+        device_id=str(user.get("device_id") or ""))
+    _invalidate_project_reviews(str(result.get("project_id") or ""),
+                                str(user.get("id") or ""),
+                                reason="membership_added")
+    project = _projects.get_project(str(result.get("project_id") or ""))
+    if not project:
+        raise HTTPException(404, "项目不存在")
+    device = _enrollment_call(team_enrollment.get_device,
+                              str(user.get("device_id") or "")) or {}
+    return {"ok": True, "project": _project_summary(result["project_id"], user),
+            "membership": {"user_id": result["user_id"], "role": result["role"],
+                           "status": result["status"]},
+            "device": {"device_id": device.get("id"),
+                       "display_code": device.get("display_code"),
+                       "name": device.get("name"), "status": device.get("status")}}
+
+
+@app.get("/api/v1/projects/{project_id}/members", summary="读取项目成员与获准终端")
+async def api_project_member_list(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    members = _project_access_call(project_access.list_members, project_id)
+    return {"ok": True, "members": members}
+
+
+@app.delete("/api/v1/projects/{project_id}/members/{user_id}", summary="移除项目成员")
+async def api_project_member_remove(project_id: str, user_id: str,
+                                    request: Request, req: ProjectMemberAction | None = None) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"})
+    result = _project_access_call(project_access.remove_member,
+                                  project_id, user_id,
+                                  actor=user,
+                                  reason=(req.reason if req else ""))
+    _invalidate_project_reviews(project_id, str(user.get("id") or ""))
+    return {"ok": True, "membership": result}
+
+
+@app.post("/api/v1/projects/{project_id}/devices/{device_id}/revoke",
+          summary="撤销一个终端在此项目中的授权")
+async def api_project_device_revoke(project_id: str, device_id: str,
+                                    req: ProjectMemberAction,
+                                    request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"})
+    result = _project_access_call(project_access.revoke_device,
+                                  project_id, device_id,
+                                  actor=user,
+                                  reason=req.reason)
+    _invalidate_project_reviews(project_id, str(user.get("id") or ""))
+    return {"ok": True, "device": result}
+
+
+@app.patch("/api/v1/projects/{project_id}/members/{user_id}/role",
+           summary="调整项目成员角色")
+async def api_project_member_role(project_id: str, user_id: str,
+                                  req: ProjectMemberRoleUpdate,
+                                  request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner"})
+    result = _project_access_call(project_access.update_member_role,
+                                  project_id, user_id, req.role,
+                                  actor=user)
+    _invalidate_project_reviews(project_id, str(user.get("id") or ""))
+    return {"ok": True, "membership": result}
+
+
+@app.put("/api/v1/projects/{project_id}/policy", summary="设置项目审批票数")
+async def api_project_policy_update(project_id: str, req: ProjectPolicyUpdate,
+                                    request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner"})
+    result = _project_access_call(project_access.set_required_approvals,
+                                  project_id, req.required_approvals,
+                                  actor=user)
+    _invalidate_project_reviews(project_id, str(user.get("id") or ""),
+                                reason="policy_changed")
+    return {"ok": True, "policy": result}
+
+
+@app.get("/api/v1/projects/{project_id}/governance-proposals",
+         summary="列出项目治理提案")
+async def api_project_governance_proposal_list(project_id: str,
+                                               request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    proposals = _project_access_call(
+        project_access.list_governance_proposals, project_id)
+    return {"ok": True, "proposals": proposals}
+
+
+@app.post("/api/v1/projects/{project_id}/governance-proposals",
+          summary="创建项目敏感治理提案")
+async def api_project_governance_proposal_create(
+        project_id: str, req: GovernanceProposalCreateRequest,
+        request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner"})
+    proposal = _project_access_call(
+        project_access.create_governance_proposal, project_id,
+        action=req.action, request_id=req.request_id, actor=user,
+        target_user_id=req.target_user_id,
+        required_approvals=req.required_approvals)
+    return {"ok": True, "proposal": proposal}
+
+
+@app.get("/api/v1/projects/{project_id}/governance-proposals/{proposal_id}",
+         summary="查看项目治理提案详情")
+async def api_project_governance_proposal_detail(project_id: str,
+                                                 proposal_id: str,
+                                                 request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    proposal = _project_access_call(
+        project_access.get_governance_proposal, project_id, proposal_id)
+    return {"ok": True, "proposal": proposal}
+
+
+@app.post("/api/v1/projects/{project_id}/governance-proposals/{proposal_id}/votes",
+          summary="对项目治理提案投票")
+async def api_project_governance_proposal_vote(
+        project_id: str, proposal_id: str,
+        req: GovernanceProposalVoteRequest, request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    proposal = _project_access_call(
+        project_access.vote_governance_proposal, project_id, proposal_id,
+        decision=req.decision, actor=user)
+    if (proposal.get("status") == "applied" and not proposal.get("already_processed")
+            and proposal.get("action") in {"promote_admin", "lower_approval_threshold"}):
+        _invalidate_project_reviews(
+            project_id, str(user.get("id") or ""),
+            reason="governance_" + str(proposal.get("action")))
+    return {"ok": True, "proposal": proposal}
+
+
+@app.post("/api/v1/projects/{project_id}/owner-transfer",
+          summary="邀请指定项目成员接受所有权转移")
+async def api_project_owner_transfer(project_id: str, req: ProjectOwnerTransferRequest,
+                                     request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner"})
+    result = _project_access_call(project_access.request_owner_transfer,
+                                  project_id, req.user_id,
+                                  actor=user)
+    return {"ok": True, "transfer": result}
+
+
+@app.get("/api/v1/projects/{project_id}/owner-transfer/pending",
+         summary="查看当前用户待接受的所有权转移")
+async def api_project_owner_transfer_pending(project_id: str,
+                                             request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    return {"ok": True, "transfer": _project_access_call(
+        project_access.pending_owner_transfer, project_id,
+        str(user.get("id") or ""))}
+
+
+@app.post("/api/v1/projects/{project_id}/owner-transfer/accept",
+          summary="目标成员接受所有权转移")
+async def api_project_owner_transfer_accept(project_id: str,
+                                            request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_active(project_id, user)
+    result = _project_access_call(project_access.accept_owner_transfer,
+                                  project_id, user_id=str(user.get("id") or ""),
+                                  device_id=str(user.get("device_id") or ""))
+    _invalidate_project_reviews(project_id, str(user.get("id") or ""))
+    return {"ok": True, "project": _project_summary(project_id, user),
+            "transfer": result}
+
+
+@app.get("/api/v1/projects/{project_id}/audit", summary="读取当前项目审计记录")
+async def api_project_audit(project_id: str, request: Request,
+                            limit: int = 100) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    amount = max(1, min(int(limit or 100), 500))
+    rows = team_collab.read_audit(limit=5000)
+    entries = [row for row in rows
+               if str((row.get("detail") or {}).get("project_id") or "") == project_id]
+    return {"ok": True, "project_id": project_id, "entries": entries[-amount:]}
+
+
+def _can_access_project(project_id: str, user: dict) -> bool:
+    proj = _projects.get_project(project_id, include_checkpoints=0)
+    if not proj:
+        return False
+    meta = proj.get("meta") or {}
+    if meta.get("is_team"):
+        if not meta.get("access_control_managed") and not TEAM_SERVE_MODE:
+            # Compatibility for an old local Hub before device enrollment:
+            # its declared owner retains access; legacy peers are not imported.
+            if str(meta.get("owner_id") or "") == str(user.get("id") or ""):
+                return True
+        return project_access.can_access(project_id, user)
+    owner = str(meta.get("owner_id") or "owner")
+    return owner == str(user.get("id") or "owner")
+
+
+def _can_view_project(project_id: str, user: dict) -> bool:
+    """Read permission including archived history; never used to authorize writes."""
+    if _can_access_project(project_id, user):
+        return True
+    project = _projects.get_project(project_id, include_checkpoints=0)
+    if not project:
+        return False
+    meta = project.get("meta") or {}
+    if meta.get("status") != "archived":
+        return False
+    if not meta.get("is_team"):
+        return str(meta.get("owner_id") or "owner") == str(user.get("id") or "owner")
+    if not meta.get("access_control_managed") and not TEAM_SERVE_MODE:
+        return str(meta.get("owner_id") or "") == str(user.get("id") or "")
+    return project_access.can_view_archived(project_id, user)
+
+
+def _can_access_job(job: dict, user: dict) -> bool:
+    if not isinstance(job, dict):
+        return False
+    uid = str(user.get("id") or "owner")
+    if job.get("visibility") == "team":
+        pid = str(job.get("project_id") or "")
+        project = _projects.get_project(pid, include_checkpoints=0)
+        return bool(project and (project.get("meta") or {}).get("is_team")
+                    and _can_view_project(pid, user))
+    return str(job.get("owner") or "owner") == uid
+
+
+def _require_team_project(project_id: str, user: dict) -> dict:
+    proj = _projects.get_project(project_id, include_checkpoints=0)
+    if not proj or not (proj.get("meta") or {}).get("is_team"):
+        raise HTTPException(404, "团队项目不存在")
+    if not _can_view_project(project_id, user):
+        raise HTTPException(404, "团队项目不存在")
+    return proj
+
+
+def _require_project_active(project_id: str, user: dict) -> dict:
+    project = _require_team_project(project_id, user)
+    if str((project.get("meta") or {}).get("status") or "active") != "active":
+        raise HTTPException(409, "归档或非活动项目为只读状态")
+    return project
+
+
+def _require_project_role(project_id: str, user: dict,
+                          allowed: set[str], *, write: bool = True) -> dict:
+    project = (_require_project_active(project_id, user) if write
+               else _require_team_project(project_id, user))
+    current_role = project_access.member_role(project_id, str(user.get("id") or ""))
+    if current_role not in allowed:
+        raise HTTPException(403, "当前项目角色无权执行此操作")
+    return project
+
+
+def _require_project_member(project_id: str, user: dict) -> dict:
+    return _require_project_role(project_id, user, {"owner", "admin", "member"})
+
+
+def _team_change_required_approvals(project_id: str) -> int:
+    """Resolve the review threshold against the request-bound team project."""
+    return project_access.required_approvals(
+        project_id, fallback=team_collab.required_votes(
+            "team_change", project_id=project_id))
+
+
+def _active_team_reviewers(project_id: str) -> set[str]:
+    """Review eligibility is scoped to active, project-authorized non-viewers."""
+    return project_access.active_member_ids(project_id)
+
+
+def _reconcile_team_change_reviews(project_id: str, change: dict,
+                                   actor_id: str = "system") -> dict:
+    active = _active_team_reviewers(project_id)
+    inactive_approvals = [row for row in change.get("reviews") or []
+                          if row.get("decision") == "approve"
+                          and not row.get("invalidated")
+                          and row.get("reviewed_sha") == change.get("current_sha")
+                          and str(row.get("reviewer_id") or "") not in active]
+    if not inactive_approvals:
+        return change
+    reconciled = _version_call(team_versions.reconcile_active_reviews,
+                               project_id, str(change.get("id") or ""), active)
+    job_id = str(reconciled.get("job_id") or "")
+    if job_id and _agent_jobs.get_job(job_id):
+        _agent_jobs.append_event(job_id, "reviewer_deactivated", {
+            "change_id": reconciled.get("id"),
+            "project_id": project_id,
+            "sha": reconciled.get("current_sha"),
+            "invalidated_reviewers": [str(row.get("reviewer_id") or "")
+                                      for row in inactive_approvals],
+            "approval_count": reconciled.get("approval_count"),
+            "required_approvals": reconciled.get("required_approvals"),
+        })
+    team_collab.audit(actor_id or "system", "team.change.approval_invalidated", {
+        "change_id": reconciled.get("id"), "project_id": project_id,
+        "job_id": job_id, "sha": reconciled.get("current_sha"),
+        "reviewers": [str(row.get("reviewer_id") or "")
+                      for row in inactive_approvals]})
+    return reconciled
+
+
+def _invalidate_inactive_team_reviews(actor_id: str) -> None:
+    for project in _projects.list_projects():
+        project_id = str(project.get("id") or "")
+        if not (project.get("meta") or {}).get("is_team"):
+            continue
+        try:
+            for change in team_versions.list_changes(project_id, limit=500):
+                _reconcile_team_change_reviews(project_id, change, actor_id)
+        except team_versions.VersionError:
+            continue
+
+
+def _invalidate_project_reviews(project_id: str, actor_id: str,
+                                reason: str = "project_access_changed") -> None:
+    """Reset open review rounds after membership, role, device, or policy changes.
+
+    Existing votes remain in the change audit trail but stop counting. The
+    pending change is re-evaluated under the current project threshold and
+    eligible reviewer set, and must receive fresh approvals.
+    """
+    active = _active_team_reviewers(project_id)
+    required = _team_change_required_approvals(project_id)
+    version = project_access.policy_version(project_id)
+    try:
+        changes = team_versions.list_changes(project_id, limit=500)
+    except team_versions.VersionError:
+        return
+    for change in changes:
+        if change.get("status") not in ("pending_review", "approved"):
+            continue
+        result = _version_call(team_versions.invalidate_reviews,
+                               project_id, str(change.get("id") or ""),
+                               reason=reason, policy_version=version,
+                               required_approvals=required,
+                               eligible_reviewer_ids=active)
+        job_id = str(result.get("job_id") or "")
+        if job_id and _agent_jobs.get_job(job_id):
+            _agent_jobs.append_event(job_id, "review_invalidated", {
+                "change_id": result.get("id"), "project_id": project_id,
+                "sha": result.get("current_sha"), "reason": reason,
+                "approval_count": result.get("approval_count"),
+                "required_approvals": result.get("required_approvals")})
+        team_collab.audit(actor_id or "system", "team.change.review_round_reset", {
+            "project_id": project_id, "change_id": result.get("id"),
+            "sha": result.get("current_sha"), "reason": reason,
+            "required_approvals": required, "policy_version": version})
+
+
+def _version_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except team_versions.VersionError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+@app.get("/api/v1/projects/{project_id}/versions", summary="团队项目版本仓库状态")
+async def api_team_version_status(project_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    return {"ok": True, **_version_call(team_versions.project_status, project_id)}
+
+
+@app.post("/api/v1/projects/{project_id}/versions/init", summary="按明确共享路径初始化团队 Git 仓库")
+async def api_team_version_init(project_id: str, req: TeamVersionInit,
+                                request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_role(project_id, user, {"owner", "admin"})
+    result = _version_call(team_versions.initialize_project,
+                           project_id, _get_workspace(), req.shared_paths, user)
+    team_collab.audit(str(user.get("id") or "owner"), "team.version.initialize", {
+        "project_id": project_id, "shared_paths": result.get("shared_paths") or [],
+        "head": result.get("head") or ""})
+    return {"ok": True, **result}
+
+
+@app.get("/api/v1/projects/{project_id}/changes", summary="团队项目变更单列表")
+async def api_team_change_list(project_id: str, request: Request,
+                               limit: int = 100) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    _version_call(team_versions.project_status, project_id)
+    changes = _version_call(team_versions.list_changes, project_id, limit=limit)
+    return {"ok": True, "changes": [
+        _reconcile_team_change_reviews(project_id, change)
+        for change in changes]}
+
+
+@app.get("/api/v1/projects/{project_id}/changes/{change_id}", summary="团队变更单详情")
+async def api_team_change_get(project_id: str, change_id: str,
+                              request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    change = _version_call(team_versions.get_change, project_id, change_id)
+    change = _reconcile_team_change_reviews(project_id, change)
+    return {"ok": True, "change": change}
+
+
+@app.get("/api/v1/projects/{project_id}/changes/{change_id}/diff", summary="查看变更单文件差异")
+async def api_team_change_diff(project_id: str, change_id: str,
+                               request: Request) -> dict:
+    user = _request_user(request)
+    _require_team_project(project_id, user)
+    return {"ok": True, **_version_call(team_versions.diff_change,
+                                         project_id, change_id)}
 
 
 @app.get("/api/v1/extensions", summary="插件 catalog 与启用状态")
@@ -1574,68 +2744,231 @@ async def api_sandbox_default(req: SandboxDefaultUpdate) -> dict:
     return {"ok": True, "message": msg, "default_mode": req.mode}
 
 
+def _create_job_record(*, messages: list[dict], title: str | None,
+                       session_id: int | None, request_id: str | None,
+                       workspace: str | None, session_version: int | None,
+                       project_id: str | None, model: str | None,
+                       temperature: float, requested_visibility: str | None,
+                       user: dict) -> dict:
+    if not messages:
+        raise HTTPException(422, "messages 不能为空")
+    owner = str(user.get("id") or "owner")
+    owner_name = str(user.get("name") or "Owner")
+    pid = str(project_id or "").strip()
+    if TEAM_SERVE_MODE and not pid:
+        raise HTTPException(422, "Hub 团队任务必须绑定已授权的团队项目")
+    visibility = "private"
+    is_team_project = False
+    if pid:
+        project = _projects.get_project(pid, include_checkpoints=0)
+        if not project:
+            raise HTTPException(404, "project_id 对应的项目不存在")
+        if (project.get("meta") or {}).get("status") == "archived":
+            raise HTTPException(409, "归档项目为只读状态，不能创建新任务")
+        if not _can_access_project(pid, user):
+            raise HTTPException(404, "项目不存在")
+        if TEAM_SERVE_MODE and not (project.get("meta") or {}).get("is_team"):
+            raise HTTPException(422, "Hub 只能派发团队项目任务")
+        if (project.get("meta") or {}).get("is_team"):
+            _require_project_member(pid, user)
+            if requested_visibility not in (None, "team"):
+                raise HTTPException(422, "团队项目任务的 visibility 固定为 team")
+            visibility = "team"
+            is_team_project = True
+        elif requested_visibility == "team":
+            raise HTTPException(422, "只有团队项目任务可以设置 visibility=team")
+    elif requested_visibility == "team":
+        raise HTTPException(422, "visibility=team 必须绑定团队 project_id")
+
+    fingerprint_payload = {
+        "messages": messages, "title": title, "session_id": session_id,
+        "request_id": request_id, "workspace": workspace,
+        "session_version": session_version, "project_id": pid,
+        "model": model, "temperature": temperature,
+        "visibility": requested_visibility,
+    }
+    request_fingerprint = hashlib.sha256(json.dumps(
+        fingerprint_payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+    if request_id:
+        try:
+            existing = _agent_jobs.find_idempotent_job(
+                owner=owner, project_id=pid, request_id=request_id,
+                request_fingerprint=request_fingerprint)
+        except _agent_jobs.JobIdempotencyConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if existing is not None:
+            return _agent_jobs.get_job(str(existing["id"])) or existing
+    try:
+        _agent_jobs.ensure_queue_capacity(owner=owner, project_id=pid)
+        _agent_jobs.ensure_storage_capacity()
+    except _agent_jobs.JobQueueLimitError as exc:
+        raise HTTPException(429, str(exc)) from exc
+
+    task_workspace = workspace or str(_get_workspace())
+    job_id = _agent_jobs.new_job_id()
+    prepared = None
+    if is_team_project:
+        prepared = _version_call(team_versions.create_task_workspace,
+                                 pid, job_id, user,
+                                 required_approvals=_team_change_required_approvals(pid),
+                                 policy_version=project_access.policy_version(pid),
+                                 eligible_reviewer_ids=_active_team_reviewers(pid))
+        task_workspace = prepared["workspace"]
+
+    job_session_id = None if visibility == "team" else session_id
+    job_session_version = None if visibility == "team" else session_version
+    job = _agent_jobs.create_job(
+        messages=messages, title=title, session_id=job_session_id,
+        workspace=task_workspace, project_id=pid,
+        session_version=job_session_version, model=model, temperature=temperature,
+        request_id=request_id, owner=owner, owner_name=owner_name,
+        owner_device_id=str(user.get("device_id") or ""),
+        visibility=visibility, job_id=job_id,
+        request_fingerprint=request_fingerprint,
+    )
+    if str(job.get("id") or "") != job_id:
+        # A concurrent duplicate was committed first. The HTTP entry point
+        # serializes this region, while this guard protects internal callers.
+        return _agent_jobs.get_job(str(job.get("id") or "")) or job
+    if prepared:
+        change = prepared["change"]
+        job = _agent_jobs.update_job(job_id, change_id=change["id"]) or job
+        _agent_jobs.append_event(job_id, "team_change", {
+            "change_id": change["id"], "status": "draft",
+            "project_id": pid, "base_sha": change["base_sha"]})
+    _agent_jobs.append_event(job_id, "status", {"status": "queued"})
+    team_collab.audit(owner, "job.create", {
+        "job_id": job_id, "project_id": pid, "visibility": visibility})
+    if not _agent_jobs.enqueue_job(job_id):
+        current = _agent_jobs.get_job(job_id) or job
+        if current.get("status") == "failed":
+            raise HTTPException(429, str(current.get("error") or "任务队列已满"))
+        raise HTTPException(409, "任务未能加入执行队列")
+    return _agent_jobs.get_job(job_id) or job
+
+
+def _create_job_record_serialized(**kwargs) -> dict:
+    with _job_create_lock:
+        return _create_job_record(**kwargs)
+
+
 @app.post("/api/v1/jobs", summary="创建异步 Agent 任务（排队后台执行）")
-async def api_create_job(req: JobCreateRequest) -> dict:
+async def api_create_job(req: JobCreateRequest, request: Request) -> dict:
     if not req.messages:
         raise HTTPException(422, "messages 不能为空")
     try:
-        job = _agent_jobs.create_job(
-            messages=req.messages,
-            title=req.title,
-            session_id=req.session_id,
-            workspace=req.workspace or str(_get_workspace()),
-            project_id=req.project_id,
-            session_version=req.session_version,
-            model=req.model,
-            temperature=req.temperature,
-            request_id=req.request_id,
-        )
+        job = await asyncio.to_thread(
+            _create_job_record_serialized,
+            messages=req.messages, title=req.title, session_id=req.session_id,
+            request_id=req.request_id, workspace=req.workspace,
+            session_version=req.session_version, project_id=req.project_id,
+            model=req.model, temperature=req.temperature,
+            requested_visibility=req.visibility, user=_request_user(request))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    _agent_jobs.enqueue_job(job["id"])
+    except _agent_jobs.JobQueueLimitError as exc:
+        raise HTTPException(429, str(exc)) from exc
     return {"ok": True, "job": job}
 
 
 @app.get("/api/v1/jobs", summary="异步任务列表")
-async def api_list_jobs(status: str | None = None, limit: int = 50) -> dict:
+async def api_list_jobs(request: Request, status: str | None = None, limit: int = 50,
+                        scope: str = "all") -> dict:
     if status and status not in _agent_jobs.JOB_STATUSES:
         raise HTTPException(422, f"无效 status：{status}")
-    jobs = _agent_jobs.list_jobs(status=status, limit=limit)
+    if scope not in ("all", "mine", "team"):
+        raise HTTPException(422, "scope 须为 all / mine / team")
+    user = _request_user(request)
+    rows = _agent_jobs.list_jobs(status=status, limit=200)
+    rows = [j for j in rows if _can_access_job(j, user)
+            and (scope == "all"
+                 or (scope == "mine" and str(j.get("owner") or "owner") == str(user.get("id") or "owner"))
+                 or (scope == "team" and j.get("visibility") == "team"))]
+    uid = str(user.get("id") or "owner")
+    rows = [{**j, "is_mine": str(j.get("owner") or "owner") == uid}
+            for j in rows]
+    jobs = rows[:max(1, min(int(limit or 50), 200))]
     active = sum(1 for j in jobs if j.get("status") in ("queued", "running", "waiting_confirm"))
     return {"ok": True, "jobs": jobs, "active_count": active}
 
 
 @app.get("/api/v1/jobs/{job_id}", summary="读取单个异步任务")
-async def api_get_job(job_id: str) -> dict:
+async def api_get_job(job_id: str, request: Request) -> dict:
     job = _agent_jobs.get_job(job_id)
-    if not job:
+    if not job or not _can_access_job(job, _request_user(request)):
         raise HTTPException(404, "任务不存在")
     return {"ok": True, "job": job}
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel", summary="取消排队中或运行中的任务")
-async def api_cancel_job(job_id: str) -> dict:
+async def api_cancel_job(job_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    job = _agent_jobs.get_job(job_id)
+    if not job or not _can_access_job(job, user):
+        raise HTTPException(404, "任务不存在")
+    if job.get("visibility") == "team":
+        pid = str(job.get("project_id") or "")
+        if (str(job.get("owner") or "") != str(user.get("id") or "")
+                and project_access.member_role(pid, str(user.get("id") or ""))
+                not in {"owner", "admin"}):
+            raise HTTPException(403, "只有任务发起人或项目 owner/admin 可以取消此任务")
     ok, msg = _agent_jobs.cancel_job(job_id)
     if not ok:
         raise HTTPException(409, msg)
+    _agent_jobs.append_event(job_id, "cancel_requested", {"actor_id": user.get("id")})
+    team_collab.audit(str(user.get("id") or "owner"), "job.cancel", {
+        "job_id": job_id, "project_id": job.get("project_id") or ""})
     return {"ok": True, "message": msg, "job": _agent_jobs.get_job(job_id)}
 
 
 @app.get("/api/v1/jobs/{job_id}/events", summary="任务事件 SSE（进度流）")
-async def api_job_events(job_id: str):
+async def api_job_events(job_id: str, request: Request):
     job = _agent_jobs.get_job(job_id)
-    if not job:
+    user = _request_user(request)
+    if not job or not _can_access_job(job, user):
         raise HTTPException(404, "任务不存在")
+    try:
+        last_event_id = max(0, int(request.headers.get("Last-Event-ID", "0") or "0"))
+    except ValueError:
+        last_event_id = 0
 
     async def _stream():
-        seen = 0
+        seen_seq = last_event_id
         terminal = _agent_jobs.JOB_STATUSES - {"queued", "running", "waiting_confirm"}
         while True:
             j = _agent_jobs.get_job(job_id) or {}
+            if not _can_access_job(j, user):
+                yield f"event: error\ndata: {json.dumps({'detail': '无权读取任务事件'}, ensure_ascii=False)}\n\n"
+                break
             events = j.get("events") or []
-            for ev in events[seen:]:
-                seen += 1
-                yield (f"event: {ev.get('kind', 'message')}\n"
+            valid_sequences = [int(ev.get("seq") or 0) for ev in events
+                               if isinstance(ev, dict) and str(ev.get("seq") or "").isdigit()]
+            if valid_sequences:
+                oldest_seq = min(valid_sequences)
+                latest_seq = max(valid_sequences)
+                if seen_seq < oldest_seq - 1:
+                    seen_seq = latest_seq
+                    yield (f"id: {latest_seq}\n"
+                           "event: resync\n"
+                           "data: " + json.dumps({
+                               "reason": "event_history_truncated",
+                               "oldest_event_id": oldest_seq,
+                               "latest_event_id": latest_seq,
+                               "status": j.get("status"),
+                           }, ensure_ascii=False) + "\n\n")
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                try:
+                    seq = int(ev.get("seq") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if seq <= seen_seq:
+                    continue
+                seen_seq = seq
+                yield (f"id: {seq}\n"
+                       f"event: {ev.get('kind', 'message')}\n"
                        f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
             st = j.get("status")
             if st in terminal:
@@ -1650,6 +2983,237 @@ async def api_job_events(job_id: str):
     )
 
 
+def _team_job_or_404(job_id: str, user: dict) -> dict:
+    job = _agent_jobs.get_job(job_id)
+    if not job or not _can_access_job(job, user):
+        raise HTTPException(404, "任务不存在")
+    if job.get("visibility") != "team":
+        raise HTTPException(404, "团队任务不存在")
+    _require_team_project(str(job.get("project_id") or ""), user)
+    return job
+
+
+def _append_change_event(job_id: str, action: str, change: dict,
+                         actor: dict) -> None:
+    data = {"change_id": change.get("id"), "project_id": change.get("project_id"),
+            "status": change.get("status"), "current_sha": change.get("current_sha"),
+            "actor_id": actor.get("id") or "owner"}
+    _agent_jobs.append_event(job_id, f"change_{action}", data)
+
+
+@app.get("/api/v1/jobs/{job_id}/workspace", summary="团队任务共享文件改动清单")
+async def api_team_job_workspace(job_id: str, request: Request) -> dict:
+    user = _request_user(request)
+    job = _team_job_or_404(job_id, user)
+    return {"ok": True, **_version_call(team_versions.workspace_status,
+                                        str(job["project_id"]), job_id)}
+
+
+@app.post("/api/v1/jobs/{job_id}/changes/commit", summary="按明确路径提交团队变更单")
+async def api_team_change_commit(job_id: str, req: TeamChangeCommit,
+                                 request: Request) -> dict:
+    user = _request_user(request)
+    job = _team_job_or_404(job_id, user)
+    _require_project_member(str(job["project_id"]), user)
+    uid = str(user.get("id") or "owner")
+    if uid != str(job.get("owner") or "owner"):
+        raise HTTPException(403, "只有任务发起人可以为该任务提交变更")
+    if job.get("status") in ("queued", "running", "waiting_confirm"):
+        raise HTTPException(409, "任务仍在执行，请完成后再提交变更")
+    change_id = str(job.get("change_id") or "")
+    if not change_id:
+        raise HTTPException(404, "该任务没有关联变更单")
+    change = _version_call(team_versions.commit_change,
+                           str(job["project_id"]), change_id, user,
+                           paths=req.paths, purpose=req.purpose,
+                           request_id=req.request_id)
+    if not change.get("already_processed"):
+        _append_change_event(job_id, "submitted", change, user)
+        team_collab.audit(uid, "team.change.commit", {
+            "change_id": change_id, "project_id": job["project_id"],
+            "job_id": job_id, "sha": change.get("current_sha"),
+            "paths": change.get("modified_files") or []})
+    return {"ok": True, "change": change}
+
+
+@app.post("/api/v1/projects/{project_id}/changes/{change_id}/submit",
+          summary="提交已有草稿供团队审阅")
+async def api_team_change_submit(project_id: str, change_id: str,
+                                 request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    change = _version_call(team_versions.get_change, project_id, change_id)
+    job = _team_job_or_404(str(change.get("job_id") or ""), user)
+    if str(user.get("id") or "owner") != str(change.get("author_id") or ""):
+        raise HTTPException(403, "只有变更作者可以提交草稿")
+    result = _version_call(team_versions.submit_change, project_id, change_id)
+    if not result.get("already_processed"):
+        _append_change_event(str(job["id"]), "submitted", result, user)
+        team_collab.audit(str(user.get("id") or "owner"), "team.change.submit", {
+            "change_id": change_id, "project_id": project_id,
+            "job_id": job["id"], "sha": result.get("current_sha")})
+    return {"ok": True, "change": result}
+
+
+@app.post("/api/v1/projects/{project_id}/changes/{change_id}/review",
+          summary="团队成员审阅并批准或拒绝变更")
+async def api_team_change_review(project_id: str, change_id: str,
+                                 req: TeamChangeReview, request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    change = _version_call(team_versions.get_change, project_id, change_id)
+    job = _team_job_or_404(str(change.get("job_id") or ""), user)
+    result = _version_call(team_versions.review_change,
+                           project_id, change_id, user,
+                           decision=req.decision, comment=req.comment,
+                           reviewed_sha=req.reviewed_sha,
+                           required_approvals=_team_change_required_approvals(project_id),
+                           active_reviewer_ids=_active_team_reviewers(project_id))
+    if not result.get("already_processed"):
+        _append_change_event(str(job["id"]), "reviewed", result, user)
+        team_collab.audit(str(user.get("id") or "owner"), "team.change.review", {
+            "change_id": change_id, "project_id": project_id,
+            "job_id": job["id"], "decision": req.decision,
+            "sha": result.get("current_sha"), "comment": req.comment[:500]})
+    if req.decision == "reject":
+        message = "已拒绝该变更"
+    elif result.get("status") == "approved":
+        message = (f"已批准（{result.get('approval_count', 1)}/"
+                   f"{result.get('required_approvals', 1)}）")
+    else:
+        message = (f"已记录批准票（{result.get('approval_count', 0)}/"
+                   f"{result.get('required_approvals', 1)}），等待其他成员审阅")
+    return {"ok": True, "change": result, "message": message}
+
+
+@app.post("/api/v1/projects/{project_id}/changes/{change_id}/merge",
+          summary="合并已审阅的团队变更")
+async def api_team_change_merge(project_id: str, change_id: str,
+                                request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    change = _version_call(team_versions.get_change, project_id, change_id)
+    job = _team_job_or_404(str(change.get("job_id") or ""), user)
+    try:
+        result = team_versions.merge_change(
+            project_id, change_id, user,
+            active_reviewer_ids=_active_team_reviewers(project_id))
+    except team_versions.VersionError as exc:
+        if exc.status_code == 409 and change.get("status") != "stale":
+            try:
+                stale = team_versions.get_change(project_id, change_id)
+            except team_versions.VersionError:
+                stale = {}
+            if stale.get("status") == "stale":
+                _append_change_event(str(job["id"]), "stale", stale, user)
+                team_collab.audit(str(user.get("id") or "owner"), "team.change.stale", {
+                    "change_id": change_id, "project_id": project_id,
+                    "job_id": job["id"], "sha": stale.get("current_sha"),
+                    "target_sha": stale.get("stale_head")})
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    if not result.get("already_processed"):
+        _append_change_event(str(job["id"]), "merged", result, user)
+        team_collab.audit(str(user.get("id") or "owner"), "team.change.merge", {
+            "change_id": change_id, "project_id": project_id,
+            "job_id": job["id"], "sha": result.get("merged_sha")})
+    return {"ok": True, "change": result,
+            "message": "该变更已合并" if not result.get("already_processed") else "变更此前已合并"}
+
+
+@app.post("/api/v1/projects/{project_id}/changes/{change_id}/rebase",
+          summary="显式刷新过期变更的基线并重新审阅")
+async def api_team_change_rebase(project_id: str, change_id: str,
+                                 request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    change = _version_call(team_versions.get_change, project_id, change_id)
+    job = _team_job_or_404(str(change.get("job_id") or ""), user)
+    result = _version_call(team_versions.rebase_change, project_id, change_id, user)
+    _append_change_event(str(job["id"]), "rebased", result, user)
+    team_collab.audit(str(user.get("id") or "owner"), "team.change.rebase", {
+        "change_id": change_id, "project_id": project_id,
+        "job_id": job["id"], "base_sha": result.get("base_sha"),
+        "sha": result.get("current_sha")})
+    return {"ok": True, "change": result,
+            "message": "基线已刷新，旧批准失效；请重新审阅当前差异"}
+
+
+def _create_revert_job_record(project_id: str, change: dict, user: dict, *,
+                              status: str, error: str = "") -> dict:
+    job_id = str(change.get("job_id") or "")
+    existing = _agent_jobs.get_job(job_id)
+    if existing:
+        return existing
+    workspace = _version_call(team_versions.workspace_for_job, project_id, job_id)
+    source_change_id = str(change.get("reverts_change_id") or "")
+    job = _agent_jobs.create_job(
+        messages=[{"role": "user",
+                   "content": f"回退团队变更 {source_change_id}：{change.get('purpose', '')}"}],
+        title=f"回退 {source_change_id}", workspace=str(workspace), project_id=project_id,
+        owner=str(user.get("id") or "owner"),
+        owner_name=str(user.get("name") or "Owner"),
+        owner_device_id=str(user.get("device_id") or ""),
+        visibility="team", job_id=job_id)
+    summary = ("已创建回退变更，等待另一名成员审阅" if status == "completed"
+               else "回退遇到文件冲突；刷新基线后可继续处理")
+    job = _agent_jobs.update_job(
+        job_id, status=status, started_at=time.time(), finished_at=time.time(),
+        change_id=change.get("id"), result_summary=summary if not error else "",
+        error=error) or job
+    event_kind = "team_change" if not error else "change_revert_conflict"
+    _agent_jobs.append_event(job_id, event_kind, {
+        "change_id": change.get("id"), "reverts_change_id": source_change_id,
+        "status": change.get("status"), "project_id": project_id,
+        "base_sha": change.get("base_sha"), "current_sha": change.get("current_sha"),
+        "actor_id": user.get("id") or "owner", "detail": error[:500]})
+    return _agent_jobs.get_job(job_id) or job
+
+
+@app.post("/api/v1/projects/{project_id}/changes/{change_id}/revert",
+          summary="创建需重新审阅的文件回退变更")
+async def api_team_change_revert(project_id: str, change_id: str,
+                                 req: TeamChangeRevert, request: Request) -> dict:
+    user = _request_user(request)
+    _require_project_member(project_id, user)
+    source_change = _version_call(team_versions.get_change, project_id, change_id)
+    new_job_id = _agent_jobs.new_job_id()
+    try:
+        change = team_versions.revert_change(
+            project_id, change_id, user, new_job_id, request_id=req.request_id,
+            required_approvals=_team_change_required_approvals(project_id),
+            policy_version=project_access.policy_version(project_id),
+            eligible_reviewer_ids=_active_team_reviewers(project_id))
+    except team_versions.VersionError as exc:
+        if not source_change.get("revert_change_id"):
+            try:
+                latest_source = team_versions.get_change(project_id, change_id)
+                revert_id = str(latest_source.get("revert_change_id") or "")
+                failed_change = (team_versions.get_change(project_id, revert_id)
+                                 if revert_id else {})
+            except team_versions.VersionError:
+                failed_change = {}
+            if failed_change.get("status") == "stale" and failed_change.get("error"):
+                failed_job = _create_revert_job_record(
+                    project_id, failed_change, user, status="failed", error=exc.detail)
+                team_collab.audit(str(user.get("id") or "owner"),
+                                  "team.change.revert_conflict", {
+                    "change_id": change_id, "revert_change_id": failed_change.get("id"),
+                    "project_id": project_id, "job_id": failed_job.get("id"),
+                    "sha": failed_change.get("current_sha"),
+                    "base_sha": failed_change.get("base_sha"), "detail": exc.detail[:500]})
+        raise HTTPException(exc.status_code, exc.detail) from exc
+    existing_job = _agent_jobs.get_job(str(change.get("job_id") or ""))
+    if existing_job:
+        return {"ok": True, "change": change, "job": existing_job,
+                "already_processed": True}
+    job = _create_revert_job_record(project_id, change, user, status="completed")
+    team_collab.audit(str(user.get("id") or "owner"), "team.change.revert", {
+        "change_id": change_id, "revert_change_id": change["id"],
+        "project_id": project_id, "job_id": job["id"],
+        "sha": change.get("current_sha")})
+    return {"ok": True, "change": change, "job": _agent_jobs.get_job(job["id"])}
+
+
 @app.post("/api/v1/dispatch/analyze", summary="分析输入应同步还是异步执行")
 async def api_dispatch_analyze(req: DispatchAnalyzeRequest) -> dict:
     result = analyze_dispatch(req.text, history_turns=req.history_turns)
@@ -1657,28 +3221,38 @@ async def api_dispatch_analyze(req: DispatchAnalyzeRequest) -> dict:
 
 
 @app.post("/api/v1/dispatch", summary="智能派发：分析后创建 Job 或返回同步建议")
-async def api_dispatch(req: DispatchRequest) -> dict:
+async def api_dispatch(req: DispatchRequest, request: Request) -> dict:
     text = (req.text or "").strip()
     if not text:
         raise HTTPException(422, "text 不能为空")
+    if TEAM_SERVE_MODE and not req.project_id:
+        raise HTTPException(422, "Hub 派活必须绑定团队项目")
     hist = 0
     if req.messages:
         hist = sum(1 for m in req.messages if m.get("role") == "user")
+    user = _request_user(request)
+    is_team_project = False
+    if req.project_id:
+        project = _projects.get_project(req.project_id, include_checkpoints=0)
+        if not project or not _can_access_project(req.project_id, user):
+            raise HTTPException(404, "项目不存在")
+        is_team_project = bool((project.get("meta") or {}).get("is_team"))
     analysis = analyze_dispatch(text, history_turns=max(0, hist - 1))
     mode = req.force_mode or analysis["mode"]
     if mode not in ("sync", "async"):
         raise HTTPException(422, "force_mode 须为 sync 或 async")
+    if is_team_project:
+        # Team work always runs against a task-specific worktree.
+        mode = "async"
     if mode == "sync":
         return {"ok": True, "mode": "sync", "analysis": analysis,
                 "hint": "请调用 POST /api/v1/chat/stream（agent=true）"}
     messages = req.messages or [{"role": "user", "content": text}]
-    job = _agent_jobs.create_job(
-        messages=messages,
-        title=text[:80],
-        session_id=req.session_id,
-        workspace=req.workspace or str(_get_workspace()),
-    )
-    _agent_jobs.enqueue_job(job["id"])
+    job = _create_job_record(
+        messages=messages, title=req.title or text[:80], session_id=req.session_id,
+        request_id=req.request_id, workspace=req.workspace,
+        session_version=None, project_id=req.project_id, model=None,
+        temperature=0.7, requested_visibility=None, user=user)
     return {"ok": True, "mode": "async", "analysis": analysis, "job": job}
 
 
@@ -1709,6 +3283,17 @@ async def api_memory_inject_preview(query: str = "", workspace: str | None = Non
         return {"ok": True, "enabled": False}
     preview = _agent_memory.inject_preview(query, workspace=workspace or str(_get_workspace()))
     return {"ok": True, "enabled": True, **preview}
+
+
+@app.get("/api/v1/memory/{memory_id}", summary="单条记忆 + 来源小票")
+async def api_memory_get(memory_id: str) -> dict:
+    if not _memory_enabled():
+        raise HTTPException(503, "记忆系统已关闭")
+    items = _agent_memory.list_memories(status="", limit=500)
+    hit = next((m for m in items if m.get("id") == memory_id), None)
+    if not hit:
+        raise HTTPException(404, "记忆不存在")
+    return {"ok": True, "memory": hit}
 
 
 @app.put("/api/v1/memory/profile", summary="更新 L3 画像偏好")
@@ -1773,6 +3358,42 @@ async def api_schedules_delete(schedule_id: str) -> dict:
     if not _schedules.delete_schedule(schedule_id):
         raise HTTPException(404, "定时任务不存在")
     return {"ok": True, "deleted": schedule_id}
+
+
+class PlanCreateRequest(BaseModel):
+    title: str = ""
+    steps: list[str] = Field(default_factory=list)
+
+
+@app.get("/api/v1/plans", summary="计划列表（含步骤状态）")
+async def api_plans_list() -> dict:
+    return {"ok": True, "plans": _plans.list_plans()}
+
+
+@app.post("/api/v1/plans", summary="创建计划（步骤初始为 pending）")
+async def api_plans_create(req: PlanCreateRequest) -> dict:
+    if not req.steps:
+        raise HTTPException(422, "steps 不能为空")
+    return {"ok": True, "plan": _plans.create_plan(req.title, req.steps)}
+
+
+@app.post("/api/v1/plans/{plan_id}/steps/{step_id}/{action}", summary="单步审批：approve/reject/done")
+async def api_plans_step(plan_id: str, step_id: str, action: str) -> dict:
+    mapping = {"approve": "approved", "reject": "rejected", "done": "done", "reopen": "pending"}
+    if action not in mapping:
+        raise HTTPException(422, "action 须为 approve/reject/done/reopen")
+    plan = _plans.set_step(plan_id, step_id, mapping[action])
+    if not plan:
+        raise HTTPException(404, "计划或步骤不存在")
+    return {"ok": True, "plan": plan}
+
+
+@app.post("/api/v1/plans/{plan_id}/approve-all", summary="一键通过全部 pending 步骤")
+async def api_plans_approve_all(plan_id: str) -> dict:
+    plan = _plans.approve_all(plan_id)
+    if not plan:
+        raise HTTPException(404, "计划不存在")
+    return {"ok": True, "plan": plan}
 
 
 @app.get("/api/v1/codegraph/stats", summary="CodeGraph 索引统计（当前工作区）")
@@ -1845,6 +3466,11 @@ async def set_workspace(req: WorkspaceUpdate) -> dict:
         log.warning("工作区配置保存失败：%s", exc)
     log.info("workspace -> %s（epoch %d）", p, _workspace_epoch)
     return {"ok": True, "workspace": str(p), "epoch": _workspace_epoch}
+
+
+@app.get("/api/v1/ready", summary="LLM 后端轻量就绪检查")
+async def ready() -> dict:
+    return {"ok": True, "service": "venus-llm", "version": APP_VERSION}
 
 
 @app.get("/api/v1/health", summary="LLM 后端健康检查")
@@ -2657,27 +4283,78 @@ def _scan_skills() -> list[dict]:
     return out
 
 
-def _skill_catalog_text() -> str:
+def _scan_team_skills(workspace: Path, project_id: str) -> list[dict]:
+    """Read only SKILL.md files inside the current project's declared roots."""
+    try:
+        shared_roots = team_versions.project_status(project_id).get("shared_paths") or []
+    except team_versions.VersionError:
+        return []
+    candidates: set[str] = set()
+    for raw in shared_roots:
+        try:
+            root = team_versions._assert_no_symlink(
+                workspace, team_versions._safe_relative(raw), allow_missing_leaf=False)
+        except team_versions.VersionError:
+            continue
+        if root.is_file():
+            if root.name.casefold() == "skill.md":
+                candidates.add(root.relative_to(workspace).as_posix())
+            continue
+        if not root.is_dir():
+            continue
+        for current, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [name for name in dirnames
+                           if not (Path(current) / name).is_symlink()]
+            if "SKILL.md" not in filenames:
+                continue
+            candidate = Path(current) / "SKILL.md"
+            if not candidate.is_symlink():
+                candidates.add(candidate.relative_to(workspace).as_posix())
+            if len(candidates) >= 100:
+                break
+        if len(candidates) >= 100:
+            break
+    out = []
+    for rel in sorted(candidates):
+        try:
+            path = team_versions._assert_no_symlink(
+                workspace, rel, allow_missing_leaf=False)
+            if path.stat().st_size > SKILL_MAX_CHARS * 8:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, team_versions.VersionError):
+            continue
+        name, desc = _parse_skill_frontmatter(text)
+        out.append({"name": name or Path(rel).parent.name,
+                    "description": desc, "dir": rel, "text": text})
+    return out
+
+
+def _skill_catalog_text(*, team_workspace: Path | None = None,
+                        team_project_id: str = "") -> str:
     """可用技能清单（只注入清单不注入全文，模型按需 load_skill 加载）。
 
     静态 skills/ + 动态记忆 Skill（active 状态；命名空间 dynamic: 不覆盖静态同名）。
     """
-    skills = _scan_skills()
+    team_scope = team_workspace is not None and bool(team_project_id)
+    skills = (_scan_team_skills(team_workspace, team_project_id)
+              if team_scope else _scan_skills())
     lines = []
     if skills:
         lines.append("可用技能包（任务匹配某技能时，用 load_skill 加载该技能全文再执行）：")
         for s in skills:
             lines.append(f"- {s['name']}：{s['description'] or '无描述'}")
-    # R4：动态 Skill（active）清单
-    try:
-        dyn = [s for s in _agent_memory.load_skills_dynamic()
-               if s.get("status") == "active"]
-        if dyn:
-            lines.append("可用动态技能（从成功任务提炼，按触发条件自动适配）：")
-            for s in dyn[:10]:
-                lines.append(f"- dynamic:{s['name']}：{s.get('trigger') or '无触发条件'}")
-    except Exception:
-        pass
+    # Personal dynamic skills are never visible inside shared team tasks.
+    if not team_scope:
+        try:
+            dyn = [s for s in _agent_memory.load_skills_dynamic()
+                   if s.get("status") == "active"]
+            if dyn:
+                lines.append("可用动态技能（从成功任务提炼，按触发条件自动适配）：")
+                for s in dyn[:10]:
+                    lines.append(f"- dynamic:{s['name']}：{s.get('trigger') or '无触发条件'}")
+        except Exception:
+            pass
     return "\n".join(lines)
 
 
@@ -2855,6 +4532,24 @@ def _call_daemon(method: str, path: str, payload: dict | None = None) -> tuple[i
 _workspace_lock = threading.Lock()
 _workspace_path: Path | None = None      # resolve 后的当前工作区（首次访问时从配置加载）
 _workspace_epoch = 0                     # 切换工作区时递增：旧任务检测到变化即中止（隔离）
+_workspace_override: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "venus_workspace_override", default=None)
+_task_project_override: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "venus_task_project_id", default="")
+_task_user_override: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "venus_task_user", default={})
+_team_job_override: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "venus_team_job", default=False)
+
+
+def _bound_project_id() -> str:
+    """Return only an explicitly task-bound project in Team Serve mode."""
+    bound = _task_project_override.get()
+    if bound:
+        return bound
+    if TEAM_SERVE_MODE:
+        return ""
+    return _projects.get_active_project_id()
 
 
 def _resolve_workspace(raw: str) -> Path | None:
@@ -2874,6 +4569,9 @@ def _get_workspace() -> Path:
 
     首次访问时从配置加载并 resolve 保存；切换（POST /api/v1/workspace）后全局生效。
     """
+    override = _workspace_override.get()
+    if override is not None:
+        return override
     global _workspace_path
     with _workspace_lock:
         if _workspace_path is None:
@@ -4231,15 +5929,23 @@ def _confirm_question(name: str, args: dict) -> tuple[str, str | None]:
 
 
 def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
-                  task_id: str = "", tool_name: str = "") -> str | None:
+                  task_id: str = "", tool_name: str = "",
+                  cancel_event: threading.Event | None = None) -> str | None:
     """等待用户对确认请求的响应；超时返回 None（视为拒绝）。
 
     条目绑定 task_id 与过期时间：agent_respond 校验，取消/完成/过期任务的确认被拒绝。
     团队模式下 required>1 时需收集足够 yes 票；任一 no 立即拒绝。
     """
     ev = threading.Event()
+    project_id = _bound_project_id()
     required = team_collab.required_votes(
-        tool_name or "unknown", project_id=_projects.get_active_project_id())
+        tool_name or "unknown", project_id=project_id)
+    eligible_reviewers: set[str] = set()
+    policy_version = 0
+    if TEAM_SERVE_MODE and project_id:
+        required = max(required, project_access.required_approvals(project_id))
+        eligible_reviewers = project_access.active_member_ids(project_id)
+        policy_version = project_access.policy_version(project_id)
     with _confirm_lock:
         _confirm_table[request_id] = {
             "event": ev, "choice": None,
@@ -4248,8 +5954,23 @@ def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
             "tool": tool_name,
             "required": required,
             "approvals": {},
+            "approval_devices": {},
+            "project_id": project_id,
+            "eligible_reviewer_ids": sorted(eligible_reviewers),
+            "policy_version": policy_version,
         }
-    ev.wait(timeout)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or ev.wait(min(0.25, remaining)):
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            with _confirm_lock:
+                current = _confirm_table.get(request_id)
+                if current is not None and current.get("choice") is None:
+                    current["choice"] = "no"
+                    current["event"].set()
+            break
     with _confirm_lock:
         entry = _confirm_table.pop(request_id, None)
         if not entry:
@@ -4262,6 +5983,50 @@ def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
 class AskResponse(BaseModel):
     request_id: str = Field(..., description="确认请求 ID")
     choice: str = Field(..., description="用户选择：yes / no 或选项文本")
+
+
+def _can_vote_on_confirmation(entry: dict, user: dict) -> bool:
+    if not TEAM_SERVE_MODE:
+        return True
+    project_id = str(entry.get("project_id") or "")
+    uid = str(user.get("id") or "")
+    if not project_id or not uid:
+        return False
+    if project_access.member_role(project_id, uid) not in {"owner", "admin", "member"}:
+        return False
+    if not project_access.can_access(project_id, user):
+        return False
+    eligible = set(str(value) for value in entry.get("eligible_reviewer_ids") or [])
+    if uid not in eligible:
+        return False
+    return int(entry.get("policy_version") or 0) == project_access.policy_version(project_id)
+
+
+def _confirm_vote_status(entry: dict) -> dict:
+    if not TEAM_SERVE_MODE:
+        return team_collab.confirm_vote_status(entry)
+    project_id = str(entry.get("project_id") or "")
+    eligible = set(str(value) for value in entry.get("eligible_reviewer_ids") or [])
+    active = project_access.active_member_ids(project_id) if project_id else set()
+    device_rows = entry.get("approval_devices") or {}
+    approvals = entry.get("approvals") or {}
+    valid: dict[str, str] = {}
+    for uid, decision in approvals.items():
+        if uid not in eligible or uid not in active:
+            continue
+        device_id = str(device_rows.get(uid) or "")
+        if not device_id or not project_access.access(project_id, uid, device_id):
+            continue
+        valid[str(uid)] = str(decision)
+    required = max(1, int(entry.get("required") or 1))
+    return {
+        "required": required,
+        "approvals": dict(approvals),
+        "yes_votes": sum(1 for vote in valid.values() if vote == "yes"),
+        "no_votes": sum(1 for vote in valid.values() if vote == "no"),
+        "resolved": entry.get("choice") is not None,
+        "choice": entry.get("choice"),
+    }
 
 
 @app.post("/api/v1/agent/respond", summary="响应 Agent 的确认请求")
@@ -4284,21 +6049,38 @@ async def agent_respond(req: AskResponse, request: Request) -> dict:
             raise HTTPException(404, "确认请求不存在或已超时（默认按拒绝处理）")
         if entry["expires"] < time.monotonic():
             raise HTTPException(404, "确认请求已过期（默认按拒绝处理）")
+        linked_job = _agent_jobs.find_job_by_task_id(str(entry.get("task_id") or ""))
+        if TEAM_SERVE_MODE:
+            if not linked_job or linked_job.get("visibility") != "team":
+                raise HTTPException(404, "确认请求不存在")
+            if not _can_vote_on_confirmation(entry, user):
+                raise HTTPException(404, "确认请求不存在或无权应答")
+            _require_project_member(str(linked_job.get("project_id") or ""), user)
+        if linked_job:
+            cancel_event = _agent_jobs.get_cancel_event(str(linked_job.get("id") or ""))
+            if (linked_job.get("status") in {"completed", "failed", "cancelled"}
+                    or (cancel_event is not None and cancel_event.is_set())):
+                raise HTTPException(409, "任务已取消或结束，不能再响应确认")
+        if linked_job and not _can_access_job(linked_job, user):
+            raise HTTPException(404, "确认请求不存在")
         with _agent_task_lock:
             current_task = _current_agent_task_id
         if entry["task_id"] and entry["task_id"] != current_task:
             raise HTTPException(404, "该确认请求所属任务已结束，无法应答")
         if entry["choice"] is not None:
-            status = team_collab.confirm_vote_status(entry)
+            status = _confirm_vote_status(entry)
             return {"ok": True, "choice": entry["choice"], "already_processed": True, **status}
 
         required = max(1, int(entry.get("required") or 1))
         if required > 1:
             approvals = entry.setdefault("approvals", {})
             if user_id in approvals:
-                status = team_collab.confirm_vote_status(entry)
+                status = _confirm_vote_status(entry)
                 return {"ok": True, "already_processed": True, **status}
             approvals[user_id] = vote
+            if TEAM_SERVE_MODE:
+                entry.setdefault("approval_devices", {})[user_id] = str(
+                    user.get("device_id") or "")
             team_collab.audit(user_id, "confirm.vote", {
                 "request_id": req.request_id,
                 "tool": entry.get("tool"),
@@ -4308,24 +6090,28 @@ async def agent_respond(req: AskResponse, request: Request) -> dict:
                 entry["choice"] = "no"
                 task_id_for_job = entry.get("task_id") or ""
                 entry["event"].set()
-                status = team_collab.confirm_vote_status(entry)
+                status = _confirm_vote_status(entry)
                 log.info("confirm %s veto by %s", req.request_id, user_id)
                 _resume_job_after_confirm(task_id_for_job)
                 return {"ok": True, "choice": "no", "resolved": True, **status}
-            yes_votes = sum(1 for v in approvals.values() if v == "yes")
+            yes_votes = _confirm_vote_status(entry)["yes_votes"]
             if yes_votes >= required:
                 entry["choice"] = "yes"
                 task_id_for_job = entry.get("task_id") or ""
                 entry["event"].set()
-                status = team_collab.confirm_vote_status(entry)
+                status = _confirm_vote_status(entry)
                 log.info("confirm %s approved (%d/%d)", req.request_id, yes_votes, required)
                 _resume_job_after_confirm(task_id_for_job)
                 return {"ok": True, "choice": "yes", "resolved": True, **status}
-            status = team_collab.confirm_vote_status(entry)
+            status = _confirm_vote_status(entry)
             log.info("confirm %s vote %s (%d/%d)", req.request_id, user_id, yes_votes, required)
             return {"ok": True, "pending": True, **status}
 
         entry["choice"] = req.choice
+        if TEAM_SERVE_MODE:
+            entry.setdefault("approvals", {})[user_id] = vote
+            entry.setdefault("approval_devices", {})[user_id] = str(
+                user.get("device_id") or "")
         task_id_for_job = entry.get("task_id") or ""
         entry["event"].set()
         team_collab.audit(user_id, "confirm.vote", {
@@ -4573,12 +6359,68 @@ def _execute_tool(name: str, arguments: str,
     由 agent 循环传入；纯函数测试/其他调用可省略。
     """
     """执行工具，返回 (ok, 结果文本)。在工作线程中调用。"""
+    if cancel is not None and cancel.is_set():
+        return False, "任务已取消，工具未执行"
     if ISOLATED and name in _SCREEN_TOOLS:
         return False, "隔离模式：屏幕操作工具已禁用（llm_server 以 --isolated 运行）"
     try:
         args = json.loads(arguments or "{}")
     except json.JSONDecodeError:
         return False, "工具参数不是合法 JSON"
+    team_job = _team_job_override.get()
+    team_project_id = _bound_project_id() if team_job else ""
+    if TEAM_SERVE_MODE:
+        # This server is shared by multiple projects. Never let a generic
+        # chat/private Job use the Hub host's tools. Team Jobs may only use
+        # task-worktree file and read-only project tools; command/code/MCP,
+        # processes, personal stores and machine-global tools stay local.
+        team_tools = {
+            "create_folder", "list_folder", "create_file", "read_file",
+            "delete_file", "delete_folder", "move_file", "rename_file",
+            "copy_file", "search_text", "glob_files", "list_symbols",
+            "replace_text", "git_status", "git_diff", "git_log",
+            "repo_map", "load_skill", "get_project", "list_projects",
+        }
+        if not team_job or not team_project_id:
+            return False, "Hub 仅允许绑定团队项目的 Job 使用工具"
+        actor = _task_user_override.get()
+        bound_project = _projects.get_project(team_project_id, include_checkpoints=0)
+        if (not bound_project or not (bound_project.get("meta") or {}).get("is_team")
+                or not project_access.can_access(team_project_id, actor)):
+            return False, "当前任务的项目或终端授权已失效"
+        actor_role = project_access.member_role(
+            team_project_id, str(actor.get("id") or ""))
+        if actor_role not in {"owner", "admin", "member", "viewer"}:
+            return False, "当前用户已不属于此项目"
+        if name not in team_tools:
+            return False, "此工具不能在共享 Hub 宿主机执行"
+        write_tools = {
+            "create_folder", "create_file", "delete_file", "delete_folder",
+            "move_file", "rename_file", "copy_file", "replace_text",
+        }
+        if name in write_tools and actor_role not in {"owner", "admin", "member"}:
+            return False, "viewer 无权修改团队工作区"
+    if team_job and name in ("git_commit", "git_push"):
+        return False, "团队任务不能绕过变更单直接提交 Git；请通过团队协作入口提交明确文件路径"
+    if team_job and name in ("remember", "recall_memory"):
+        return False, "团队任务不能读取或修改个人记忆"
+    if team_job and name in ("create_todo", "update_todo", "list_todos"):
+        return False, "团队任务不能读取或修改个人待办清单"
+    if team_job and name == "create_project":
+        return False, "团队任务不能创建或切换 Hub 项目"
+    if team_job and name == "delegate":
+        return False, "团队任务暂不读取 Hub 本机子 Agent 定义；请由主 Agent 在隔离工作区完成"
+    if team_job and name in ("get_project", "update_project", "add_milestone",
+                             "update_milestone", "save_checkpoint", "link_todo"):
+        requested_project = str(args.get("project_id") or "").strip()
+        if requested_project and requested_project != team_project_id:
+            return False, "团队任务只能访问当前绑定的团队项目"
+    if team_job:
+        if name == "run_shell":
+            command = str(args.get("command") or "")
+            if re.search(r"\bgit\s+(add|commit|merge|rebase|reset|checkout|switch|push|clean|worktree)\b",
+                         command, flags=re.IGNORECASE):
+                return False, "团队任务不能通过 shell 修改 Git 历史；请使用变更单流程"
     try:
         # ---- 参数安全校验 ----
         if name == "type_text":
@@ -5276,25 +7118,35 @@ def _execute_tool(name: str, arguments: str,
             _projects.set_active_project(result["created"]["id"])
             return True, json.dumps(result, ensure_ascii=False)
         if name == "update_project":
-            pid = (args.get("project_id") or "").strip()
+            pid = (args.get("project_id") or team_project_id).strip()
             fields = {k: args[k] for k in ("title", "goal", "status", "is_team")
                       if k in args and args[k] is not None}
+            if team_job:
+                fields.pop("is_team", None)
             ok, result = _projects.update_project(pid, **fields)
             return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         if name == "get_project":
-            pid = (args.get("project_id") or _projects.get_active_project_id()).strip()
+            pid = (args.get("project_id") or team_project_id
+                   or _projects.get_active_project_id()).strip()
             proj = _projects.get_project(pid)
             if proj is None:
                 return False, f"项目不存在：{pid or '(未指定)'}"
             return True, json.dumps(proj, ensure_ascii=False)
         if name == "list_projects":
             status = (args.get("status") or "").strip() or None
-            items = _projects.list_projects(status=status)
-            return True, json.dumps({"projects": items, "active": _projects.get_active_project_id()},
+            if team_job:
+                items = ([p for p in _projects.list_projects(status=status)
+                          if str(p.get("id") or "") == team_project_id]
+                         if _projects.is_team_project(team_project_id) else [])
+                active = team_project_id if items else ""
+            else:
+                items = _projects.list_projects(status=status)
+                active = _projects.get_active_project_id()
+            return True, json.dumps({"projects": items, "active": active},
                                     ensure_ascii=False)
         if name == "add_milestone":
             ok, result = _projects.add_milestone(
-                args.get("project_id") or "", args.get("title") or "", args.get("notes") or "")
+                args.get("project_id") or team_project_id, args.get("title") or "", args.get("notes") or "")
             return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         if name == "update_milestone":
             try:
@@ -5302,12 +7154,12 @@ def _execute_tool(name: str, arguments: str,
             except (TypeError, ValueError):
                 return False, "milestone_id 必须是整数"
             ok, result = _projects.update_milestone(
-                args.get("project_id") or "", mid,
+                args.get("project_id") or team_project_id, mid,
                 status=args.get("status"), notes=args.get("notes"))
             return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         if name == "save_checkpoint":
             ok, result = _projects.save_checkpoint(
-                args.get("project_id") or "",
+                args.get("project_id") or team_project_id,
                 args.get("summary") or "",
                 args.get("next_step") or "",
                 args.get("blockers") or "",
@@ -5318,7 +7170,7 @@ def _execute_tool(name: str, arguments: str,
                 tid = int(args.get("todo_id"))
             except (TypeError, ValueError):
                 return False, "todo_id 必须是整数"
-            ok, result = _projects.link_todo(args.get("project_id") or "", tid)
+            ok, result = _projects.link_todo(args.get("project_id") or team_project_id, tid)
             return (True, json.dumps(result, ensure_ascii=False)) if ok else (False, str(result))
         # ================= 编程工具：项目索引 =================
         if name == "repo_map":
@@ -5334,7 +7186,8 @@ def _execute_tool(name: str, arguments: str,
             return False, f"执行失败：{data.get('detail', code)}"
         if name == "load_skill":
             sname = (args.get("name") or "").strip()
-            skills = _scan_skills()
+            skills = (_scan_team_skills(_get_workspace(), team_project_id)
+                      if team_job else _scan_skills())
             hit = next((s for s in skills if s["name"] == sname), None)
             if hit is None:
                 avail = "、".join(s["name"] for s in skills) or "无"
@@ -5631,10 +7484,25 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
     """
     global _current_agent_task_id
     global _pending_git_snapshot
+    workspace_token = project_token = user_token = team_token = None
     if run_record is not None:
         run_record.setdefault("started_at", time.time())
         run_record.setdefault("tool_events", [])
         run_record.setdefault("status", "")
+        bound_workspace = str(run_record.get("agent_workspace") or "").strip()
+        if bound_workspace:
+            workspace_token = _workspace_override.set(Path(bound_workspace).resolve())
+        bound_project = str(run_record.get("project_id") or "").strip()
+        if bound_project:
+            project_token = _task_project_override.set(bound_project)
+        actor = run_record.get("task_actor")
+        if isinstance(actor, dict):
+            user_token = _task_user_override.set({
+                "id": str(actor.get("id") or ""),
+                "device_id": str(actor.get("device_id") or ""),
+                "name": str(actor.get("name") or ""),
+            })
+        team_token = _team_job_override.set(bool(run_record.get("team_job")))
     if depth == 0 and task_id:
         with _agent_task_lock:
             _current_agent_task_id = task_id
@@ -5847,10 +7715,11 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                            "options": ["yes", "no"],
                                            "plan": plan_steps,
                                            "required": team_collab.required_votes(
-                                               "create_plan", project_id=_projects.get_active_project_id()),
+                                               "create_plan", project_id=_bound_project_id()),
                                            "approvals": {}}))
                             choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
-                                                   task_id=task_id, tool_name="create_plan")
+                                                   task_id=task_id, tool_name="create_plan",
+                                                   cancel_event=cancel)
                             if time.monotonic() - start > _MAX_SECS:
                                 # 确认等待也计入任务总时长
                                 q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
@@ -5902,9 +7771,10 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                        "options": ["yes", "no"],
                                        "diff": _confirm_question(fn["name"], args)[1],
                                        "required": team_collab.required_votes(
-                                           fn["name"], project_id=_projects.get_active_project_id()),
+                                           fn["name"], project_id=_bound_project_id()),
                                        "approvals": {}}))
-                        choice = _wait_confirm(ask_id, task_id=task_id, tool_name=fn["name"])
+                        choice = _wait_confirm(ask_id, task_id=task_id,
+                                               tool_name=fn["name"], cancel_event=cancel)
                         if time.monotonic() - start > _MAX_SECS:
                             q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
                             return f"任务超过总时长上限 {_MAX_SECS}s"
@@ -5932,9 +7802,10 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                        "question": question,
                                        "options": ["yes", "no"], "diff": diff,
                                        "required": team_collab.required_votes(
-                                           fn["name"], project_id=_projects.get_active_project_id()),
+                                           fn["name"], project_id=_bound_project_id()),
                                        "approvals": {}}))
-                        choice = _wait_confirm(ask_id, task_id=task_id, tool_name=fn["name"])
+                        choice = _wait_confirm(ask_id, task_id=task_id,
+                                               tool_name=fn["name"], cancel_event=cancel)
                         if time.monotonic() - start > _MAX_SECS:
                             q.put(("error", f"任务超过总时长上限 {_MAX_SECS}s（含确认等待），已自动中止"))
                             return f"任务超过总时长上限 {_MAX_SECS}s"
@@ -5977,7 +7848,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                           if _rmeta and _rmeta.get("result_id") else {})}))
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
                 # 任务清单变化：推送 todo_update 事件（前端刷新任务面板）
-                if fn["name"] in ("create_todo", "update_todo"):
+                if (not _team_job_override.get()
+                        and fn["name"] in ("create_todo", "update_todo")):
                     q.put(("todo_update", _todos_snapshot()))
                 # 连续失败熔断
                 consecutive_failures = 0 if ok else consecutive_failures + 1
@@ -6006,6 +7878,14 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
             with _modified_lock:
                 _agent_modified_files.clear()
                 _agent_modified_files.update(_modified_baseline)
+        if workspace_token is not None:
+            _workspace_override.reset(workspace_token)
+        if project_token is not None:
+            _task_project_override.reset(project_token)
+        if user_token is not None:
+            _task_user_override.reset(user_token)
+        if team_token is not None:
+            _team_job_override.reset(team_token)
 
 def _agent_limits() -> tuple[int, int]:
     """工具轮数/任务时长上限：优先配置（设置界面保存后实时生效），否则默认常量。"""
@@ -6022,12 +7902,17 @@ def _new_task_id() -> str:
 
 
 def _build_agent_messages(messages: list[dict], *, workspace: str = "",
-                          project_id: str | None = None) -> list[dict]:
+                          project_id: str | None = None,
+                          team_job: bool = False) -> list[dict]:
     """组装 Agent 模式消息：记忆注入 + system 后缀 + 任务/项目/技能/子 agent 清单。"""
     messages = [dict(m) for m in _trim_messages(messages)]
+    project_note = ("" if TEAM_SERVE_MODE and not project_id
+                    else _projects.project_system_note(project_id))
     last_user = next((str(m.get("content") or "") for m in reversed(messages)
                       if m.get("role") == "user"), "")
-    dyn = _dynamic_memory_message(last_user, workspace=workspace)
+    # Team task prompts and results are visible to project members. Do not
+    # inject one user's private memories into that shared execution context.
+    dyn = None if team_job else _dynamic_memory_message(last_user, workspace=workspace)
     if dyn:
         insert_at = 0
         while insert_at < len(messages) and messages[insert_at].get("role") == "system":
@@ -6040,14 +7925,22 @@ def _build_agent_messages(messages: list[dict], *, workspace: str = "",
         if "（动态记忆上下文" in (m.get("content") or ""):
             continue
         m["content"] = (m.get("content") or "") + AGENT_SYSTEM_SUFFIX
-        todo_note = _todos_system_note()
+        if team_job:
+            m["content"] += (
+                "\n\n团队任务约束：你在项目专属隔离 worktree 中工作；只编辑本项目共享范围内的文件。"
+                "不要访问 Hub 的其他项目、个人记忆、个人待办或本机子 Agent。"
+                "团队技能只能通过 load_skill 读取本项目共享范围内的 SKILL.md。"
+                "不要直接提交 Git；完成后由发起人在团队任务卡片提交明确路径，再由成员审阅。")
+        todo_note = "" if team_job else _todos_system_note()
         if todo_note:
             m["content"] += todo_note
-        project_note = _projects.project_system_note(project_id)
         if project_note:
             m["content"] += project_note
-        m["content"] += _skill_catalog_text()
-        m["content"] += _agent_catalog_text()
+        m["content"] += (_skill_catalog_text(
+            team_workspace=Path(workspace), team_project_id=str(project_id or ""))
+            if team_job else _skill_catalog_text())
+        if not team_job:
+            m["content"] += _agent_catalog_text()
         if _current_confirm_mode() == "plan":
             m["content"] += (
                 "\n\n（当前为计划审批模式：收到任务后先用 create_plan 提交计划，"
@@ -6057,9 +7950,14 @@ def _build_agent_messages(messages: list[dict], *, workspace: str = "",
         break
     if not appended:
         messages.insert(0, {"role": "system",
-                            "content": AGENT_SYSTEM_SUFFIX.lstrip() + _todos_system_note()
-                            + _projects.project_system_note(project_id)
-                            + _skill_catalog_text() + _agent_catalog_text()})
+                            "content": AGENT_SYSTEM_SUFFIX.lstrip()
+                            + ("" if team_job else _todos_system_note())
+                            + project_note
+                            + (_skill_catalog_text(
+                                team_workspace=Path(workspace),
+                                team_project_id=str(project_id or ""))
+                               if team_job else _skill_catalog_text())
+                            + ("" if team_job else _agent_catalog_text())})
     return messages
 
 
@@ -6067,7 +7965,12 @@ def _schedule_loop() -> None:
     """每分钟检查定时任务，到点创建异步 Job。"""
     while True:
         try:
-            for s in _schedules.due_schedules():
+            # 固定一次检查的本地日期；due_schedules 与 mark_ran 使用相同日期，
+            # 使同日重试幂等、次日触发仍会创建新 Job。
+            now = time.localtime()
+            today = time.strftime("%Y-%m-%d", now)
+            now_hhmm = time.strftime("%H:%M", now)
+            for s in _schedules.due_schedules(now_hhmm=now_hhmm, today=today):
                 prompt = str(s.get("prompt") or "").strip()
                 if not prompt:
                     continue
@@ -6075,19 +7978,24 @@ def _schedule_loop() -> None:
                     messages=[{"role": "user", "content": prompt}],
                     title=prompt[:80],
                     session_id=s.get("session_id"),
-                    request_id=f"schedule-{s.get('id')}",
+                    request_id=_schedule_occurrence_request_id(s.get("id"), today),
                 )
                 _agent_jobs.enqueue_job(job["id"])
-                _schedules.mark_ran(s["id"])
+                _schedules.mark_ran(s["id"], when=f"{today} {now_hhmm}")
                 log.info("定时任务 %s -> job %s", s.get("id"), job["id"])
         except Exception:
             log.debug("schedule loop 异常", exc_info=True)
         time.sleep(30)
 
 
+def _schedule_occurrence_request_id(schedule_id: object, today: str) -> str:
+    """为单个日历日的定时任务生成稳定幂等键。"""
+    return f"schedule-{schedule_id}-{today}"
+
+
 def _execute_agent_job(job_id: str) -> None:
     """AgentJobWorker 回调：在后台线程中执行单个异步任务。"""
-    job = _agent_jobs.get_job(job_id)
+    job = _agent_jobs.get_job_internal(job_id)
     if not job or job.get("status") != "queued":
         return
 
@@ -6105,14 +8013,11 @@ def _execute_agent_job(job_id: str) -> None:
         return
 
     cancel = _agent_jobs.bind_cancel_event(job_id)
-    _agent_jobs.update_job(job_id, status="running", started_at=time.time())
-    _agent_jobs.append_event(job_id, "status", {"status": "running"})
-
-    if not _agent_lock.acquire(blocking=True, timeout=3600):
-        _agent_jobs.update_job(job_id, status="failed", finished_at=time.time(),
-                               error="等待 Agent 执行锁超时")
+    started_job = _agent_jobs.update_job(job_id, status="running", started_at=time.time())
+    if not started_job or started_job.get("status") != "running":
         _agent_jobs.clear_cancel_event(job_id)
         return
+    _agent_jobs.append_event(job_id, "status", {"status": "running"})
 
     task_id = _new_task_id()
     q: queue.Queue = queue.Queue()
@@ -6120,6 +8025,13 @@ def _execute_agent_job(job_id: str) -> None:
         "session_id": job.get("session_id"),
         "request_id": job.get("request_id") or task_id,
         "workspace": job.get("workspace") or "",
+        "project_id": job.get("project_id") or "",
+        "team_job": job.get("visibility") == "team",
+        "task_actor": {"id": job.get("owner") or "",
+                       "device_id": job.get("_owner_device_id") or "",
+                       "name": job.get("owner_name") or ""},
+        "agent_workspace": (job.get("workspace") or "")
+                           if job.get("visibility") == "team" else "",
         "session_version": job.get("session_version"),
         "input_messages": [dict(m) for m in job.get("messages") or []],
         "status": "", "final_answer": "", "tool_events": [],
@@ -6132,6 +8044,7 @@ def _execute_agent_job(job_id: str) -> None:
         job.get("messages") or [],
         workspace=str(job.get("workspace") or ""),
         project_id=job.get("project_id") or None,
+        team_job=job.get("visibility") == "team",
     )
     temperature = float(job.get("temperature") or 0.7)
     content_parts: list[str] = []
@@ -6144,12 +8057,32 @@ def _execute_agent_job(job_id: str) -> None:
                     0, None, None, task_id, run_record)
 
     t = threading.Thread(target=_worker, daemon=True, name=f"agent-job-{job_id}")
-    t.start()
-
     _lim_steps, lim_secs = _agent_limits()
-    deadline = time.monotonic() + lim_secs + 180
+    lock_deadline = time.monotonic() + 3600
+    acquired = False
+    while not cancel.is_set() and time.monotonic() < lock_deadline:
+        if _agent_lock.acquire(timeout=0.5):
+            acquired = True
+            break
+    if not acquired:
+        if cancel.is_set():
+            _agent_jobs.update_job(job_id, status="cancelled", finished_at=time.time(),
+                                   error="用户取消（等待 Agent 执行锁期间）")
+        else:
+            _agent_jobs.update_job(job_id, status="failed", finished_at=time.time(),
+                                   error="等待 Agent 执行锁超时")
+        _agent_jobs.clear_cancel_event(job_id)
+        return
+    if cancel.is_set():
+        _agent_jobs.update_job(job_id, status="cancelled", finished_at=time.time(),
+                               error="用户取消（等待 Agent 执行锁期间）")
+        _agent_lock.release()
+        _agent_jobs.clear_cancel_event(job_id)
+        return
 
     try:
+        t.start()
+        deadline = time.monotonic() + lim_secs + 180
         while t.is_alive() or not q.empty():
             if time.monotonic() > deadline:
                 cancel.set()
@@ -6190,9 +8123,13 @@ def _execute_agent_job(job_id: str) -> None:
                 final_status = "cancelled" if cancel.is_set() else "failed"
                 _agent_jobs.append_event(job_id, "error", {"detail": error_msg})
                 break
-        if t.is_alive():
-            t.join(timeout=60)
     finally:
+        # Keep the global Agent lock until all tool code has stopped. In
+        # particular, timeout/cancel cannot release it while a blocking tool
+        # call is still touching shared state or a workspace.
+        if t.ident is not None and t.is_alive():
+            cancel.set()
+            t.join()
         global _current_agent_task_id
         with _agent_task_lock:
             _current_agent_task_id = ""
@@ -6237,6 +8174,17 @@ def _execute_agent_job(job_id: str) -> None:
                  {"role": "assistant", "content": summary}],
                 request_id=f"job-{job_id}",
             )
+    if job.get("visibility") == "team":
+        try:
+            changes = team_versions.workspace_status(
+                str(job.get("project_id") or ""), job_id)
+            _agent_jobs.append_event(job_id, "team_workspace", {
+                "project_id": job.get("project_id"),
+                "change_id": job.get("change_id") or "",
+                "files": changes.get("files") or [],
+                "status": final_status})
+        except Exception:
+            log.debug("读取团队任务改动清单失败：%s", job_id, exc_info=True)
     log.info("agent job %s -> %s", job_id, final_status)
 
 
@@ -6261,7 +8209,9 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
                                session_id: int | None = None,
                                request_id: str | None = None,
                                workspace: str | None = None,
-                               session_version: int | None = None):
+                               session_version: int | None = None,
+                               project_id: str | None = None,
+                               actor: dict | None = None):
     """把 agent 循环的事件流转发为 SSE；客户端断开时通知循环线程停止。
 
     并发互斥：持有 _agent_lock 期间不允许第二条 Agent 任务启动；
@@ -6280,6 +8230,10 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
     loop = asyncio.get_running_loop()
     run_record = {"session_id": session_id, "request_id": request_id or task_id,
                   "workspace": workspace or "",
+                  "project_id": project_id or "",
+                  "task_actor": {"id": str((actor or {}).get("id") or ""),
+                                 "device_id": str((actor or {}).get("device_id") or ""),
+                                 "name": str((actor or {}).get("name") or "")},
                   "session_version": session_version,
                   "input_messages": [dict(m) for m in messages],
                   "status": "", "final_answer": "", "tool_events": [],
@@ -6372,7 +8326,18 @@ async def _agent_stream_events(api_url: str, headers: dict, messages: list[dict]
 # 流式聊天（SSE）：上游逐块转发，读取在后台线程，事件循环不阻塞
 # --------------------------------------------------------------------------
 @app.post("/api/v1/chat/stream", summary="流式聊天（SSE 逐块返回；agent=true 启用工具调用循环）")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
+    user = _request_user(request)
+    if TEAM_SERVE_MODE and req.agent:
+        raise HTTPException(409, "Hub Agent 任务必须通过绑定项目的 /api/v1/jobs 派发")
+    is_team_project = False
+    if req.project_id:
+        project = _projects.get_project(req.project_id, include_checkpoints=0)
+        if not project or not _can_access_project(req.project_id, user):
+            raise HTTPException(404, "项目不存在")
+        is_team_project = bool((project.get("meta") or {}).get("is_team"))
+    if req.agent and is_team_project:
+        raise HTTPException(409, "团队项目 Agent 任务必须通过 /api/v1/jobs 派发，以创建隔离 worktree")
     cfg = load_config()
     api_url = normalize_url(cfg.get("api_url"))
     api_key = (cfg.get("api_key") or "").strip()
@@ -6391,7 +8356,9 @@ async def chat_stream(req: ChatRequest):
             _agent_stream_events(api_url, headers, messages, model, req.temperature,
                                  session_id=req.session_id, request_id=req.request_id,
                                  workspace=req.workspace,
-                                 session_version=req.session_version),
+                                 session_version=req.session_version,
+                                 project_id=req.project_id,
+                                 actor=user),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -6546,7 +8513,25 @@ if __name__ == "__main__":
                         help="启用 token 鉴权（远程访问时强烈建议设置）")
     parser.add_argument("--isolated", action="store_true",
                         help="隔离模式：禁用屏幕操作工具，只保留文件类工具（WSL 隔离测试用）")
+    parser.add_argument("--team-serve", action="store_true",
+                        help="启用单团队 Tailscale Serve 身份代理模式（必须同时使用 --isolated）")
+    parser.add_argument("--team-host", default="",
+                        help="Tailscale Serve 的精确 HTTPS 主机名，例如 hub.example.ts.net")
     args = parser.parse_args()
+    team_host = str(args.team_host or "").strip().lower()
+    if args.team_serve:
+        if not args.isolated:
+            parser.error("--team-serve 必须与 --isolated 一起使用")
+        if str(args.host).strip().lower() not in ("127.0.0.1", "localhost"):
+            parser.error("--team-serve 后端只能绑定 127.0.0.1 或 localhost")
+        if args.token:
+            parser.error("--team-serve 使用 Tailscale Serve 身份与设备凭证；不要设置共享 --token")
+        if (not team_host.endswith(".ts.net") or
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", team_host) or
+                ".." in team_host):
+            parser.error("--team-host 须是精确的 Tailscale HTTPS 域名（*.ts.net）")
+    elif team_enrollment.is_initialized():
+        parser.error("此 Hub 已初始化团队，必须使用 --isolated --team-serve --team-host")
     # 安全要求：绑定非回环地址时必须提供 token（否则拒绝启动）
     if not _is_loopback(args.host) and not args.token:
         print(f"错误：绑定非回环地址（{args.host}）时必须提供 --token 鉴权，"
@@ -6555,6 +8540,15 @@ if __name__ == "__main__":
         sys.exit(1)
     AUTH_TOKEN = args.token   # 模块级赋值即修改全局
     ISOLATED = args.isolated
+    TEAM_SERVE_MODE = args.team_serve
+    TEAM_SERVE_HOST = team_host if args.team_serve else ""
+    if TEAM_SERVE_MODE:
+        try:
+            if team_enrollment.ensure_bootstrap_credential():
+                log.info("Hub 首次初始化凭证已保存在本机 secure_store；请在 Hub 本机 VenusChat 的“团队”页面初始化。")
+        except team_enrollment.EnrollmentError as exc:
+            log.error("团队 Hub 安全初始化失败：%s", exc.detail)
+            sys.exit(1)
     # ---- 密钥迁移：旧明文 api_key → 安全存储（配置文件只保留占位符）----
     try:
         from secure_store import PLACEHOLDER as _SS_PH, store as _ss_store

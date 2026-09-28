@@ -26,8 +26,11 @@ mcp_config.json
 # 本地工具二进制（不入库）
 tools/
 
-# 量化子项目作为隔离子目录纳入主仓库；其缓存、数据库、日志和构建产物
-# 由 quant-agent-lab/.gitignore 单独排除。
+# 已从主仓库移出的独立量化子项目；保留本机文件，不再跟踪。
+/quant-agent-lab/
 
-artifacts/gui/
+# 本地调试、预览和临时文件。
+/artifacts/
+/tmp/
+/output/
 

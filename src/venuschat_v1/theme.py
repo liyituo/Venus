@@ -1,4 +1,4 @@
-"""VenusChat V1 classical-minimal design tokens.
+"""VenusChat V1 warm, readable design tokens.
 
 This module is deliberately standalone.  It does not import the legacy chat
 theme or any backend module, which keeps the V1 visual experiment isolated.
@@ -32,8 +32,8 @@ LINE_STRONG = "#CFC3B9"
 # Ink ----------------------------------------------------------------------
 INK = "#292520"
 INK_SOFT = "#59524C"
-INK_MUTED = "#837A72"
-INK_FAINT = "#AAA198"
+INK_MUTED = "#6F665E"
+INK_FAINT = "#8D8378"
 
 # Accent and semantic colors -----------------------------------------------
 TERRACOTTA = "#C9573D"
@@ -133,6 +133,10 @@ class Fonts:
     body: tkfont.Font
     body_medium: tkfont.Font
     body_bold: tkfont.Font
+    body_italic: tkfont.Font
+    heading1: tkfont.Font
+    heading2: tkfont.Font
+    heading3: tkfont.Font
     small: tkfont.Font
     small_bold: tkfont.Font
     caption: tkfont.Font
@@ -148,20 +152,9 @@ class Fonts:
             "Segoe UI",
             "Arial",
         )
-        # Large Chinese serifs: prefer real TrueType serifs; SimSun must never
-        # be used for display sizes (its bitmap strikes become visibly jagged).
-        display = choose_family(
-            root,
-            "Source Han Serif SC",
-            "Noto Serif CJK SC",
-            "思源宋体",
-            "FangSong",
-            "仿宋",
-            "KaiTi",
-            "楷体",
-            "Microsoft YaHei UI Light",
-            "Microsoft YaHei UI",
-        )
+        # Keep Chinese headlines in the same family as the interface. Serif
+        # fallback on Windows mixed stroke shapes and made captions look thin.
+        display = ui
         mono = choose_family(
             root,
             "Cascadia Code",
@@ -179,14 +172,18 @@ class Fonts:
             display_xl=tkfont.Font(root=root, family=display, size=-s(42)),
             display_lg=tkfont.Font(root=root, family=display, size=-s(29)),
             display_md=tkfont.Font(root=root, family=display, size=-s(20)),
-            title=tkfont.Font(root=root, family=display, size=-s(18)),
+            title=tkfont.Font(root=root, family=display, size=-s(18), weight="bold"),
             body=tkfont.Font(root=root, family=ui, size=-s(15)),
             body_medium=tkfont.Font(root=root, family=ui, size=-s(15), weight="bold"),
             body_bold=tkfont.Font(root=root, family=ui, size=-s(16), weight="bold"),
+            body_italic=tkfont.Font(root=root, family=ui, size=-s(15), slant="italic"),
+            heading1=tkfont.Font(root=root, family=ui, size=-s(21), weight="bold"),
+            heading2=tkfont.Font(root=root, family=ui, size=-s(18), weight="bold"),
+            heading3=tkfont.Font(root=root, family=ui, size=-s(16), weight="bold"),
             small=tkfont.Font(root=root, family=ui, size=-s(14)),
             small_bold=tkfont.Font(root=root, family=ui, size=-s(14), weight="bold"),
             caption=tkfont.Font(root=root, family=ui, size=-s(13)),
-            kicker=tkfont.Font(root=root, family=mono, size=-s(11)),
+            kicker=tkfont.Font(root=root, family=ui, size=-s(11), weight="bold"),
             mono=tkfont.Font(root=root, family=mono, size=-s(12)),
         )
 

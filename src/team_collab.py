@@ -110,7 +110,28 @@ def team_mode_active() -> bool:
     cfg = load_collab_config()
     if not cfg.get("team_mode"):
         return False
-    return len(load_users()) >= 2
+    return len(active_users()) >= 2
+
+
+def active_users() -> list[dict]:
+    """Return current active members; legacy rows without status stay compatible."""
+    rows = [row for row in load_users()
+            if str(row.get("status") or "active") == "active"]
+    if any(row.get("enrollment_managed") for row in rows):
+        try:
+            import team_enrollment
+            device_users = team_enrollment.active_user_ids()
+            rows = [row for row in rows if not row.get("enrollment_managed")
+                    or str(row.get("id") or "") in device_users]
+        except Exception:
+            # Fail closed for new trust-managed identities if device state is
+            # unreadable; legacy identities retain their pre-enrollment rules.
+            rows = [row for row in rows if not row.get("enrollment_managed")]
+    return rows
+
+
+def active_user_ids() -> set[str]:
+    return {str(row.get("id") or "") for row in active_users() if row.get("id")}
 
 
 def team_enabled() -> bool:
@@ -120,8 +141,12 @@ def team_enabled() -> bool:
 
 def required_votes(tool_name: str, *, project_id: str | None = None) -> int:
     """团队项目 + Hub 协作就绪时对敏感工具要求 N 票；个人项目始终 1 票。"""
-    if not team_mode_active():
-        return 1
+    def _count(value: Any, fallback: int) -> int:
+        try:
+            return max(1, min(100, int(value)))
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+
     try:
         import project_store as _ps
         if not _ps.is_team_project(project_id):
@@ -129,12 +154,25 @@ def required_votes(tool_name: str, *, project_id: str | None = None) -> int:
     except Exception:
         return 1
     cfg = load_collab_config()
-    tool_required = cfg.get("tool_required") or {}
+    tool_required = cfg.get("tool_required")
+    if not isinstance(tool_required, dict):
+        tool_required = {}
     if tool_name in tool_required:
-        return max(1, int(tool_required[tool_name]))
+        return _count(tool_required[tool_name], 1)
     if tool_name in HIGH_RISK_TOOLS:
-        return max(1, int(cfg.get("destructive_required") or 2))
-    return max(1, int(cfg.get("default_required") or 1))
+        configured = _count(cfg.get("destructive_required") or 2, 2)
+    else:
+        configured = _count(cfg.get("default_required") or 1, 1)
+    if not cfg.get("team_mode"):
+        return 1
+    # A newly enrolled team with fewer than two active people must fail closed.
+    # Keep the configured threshold (at least two); never silently turn a
+    # multi-person operation into a single-person approval after revocation.
+    managed_team = any(row.get("enrollment_managed") for row in load_users())
+    active_count = len(active_users())
+    if managed_team and active_count < 2:
+        return max(2, configured)
+    return configured if team_mode_active() else 1
 
 
 def match_token(token: str) -> dict | None:
@@ -142,6 +180,8 @@ def match_token(token: str) -> dict | None:
     if not token:
         return None
     for row in load_users():
+        if row.get("status", "active") != "active" or row.get("enrollment_managed"):
+            continue
         if verify_token(token, str(row.get("token_hash") or "")):
             return {
                 "id": str(row.get("id") or ""),
@@ -183,19 +223,23 @@ def resolve_request_user(
 
 
 def public_users() -> list[dict]:
-    return [
-        {
-            "id": u.get("id"),
-            "name": u.get("name"),
-            "role": u.get("role", "member"),
-            "color": u.get("color", "#888888"),
-        }
-        for u in load_users()
-    ]
+    return [public_user(u) for u in load_users()]
+
+
+def public_user(user: dict) -> dict:
+    """Project only non-secret member fields; never return a token hash."""
+    return {
+        "id": user.get("id"), "name": user.get("name"),
+        "role": user.get("role", "member"),
+        "color": user.get("color", "#888888"),
+        "status": user.get("status", "active"),
+    }
 
 
 def is_admin(user: dict | None) -> bool:
     if not user:
+        return False
+    if user.get("status", "active") != "active":
         return False
     if user.get("id") == OWNER_ID:
         return True
@@ -260,8 +304,12 @@ def create_user(
 def confirm_vote_status(entry: dict) -> dict:
     required = max(1, int(entry.get("required") or 1))
     approvals = entry.get("approvals") or {}
-    yes_votes = sum(1 for v in approvals.values() if v == "yes")
-    no_votes = sum(1 for v in approvals.values() if v == "no")
+    active = active_user_ids()
+    managed_team = any(row.get("enrollment_managed") for row in load_users())
+    yes_votes = sum(1 for uid, vote in approvals.items()
+                    if vote == "yes" and (uid in active or not managed_team))
+    no_votes = sum(1 for uid, vote in approvals.items()
+                   if vote == "no" and (uid in active or not managed_team))
     return {
         "required": required,
         "approvals": dict(approvals),
