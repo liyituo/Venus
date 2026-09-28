@@ -4,7 +4,7 @@
 
 > **v0.11.0** — 团队项目支持独立 Git 版本库、隔离任务 worktree、变更审阅/合并/回退；Hub 增加 Tailscale Serve 入队、管理员邀请、审核及独立设备凭证撤销；CI 修复（chat.py 孤儿测试移除、ruff F/E9 清零）。
 >
-> **v0.10.1** — VenusChat V1 桌面端接入 llm_server（会话/SSE/确认/派活/设置）；旧 `chat.py` 已移除。CLI 与 Web UI（`/venus`）可并行验证后端能力。
+> **v0.10.1** — VenusChat V1 桌面端接入 llm_server（会话/SSE/确认/派活/设置）；旧 `chat.py` 已移除。
 
 ## 免责声明
 
@@ -45,7 +45,7 @@ Venus、[`RAG`](RAG/README.md) 与仓库中的示例模型仅供**技术演示�
 
 - `src/app.py` — 屏幕控制 daemon，鼠标键盘操作在单线程队列里排队执行
 - `src/llm_server.py` — 中枢：Agent 循环、异步任务、记忆、确认流、MCP、会话
-- 前端（任选其一）— `cli.py` 终端 / `venuschat_v1` 桌面 / `gui.py` 屏幕面板 / `telegram_bot.py` 手机遥控 / `static/venus.html` 网页（`/venus`）
+- 客户端（任选其一）— `cli.py` 终端 / `venuschat_v1` 桌面 / `gui.py` 屏幕面板 / `telegram_bot.py` 手机遥控。`8001` 只提供 `/api/v1` 接口，不提供浏览器 Venus 页面或 API 文档页。
 
 ### 后端模块（v0.10 冻结）
 
@@ -61,9 +61,17 @@ Venus、[`RAG`](RAG/README.md) 与仓库中的示例模型仅供**技术演示�
 
 ## 快速开始（Windows）
 
-双击 `scripts/一键启动控制台.bat`：首次自动建 `.venv` 并安装依赖，检查或启动本机 `llm_server`，等后端就绪后打开 VenusChat。重复双击会复用已有后端与窗口。启动失败时保留控制台提示，日志位于 `.venus/launcher/`。`scripts/启动VenusChat V1.bat` 使用同一启动流程。
+双击 `scripts/启动VenusChat V1.bat` 会先探测本机后端，再打开 VenusChat。若本机后端不可用，客户端窗口内会提示“启动本机后端”“填写远程地址”或“暂时离线打开”；只有点选启动本机时才会安装后端依赖并启动服务。远程地址会保存到 `chat_config.json`。首次运行会创建 `.venv`，桌面客户端本身无需安装后端 Python 依赖。
 
-双击 `scripts/创建VenusChat桌面快捷方式.bat` 可安装带 Venus 图标的桌面快捷方式；GUI 窗口和任务栏也使用 `assets/venuschat.ico`。若 `chat_config.json` 的 `llm_base` 指向远端，启动器只检查该地址并打开 GUI，不会在本机另起一个无关后端。团队 Hub 仍用 `scripts/start_team_hub.ps1` 启动。
+也可以在 PowerShell 中手动安装依赖并启动本机后端；桌面客户端可以在服务启动前后独立打开：
+
+```powershell
+if (-not (Test-Path .venv\Scripts\python.exe)) { py -3 -m venv .venv }
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python src\llm_server.py --host 127.0.0.1 --port 8001
+```
+
+双击 `scripts/创建VenusChat桌面快捷方式.bat` 安装的快捷方式使用同一 GUI 提示流程。客户端和按需启动的后端日志位于 `.venus/launcher/`。团队 Hub 仍用 `scripts/start_team_hub.ps1` 启动。
 
 手动启动 CLI：
 
@@ -71,7 +79,7 @@ Venus、[`RAG`](RAG/README.md) 与仓库中的示例模型仅供**技术演示�
 .venv\Scripts\python src\cli.py
 ```
 
-手动启动桌面 Chat（先确保后端运行）：
+手动启动桌面 Chat（可在后端离线时打开）：
 
 ```
 cd src
@@ -79,6 +87,8 @@ cd src
 ```
 
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
+
+启动架构回归：`.venv\Scripts\python tests\venuschat_v1\startup_architecture_test.py` 验证 `8001` 的网页与文档入口为 404、`/api/v1/ready` 可用、桌面客户端可在无服务端 Python 包时导入，并解析 PowerShell 启动脚本语法。`8000` 屏幕控制 daemon 及其 API 保持独立。
 
 **团队协作：**团队 Hub 必须通过 Tailscale Serve HTTPS 运行；管理员邀请指定 Tailscale 登录名，成员申请后由管理员审核。不要复用模型 API Key 作为团队凭证。部署和两台电脑完整演示见 [`docs/collaboration-plan.md`](docs/collaboration-plan.md) 与 [`docs/venuschat-v1.md`](docs/venuschat-v1.md)。
 

@@ -3,7 +3,7 @@
 VenusChat V1 是与已移除的 `src/chat.py` 完全隔离的原生 Windows 前端，通过 HTTP/SSE 对接 `llm_server`。
 
 - 代码入口：`src/venuschat_v1/`
-- 启动脚本：`scripts/启动VenusChat V1.bat` 或 `scripts/一键启动控制台.bat`（均会检查或启动后端）
+- 启动脚本：`scripts/启动VenusChat V1.bat`（探测本机后端，连接选择在 GUI 内完成）
 - 视觉方向：暖白石灰色、统一的界面字体、陶土红单一强调色、圆角控件与低对比边框
 
 ## 已接入能力
@@ -20,12 +20,22 @@ VenusChat V1 是与已移除的 `src/chat.py` 完全隔离的原生 Windows 前�
 
 ## 启动
 
-Windows 上直接双击 `scripts/一键启动控制台.bat`。脚本负责创建虚拟环境、补齐依赖、检查 `chat_config.json` 指向的后端、等待本机后端就绪并打开 GUI；再次运行会复用已有进程。错误会留在控制台，后端和 GUI 日志在 `.venus/launcher/`。
+Windows 上直接双击 `scripts/启动VenusChat V1.bat`：脚本探测本机 `llm_server` 后打开 GUI。本机不可用时，VenusChat 窗口提示启动本机后端、填写远程地址或暂时离线打开。只有点击“启动本机后端”才会在后台安装后端依赖并启动服务；远程地址会保存到 `chat_config.json`。首次运行创建 `.venv`；桌面客户端导入无需服务端 Python 包。
 
-双击 `scripts/创建VenusChat桌面快捷方式.bat` 可以在当前用户桌面安装带图标的快捷方式。窗口与任务栏使用 `assets/venuschat.ico`。配置远端 Agent URL 时，脚本只验证远端状态；团队 Hub 按下文专用流程启动。
+如需手动启动本机个人后端，在仓库根目录的 PowerShell 中运行：
 
 ```powershell
-# 手动打开 GUI 时，先确保个人 llm_server 在 127.0.0.1:8001 运行
+if (-not (Test-Path .venv\Scripts\python.exe)) { py -3 -m venv .venv }
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python src\llm_server.py --host 127.0.0.1 --port 8001
+```
+
+GUI 可在后端启动前后独立打开。GUI 和按需启动的本机后端日志在 `.venus/launcher/`。
+
+双击 `scripts/创建VenusChat桌面快捷方式.bat` 可以在当前用户桌面安装带图标的快捷方式；该快捷方式使用同一 GUI 提示流程。窗口与任务栏使用 `assets/venuschat.ico`。团队 Hub 按下文专用流程启动。
+
+```powershell
+# GUI 可以先于个人 llm_server 打开
 cd src
 ..\.venv\Scripts\python -m venuschat_v1
 ```
@@ -38,6 +48,8 @@ cd src
 ```
 
 配置读写 `chat_config.json`（本地，已在 `.gitignore`）。
+
+`8001` 后端仅提供 `/api/v1`，`/`、`/venus`、`/docs`、`/redoc`、`/openapi.json` 返回 404。运行 `.venv\Scripts\python tests\venuschat_v1\startup_architecture_test.py` 检查上述入口、API、无服务端依赖的客户端导入和 PowerShell 启动脚本语法。`8000` 屏幕控制 daemon 的功能和 API 保持不变。
 
 ## 团队 Hub 与成员加入
 

@@ -19,7 +19,7 @@ set "PIDFILE=%ROOT%\.venus\daemon.pid"
 rem ---- pre-flight checks ----
 if not exist "%VENV_PY%" (
     echo [错误] 未找到虚拟环境：%VENV_PY%
-    echo        请先运行 scripts\一键启动控制台.bat 初始化。
+    echo        请先创建 .venv 并安装 requirements.txt。
     exit /b 1
 )
 if not exist "%APP%" (
@@ -28,7 +28,7 @@ if not exist "%APP%" (
 )
 "%VENV_PY%" -c "import fastapi, pyautogui, uvicorn" >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 虚拟环境中缺少依赖（fastapi/pyautogui/uvicorn），请先运行一键启动控制台.bat。
+    echo [错误] 虚拟环境中缺少依赖（fastapi/pyautogui/uvicorn），请运行 .venv\Scripts\python -m pip install -r requirements.txt。
     exit /b 1
 )
 

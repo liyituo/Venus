@@ -12,7 +12,7 @@ LLM API 后端 — 把 Chat 前端的聊天请求转发到任意 OpenAI 兼容�
   给出明确提示而不是返回空回复
 - 实时读取 chat_config.json（API URL / Key / Model），Settings 保存后立即生效
 - 网络调用放在线程池执行，不阻塞 FastAPI 事件循环
-- 由 CLI / VenusChat V1（本地）或手动运行（默认端口 8001）
+- 手动运行，供桌面客户端、CLI 和团队 Hub 通过 API 连接（默认端口 8001）
 
 运行：python llm_server.py [--host 127.0.0.1] [--port 8001]
 """
@@ -80,7 +80,7 @@ import agent_jobs as _agent_jobs  # noqa: E402
 import schedule_store as _schedules  # noqa: E402
 import plan_store as _plans  # noqa: E402
 from dispatch_router import analyze_dispatch  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1011,7 +1011,8 @@ class LlmError(Exception):
         self.message = message
 
 
-app = FastAPI(title="LLM Backend", version=APP_VERSION)
+app = FastAPI(title="LLM Backend", version=APP_VERSION,
+              docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(worker_hub.router)
 
 
@@ -1031,19 +1032,6 @@ async def _redacted_validation_error(request: Request,
                     else str(error.get("msg") or "Invalid value")),
         })
     return JSONResponse(status_code=422, content={"detail": safe_errors})
-
-# 晨星 Web UI：由 llm_server 同源伺服（same-origin → 免 CORS；
-# 仍受 host_guard 回环限制与可选 token 鉴权保护，不暴露到局域网）
-_WEB_UI_PATH = BASE_DIR.parent / "static" / "venus.html"
-
-
-@app.get("/", include_in_schema=False)
-@app.get("/venus", include_in_schema=False)
-async def venus_ui() -> FileResponse:
-    if not _WEB_UI_PATH.is_file():
-        raise HTTPException(404, "static/venus.html 不存在")
-    return FileResponse(_WEB_UI_PATH)
-
 
 @app.on_event("startup")
 async def _warmup_mcp() -> None:

@@ -1,4 +1,4 @@
-"""Return a small exit status for the one-click launcher's backend check.
+"""Return a small exit status for the desktop launcher's backend check.
 
 0: Venus backend is healthy; 1: no response; 2: another or unusable service.
 The configured API credential stays inside ApiClient and is never printed.

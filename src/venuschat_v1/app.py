@@ -23,6 +23,7 @@ from .config_store import (active_project_for_origin, load_config,
                            save_local_config)
 from .settings_view import SettingsView
 from .widgets import Dot, FlatButton, MenuPopup, separator
+from .startup_backend import show_startup_backend_prompt
 
 class HeaderLink(tk.Frame):
     """Text navigation item with a quiet active underline."""
@@ -960,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
         temporary.write_text(json.dumps(metadata), encoding="utf-8")
         temporary.replace(marker)
         app = VenusChatV1(root, custom_chrome=not args.native_frame)
+        root.after(100, lambda: show_startup_backend_prompt(app))
         if args.geometry:
             root.geometry(args.geometry)
         if args.settings:

@@ -250,29 +250,10 @@ def main() -> None:
     assert "after_cancel" in clear_jobs and "jobs_box.winfo_children()" in clear_jobs
 
     launcher = (ROOT / "scripts/Start-VenusChat.ps1").read_text(encoding="utf-8")
-    assert launcher.index("$existingGui = Get-GuiProcess") < launcher.index(
-        "$backendState = Get-BackendState")
-    assert "远端 Hub $baseUrl 当前不可达，将打开 VenusChat" in launcher
-    assert "Venus 后端" in launcher
-    ensure = launcher.split("function Ensure-PersonalBackend", 1)[1].split(
-        "\n}\n\ntry {", 1)[0]
-    assert "Test-LocalVenusHub 8001" in ensure
-    assert "savedConfig.team_hub_local_base" in ensure
-    assert "if ($hubLocalUrl -or (Test-LocalVenusHub 8001))" in ensure
-    assert "$personalPort = 8002" in ensure
-    assert "Save-PersonalBackendConfig $personalUrl $hubLocalUrl" in ensure
-    assert launcher.count("[void](Ensure-PersonalBackend)") == 1
-    assert "(-not $localBackend) -or $reservedHubLocal -or (Test-LocalVenusHub $port)" in launcher
-    assert "$reservedHubLocal = (([string]$config.team_hub_local_base).TrimEnd('/') -eq" in launcher
-    assert "if ((-not $localBackend) -or $reservedHubLocal)" in launcher
-    assert "if ((-not $localBackend) -or $reservedHubLocal -or (Test-LocalVenusHub $port))" in launcher
-    assert "不会占用 8001 启动个人后端" in launcher
-    assert '"personal_llm_base":os.environ["VENUS_PERSONAL_BACKEND_BASE"]' in launcher
-    assert '"llm_base"' not in launcher.split("function Save-PersonalBackendConfig", 1)[1].split(
-        "function Test-LocalVenusHub", 1)[0]
-    save_config = launcher.split("function Save-PersonalBackendConfig", 1)[1].split(
-        "function Test-LocalVenusHub", 1)[0]
-    assert 'updates.update({"team_hub_local_base":hub} if hub else {})' in save_config
+    assert "Get-GuiProcess" in launcher
+    assert "Start-Process -FilePath $pythonwExe" in launcher
+    assert "Get-LocalBackendState" in launcher
+    assert "Read-Host" not in launcher
     app_source = (ROOT / "src/venuschat_v1/app.py").read_text(encoding="utf-8")
     assert "local_hub_base and initial_base == local_hub_base" in app_source
     assert "self.client = ApiClient(base=origin)" in app_source
