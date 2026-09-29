@@ -26,6 +26,11 @@ if ($LASTEXITCODE -ne 0) {
 $tailnetJson = $statusText -join [Environment]::NewLine
 $tailnetStatus = $tailnetJson | ConvertFrom-Json
 $detectedHost = ([string]$tailnetStatus.Self.DNSName).TrimEnd(".").ToLowerInvariant()
+$servePeer = [string]($tailnetStatus.Self.TailscaleIPs |
+    Where-Object { $_ -match '^100\.' } | Select-Object -First 1)
+if (-not $servePeer) {
+    throw "无法检测本机 Tailscale IPv4 地址；请确认 Tailscale 在线。"
+}
 if (-not $HubHost) {
     $HubHost = $detectedHost
 }
@@ -52,7 +57,8 @@ $arguments = @(
     "--port", "8001",
     "--isolated",
     "--team-serve",
-    "--team-host", $HubHost
+    "--team-host", $HubHost,
+    "--team-serve-peer", $servePeer
 )
 $server = Start-Process -FilePath $pythonExe -ArgumentList $arguments `
     -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru

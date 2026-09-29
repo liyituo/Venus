@@ -17,12 +17,15 @@ from . import theme as t
 from .api_client import ApiClient
 from .backend_bridge import BackendBridge
 from .chat_view import ChatView
+from .team_workspace_view import TeamWorkspaceView
 from .config_store import (active_project_for_origin, load_config,
                            personal_backend_for_team,
                            project_preference_key, save_active_project_for_origin,
-                           save_local_config)
+                           save_local_config, team_connections)
 from .settings_view import SettingsView
 from .widgets import Dot, FlatButton, MenuPopup, separator
+from .workspace_state import (TEAM, backend_switch_block_reason,
+                              workspace_kind)
 
 class HeaderLink(tk.Frame):
     """Text navigation item with a quiet active underline."""
@@ -154,6 +157,8 @@ class VenusChatV1:
         self._restore_override_pending = False
         self._online = False
         self._current_view = "chat"
+        self._current_space = "personal"
+        self._settings_return_view = "chat"
         self._model_change_pending = False
         self._active_project_change_serial = 0
         self._drag_moved = False
@@ -177,18 +182,17 @@ class VenusChatV1:
         self._personal_backend_base = initial_base
         self._team_backend_origin = ""
         self._team_backend_name = "团队 Hub"
-        joined = [row for row in (config.get("team_connections") or [])
-                  if row.get("status") == "joined" and row.get("origin")]
+        connections = [row for row in team_connections() if row.get("origin")]
+        joined = [row for row in connections if row.get("status") == "joined"]
         local_hub_base = str(config.get("team_hub_local_base") or "").rstrip("/")
-        connection = (next((row for row in reversed(joined)
+        connection = (next((row for row in reversed(connections)
                             if str(row.get("origin") or "").rstrip("/") == initial_base), None)
                       or (joined[-1] if joined else None))
         if connection:
             origin = str(connection.get("origin") or "").rstrip("/")
             if local_hub_base and initial_base == local_hub_base:
-                # Local llm_base may address the Hub service on its host;
-                # use the enrolled HTTPS origin so its device token is scoped
-                # correctly and the switch control starts in team context.
+                # Resolve the local Hub address to its saved HTTPS origin so
+                # connection state is shown against the configured identity.
                 self.client = ApiClient(base=origin)
                 initial_base = origin
             self._team_backend_origin = origin
@@ -206,14 +210,17 @@ class VenusChatV1:
         self._configure_window()
         self._build_shell()
         self._apply_windows_taskbar_style()
-        self.show_chat()
+        if self._team_backend_origin and self.client.base.rstrip("/") == self._team_backend_origin:
+            self.show_team(refresh=False)
+        else:
+            self.show_personal(refresh=False)
         self.bridge.refresh_all()
         self.bridge.submit("agents", lambda: self.client.get("/api/v1/agents", timeout=8))
         self._poll_backend()
         self.root.after(30000, self._periodic_health)
 
     def _periodic_health(self) -> None:
-        self.bridge.submit("health", lambda: ("ok", self.client.get("/api/v1/health", timeout=5)))
+        self.bridge.refresh_health()
         self.root.after(30000, self._periodic_health)
 
     def configure_team_backend(self, origin: str, name: str,
@@ -223,9 +230,14 @@ class VenusChatV1:
         self._team_backend_name = str(name or "团队 Hub")
         if personal_base:
             self._personal_backend_base = str(personal_base).rstrip("/")
+        already_active = self.client.base.rstrip("/") == self._team_backend_origin
+        self._settings_return_view = "team"
+        self._current_space = "team"
         self._refresh_backend_switch_control()
         self.switch_backend_context(self._team_backend_origin,
                                     self._team_backend_name)
+        if already_active:
+            self.team_workspace_view.activate()
 
     def set_active_project(self, project_id: str) -> None:
         """Ask the Hub to set this user's current project, then update locally."""
@@ -241,6 +253,9 @@ class VenusChatV1:
                 return
         self._active_project_change_serial += 1
         serial = self._active_project_change_serial
+        team_view = getattr(self, "team_workspace_view", None)
+        if team_view is not None and team_view.connected:
+            team_view.begin_project_switch(project_id)
         self.toast("正在更新 Hub 当前项目…")
         self.bridge.submit(
             "active_project_update",
@@ -263,6 +278,9 @@ class VenusChatV1:
         self._backend_project_preferences[project_preference_key(origin)] = project_id
         save_active_project_for_origin(origin, project_id)
         self.chat_view.refresh_projects()
+        team_view = getattr(self, "team_workspace_view", None)
+        if team_view is not None and team_view.connected:
+            team_view.finish_project_switch(True)
 
     def toggle_backend_context(self) -> None:
         current = self.client.base.rstrip("/")
@@ -277,23 +295,27 @@ class VenusChatV1:
             return
         self.switch_backend_context(target, label)
 
-    def switch_backend_context(self, base: str, label: str) -> None:
+    def switch_backend_context(self, base: str, label: str) -> bool:
         """Switch between the personal server and a team Hub without mixing state."""
         target = str(base or "").rstrip("/")
         current = self.client.base.rstrip("/")
         if not target:
             self._pending_backend_switch = None
             self._refresh_backend_switch_control()
-            return
+            return False
         if target == current:
             # A quick reverse click cancels a queued switch instead of allowing
             # the old destination to win after the background queue drains.
             self._pending_backend_switch = None
             self._refresh_backend_switch_control()
-            return
-        if self.bridge._streaming or self.chat_view._creating_session:
-            self.toast("当前对话操作尚未结束，请完成或停止后再切换空间")
-            return
+            return True
+        blocked = backend_switch_block_reason(
+            streaming=bool(self.bridge._streaming),
+            creating_session=bool(self.chat_view._creating_session),
+        )
+        if blocked:
+            self.toast(blocked)
+            return False
         self._pending_backend_switch = None
         unbound_draft = self.chat_view.prepare_backend_context_switch()
         self._backend_session_preferences[current] = self.bridge.current_sid
@@ -322,6 +344,9 @@ class VenusChatV1:
         self.chat_view.reset_backend_context(
             label, self._backend_drafts.get(target, {}),
             self._backend_unbound_drafts.get(target, ""))
+        team_view = getattr(self, "team_workspace_view", None)
+        if team_view is not None:
+            team_view.reset_context()
         self._backend_context_pending = True
         self._model_change_pending = False
         self._active_project_change_serial += 1
@@ -330,14 +355,23 @@ class VenusChatV1:
         self.chat_view._mode_change_pending = False
         self._refresh_backend_switch_control()
         self.bridge.refresh_all()
+        if target == self._team_backend_origin:
+            team_view = getattr(self, "team_workspace_view", None)
+            if team_view is not None:
+                team_view.activate()
+        return True
 
     def _retry_backend_switch(self) -> None:
         request = self._pending_backend_switch
         if request is None:
             return
-        if self.bridge._streaming or self.chat_view._creating_session:
+        blocked = backend_switch_block_reason(
+            streaming=bool(self.bridge._streaming),
+            creating_session=bool(self.chat_view._creating_session),
+        )
+        if blocked:
             self._pending_backend_switch = None
-            self.toast("当前对话操作尚未结束，空间切换已取消")
+            self.toast(f"{blocked}；空间切换已取消")
             return
         self._pending_backend_switch = None
         self.switch_backend_context(*request)
@@ -346,6 +380,7 @@ class VenusChatV1:
         view = getattr(self, "chat_view", None)
         if view is not None:
             view.refresh_backend_switch_button()
+        self._refresh_space_navigation()
 
     def _poll_backend(self) -> None:
         try:
@@ -362,13 +397,22 @@ class VenusChatV1:
                 code, data = self._api_result(payload)
                 if code == 200:
                     configured = bool(data.get("configured"))
-                    self._set_online(configured, data.get("model") or ("已连接" if configured else "未配置"))
+                    team_backend = bool(
+                        self._team_backend_origin
+                        and self.client.base.rstrip("/") == self._team_backend_origin)
+                    online_label = ("Hub 在线 · 模型未就绪" if team_backend and not configured
+                                    else data.get("model") or ("已连接" if configured else "未配置"))
+                    self._set_online(True if team_backend else configured, online_label)
                     self.model_name = data.get("model") or self.model_name
                     self.bridge._apply_health(code, data)
                     self.chat_view.on_health(data)
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_health(data, reachable=True)
                 else:
                     self._set_online(False, "")
                     self.chat_view.set_offline()
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_health(data, reachable=False)
             elif kind == "sessions":
                 code, data = self._api_result(payload)
                 self.bridge._apply_sessions(code, data)
@@ -395,6 +439,8 @@ class VenusChatV1:
                 code, data = self._api_result(payload)
                 self.bridge._apply_projects(code, data)
                 self.chat_view.refresh_projects()
+                if hasattr(self, "team_workspace_view"):
+                    self.team_workspace_view.on_projects(code, data)
             elif kind == "active_project_update":
                 code, data = self._api_result(payload)
                 serial = int(data.get("_request_serial") or 0)
@@ -412,6 +458,9 @@ class VenusChatV1:
                     else:
                         self.toast("已清除当前派活项目")
                 else:
+                    if (hasattr(self, "team_workspace_view")
+                            and self.team_workspace_view.connected):
+                        self.team_workspace_view.finish_project_switch(False)
                     detail = str(data.get("detail") or f"HTTP {code}")
                     self.toast(f"切换当前项目失败：{detail}", duration=5000)
                     self.bridge.refresh_all()
@@ -420,10 +469,15 @@ class VenusChatV1:
                 if code == 200:
                     self.bridge.jobs_active = int((data.get("active_count") or 0))
                     self.chat_view.refresh_jobs(data.get("jobs") or [])
-                elif self._backend_context_pending:
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_jobs(data.get("jobs") or [])
+                else:
                     # Never leave the previous origin's task list visible when
                     # the newly selected backend is offline or rejects access.
-                    self.chat_view.refresh_jobs([])
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_jobs([])
+                    if self._backend_context_pending:
+                        self.chat_view.refresh_jobs([])
             elif kind == "session_new":
                 code, data = self._api_result(payload)
                 sid = 0
@@ -451,9 +505,14 @@ class VenusChatV1:
                 if code == 200 and data.get("job"):
                     jid = data["job"].get("id", "?")
                     self.toast(f"任务已派发 {jid}")
-                    self.bridge.submit("jobs", lambda: ("ok", self.client.get("/api/v1/jobs?limit=20")))
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_dispatch(
+                            True, project_id=str(data["job"].get("project_id") or ""))
                 else:
-                    self.toast(f"派活失败：{(data or {}).get('detail', code)}")
+                    detail = str((data or {}).get("detail", code))
+                    self.toast(f"派活失败：{detail}")
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_dispatch(False, detail)
             elif kind == "stream_event":
                 skind, spayload = payload
                 self.bridge.handle_stream_event(skind, spayload)
@@ -471,16 +530,21 @@ class VenusChatV1:
                     cfg = data.get("config") or {}
                     self.model_name = str(cfg.get("model") or self.model_name)
                     self.toast(f"当前模型：{self.model_name}")
-                    self.bridge.submit("health", lambda: ("ok", self.client.get("/api/v1/health")))
+                    self.bridge.refresh_health()
                 else:
                     self.toast(f"模型切换失败：{data.get('detail', code)}", duration=4200)
             elif kind == "worker_error":
                 source, detail = payload
-                if str(source).startswith("settings_"):
+                if str(source).startswith("team_workspace_"):
+                    self.team_workspace_view.handle_backend("worker_error", payload)
+                elif str(source).startswith("settings_"):
                     self.settings_view.handle_backend(str(source), ("error", str(detail)))
                 elif source == "model_change":
                     self._model_change_pending = False
                     self.toast(f"模型切换失败：{detail}", duration=4200)
+                elif source == "dispatch":
+                    self.toast(f"派活失败：{detail}", duration=4200)
+                    self.team_workspace_view.on_dispatch(False, str(detail))
                 elif source == "session_new":
                     self.chat_view.on_session_create_failed(str(detail))
                 elif source == "session_load":
@@ -494,10 +558,18 @@ class VenusChatV1:
                         self.chat_view.handle_backend(source, (0, {"detail": str(detail)}))
                     else:
                         self.chat_view.handle_backend(source, ("", (0, {"detail": str(detail)})))
+                elif source == "health":
+                    self._set_online(False, "")
+                    self.chat_view.set_offline()
+                    if hasattr(self, "team_workspace_view"):
+                        self.team_workspace_view.on_health(
+                            {"detail": str(detail)}, reachable=False)
                 else:
                     self.toast(f"操作失败：{detail}", duration=4200)
             elif kind.startswith("settings_"):
                 self.settings_view.handle_backend(kind, payload)
+            elif kind.startswith("team_workspace_"):
+                self.team_workspace_view.handle_backend(kind, payload)
             else:
                 self.chat_view.handle_backend(kind, payload)
         except tk.TclError:
@@ -526,6 +598,7 @@ class VenusChatV1:
                 text=(model[:18] + "…") if online and len(model) > 18 else (model or "离线"),
                 fg=t.SUCCESS if online else t.WARNING,
             )
+        self._refresh_space_navigation()
 
     # Window ----------------------------------------------------------------
     def _configure_window(self) -> None:
@@ -572,8 +645,11 @@ class VenusChatV1:
         self.view_host.columnconfigure(0, weight=1)
 
         self.chat_view = ChatView(self.view_host, self, self.fonts, self.bridge)
+        self.team_workspace_view = TeamWorkspaceView(
+            self.view_host, self, self.fonts, self.bridge)
         self.settings_view = SettingsView(self.view_host, self, self.fonts, self.client)
         self.chat_view.grid(row=0, column=0, sticky="nsew")
+        self.team_workspace_view.grid(row=0, column=0, sticky="nsew")
         self.settings_view.grid(row=0, column=0, sticky="nsew")
 
         self.toast_frame = tk.Frame(
@@ -626,6 +702,15 @@ class VenusChatV1:
             cursor="fleur",
         )
         self.brand_label.pack(side="left")
+
+        self.space_links: dict[str, HeaderLink] = {}
+        for key, label, callback in (
+            ("personal", "个人空间", self.show_personal),
+            ("team", "团队空间", self.show_team),
+        ):
+            link = HeaderLink(self.header, label, callback, fonts=self.fonts)
+            link.pack(side="left", fill="y")
+            self.space_links[key] = link
 
         if self.custom_chrome:
             controls = tk.Frame(self.header, bg=t.HEADER)
@@ -723,11 +808,55 @@ class VenusChatV1:
 
     # Routing ----------------------------------------------------------------
     def show_chat(self) -> None:
+        """Compatibility route used by older management windows."""
+        self.show_personal()
+
+    def show_personal(self, *, refresh: bool = True) -> None:
+        current = self.client.base.rstrip("/")
+        if self._team_backend_origin and current == self._team_backend_origin:
+            if not self.switch_backend_context(self._personal_backend_base, "个人空间"):
+                return
+        self.team_workspace_view.stop_jobs_polling()
+        self._current_space = "personal"
         self.chat_view.tkraise()
         self._current_view = "chat"
-        self.set_header_section("chat")
+        self.set_header_section("personal")
+
+    def show_team(self, *, refresh: bool = True) -> None:
+        if not self._team_backend_origin:
+            self._current_space = "team"
+            self.team_workspace_view.tkraise()
+            self._current_view = "team"
+            self.set_header_section("team")
+            self.team_workspace_view.activate()
+            return
+        if self.client.base.rstrip("/") != self._team_backend_origin:
+            if not self.switch_backend_context(self._team_backend_origin, self._team_backend_name):
+                return
+            self._current_space = "team"
+            self.team_workspace_view.tkraise()
+            self._current_view = "team"
+            self.set_header_section("team")
+            return
+        self._current_space = "team"
+        self.team_workspace_view.tkraise()
+        self._current_view = "team"
+        self.set_header_section("team")
+        self.team_workspace_view.activate()
+        if refresh:
+            self.bridge.refresh_health()
+
+    def return_from_settings(self) -> None:
+        target = self._settings_return_view
+        if target == "team":
+            self.show_team()
+        else:
+            self.show_personal()
 
     def show_settings(self) -> None:
+        if self._current_view != "settings":
+            self._settings_return_view = self._current_view
+        self.team_workspace_view.stop_jobs_polling()
         self.settings_view.on_open()
         self.settings_view.tkraise()
         self._current_view = "settings"
@@ -737,6 +866,9 @@ class VenusChatV1:
         """Jump straight into one settings page (workspace card, rail links)."""
         if key not in self.settings_view.page_keys:
             return
+        if self._current_view != "settings":
+            self._settings_return_view = self._current_view
+        self.team_workspace_view.stop_jobs_polling()
         self.settings_view.tkraise()
         self._current_view = "settings"
         self.settings_view.select_page(key)
@@ -745,6 +877,39 @@ class VenusChatV1:
     def set_header_section(self, section: str) -> None:
         for key, link in self.header_links.items():
             link.set_active(section == key)
+        self._refresh_space_navigation()
+
+    def _refresh_space_navigation(self) -> None:
+        links = getattr(self, "space_links", {})
+        if not links:
+            return
+        current = self.client.base.rstrip("/") if hasattr(self, "bridge") else ""
+        team_origin = str(getattr(self, "_team_backend_origin", "") or "").rstrip("/")
+        joined_origins = [row.get("origin") for row in team_connections()
+                          if row.get("status") == "joined"]
+        origin_kind = workspace_kind(current, joined_origins)
+        active = (self._current_space if self._current_view == "settings" else
+                  "team" if origin_kind == TEAM else self._current_space)
+        for key, link in links.items():
+            link.set_active(key == active)
+        status = self._online_label
+        if status is not None:
+            if active == "team":
+                team_name = str(getattr(self, "_team_backend_name", "团队 Hub") or "团队 Hub")
+                team_view = getattr(self, "team_workspace_view", None)
+                if not team_origin:
+                    state = "未连接"
+                elif current != team_origin:
+                    state = "连接中"
+                elif team_view is not None and not team_view._service_reachable:
+                    state = "Hub 暂不可达"
+                elif team_view is not None and not team_view._identity_verified:
+                    state = "身份核验中"
+                else:
+                    state = "身份已核验" if origin_kind == TEAM else "身份未验证"
+                status.configure(text=f"团队 · {team_name} · {state}")
+            else:
+                status.configure(text=("个人 · 本机 · 在线" if self._online else "个人 · 本机 · 离线"))
 
     def set_model(self, model: str) -> None:
         if self._model_change_pending:
@@ -774,7 +939,11 @@ class VenusChatV1:
                   min_width=230, align_right=anchor is None)
 
     def _top_view(self):
-        return self.settings_view if self._current_view == "settings" else self.chat_view
+        if self._current_view == "settings":
+            return self.settings_view
+        if self._current_space == "team":
+            return self.team_workspace_view
+        return self.chat_view
 
     # Toast ------------------------------------------------------------------
     def toast(self, text: str, *, duration: int = 2200) -> None:
@@ -892,7 +1061,7 @@ class VenusChatV1:
 
     def _escape(self, _event=None) -> None:
         if self._top_view() is self.settings_view:
-            self.show_chat()
+            self.return_from_settings()
 
 
 def build_parser() -> argparse.ArgumentParser:

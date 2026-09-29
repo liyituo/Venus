@@ -18,6 +18,8 @@ from typing import Callable
 from . import theme as t
 from .api_client import ApiClient                      # noqa: F401  (contract)
 from .backend_bridge import BackendBridge
+from .config_store import team_connection
+from .workspace_state import personal_jobs
 from .widgets import (
     HAS_PIL,
     Dot,
@@ -25,7 +27,6 @@ from .widgets import (
     HoverSurface,
     MenuPopup,
     MessageDialog,
-    PeopleBadge,
     ProgressBar,
     RoundButton,
     ScrollArea,
@@ -36,7 +37,7 @@ from .widgets import (
     rounded_rect,
     separator,
 )
-from .team_collab_view import open_job_change_submit, open_team_collab
+from .team_collab_view import open_job_change_submit
 
 if HAS_PIL:
     from PIL import Image, ImageDraw, ImageTk
@@ -506,6 +507,12 @@ class SidebarItem(tk.Frame):
 class ChatView(tk.Frame):
     """Workspace bound to the local Venus backend through the bridge."""
 
+    def _team_context(self) -> bool:
+        try:
+            return bool(team_connection(self.bridge.client.base))
+        except ValueError:
+            return False
+
     def __init__(self, parent: tk.Misc, app, fonts: t.Fonts,
                  bridge: BackendBridge) -> None:
         super().__init__(parent, bg=t.CANVAS)
@@ -553,6 +560,9 @@ class ChatView(tk.Frame):
         self._pending_visible = False
         self._queued_send: tuple[int, str] | None = None
         self._deleting_sid: int | None = None
+        self._personal_jobs: list[dict] = []
+        self._selected_personal_job: dict | None = None
+        self._showing_personal_tasks = False
 
         self._build()
 
@@ -578,6 +588,11 @@ class ChatView(tk.Frame):
         self._build_stage()
         self._build_composer()
 
+        self.personal_tasks_page = tk.Frame(self.workspace, bg=t.CANVAS)
+        self.personal_tasks_page.grid(row=1, column=0, rowspan=2, sticky="nsew")
+        self.personal_tasks_page.grid_remove()
+        self._build_personal_tasks_page()
+
         self._build_job_panel()
         self.bind("<Configure>", self._adapt_layout, add="+")
 
@@ -601,9 +616,9 @@ class ChatView(tk.Frame):
         self.stop_button.pack(side="right", padx=(t.s(6), 0))
         self.stop_button.set_enabled(False)
         self.panel_button = FlatButton(
-            right, "任务面板", self._toggle_panel, font=self.fonts.small,
+            right, "个人任务", self.show_personal_tasks, font=self.fonts.small,
             variant="ghost", height=28, min_width=78, parent_bg=t.CANVAS)
-        self.panel_button.pack(side="right")
+        self.panel_button.pack_forget()
         separator(self.workspace, color=t.LINE_FAINT).grid(row=0, column=0,
                                                            sticky="sew")
 
@@ -626,66 +641,32 @@ class ChatView(tk.Frame):
         self._svc_line = self._status_line(footer, "模型服务")
         self._mem_line = self._status_line(footer, "记忆系统")
 
-        # 固定区：标题、空间卡、新建、长期项目 —— 不参与滚动
+        # 固定区：个人导航、对话入口和个人项目 —— 不参与滚动
         header_zone = tk.Frame(self.sidebar, bg=t.SIDEBAR)
         header_zone.pack(side="top", fill="x")
 
-        tk.Label(header_zone, text="工作空间", bg=t.SIDEBAR, fg=t.INK,
+        tk.Label(header_zone, text="个人空间", bg=t.SIDEBAR, fg=t.INK,
                  font=self.fonts.display_md).pack(
             anchor="w", padx=t.s(20), pady=(t.s(18), t.s(11)))
-
-        workspace_card = HoverSurface(
-            header_zone, bg=t.SURFACE_ALT, resting_line=t.LINE,
-            hover_line=t.LINE_STRONG, active_line=t.TERRACOTTA, height=t.s(74))
-        workspace_card.pack(fill="x", padx=t.s(18))
-        workspace_card.pack_propagate(False)
-        tk.Frame(workspace_card, bg=t.TERRACOTTA, width=2).pack(side="left", fill="y")
-        people = PeopleBadge(workspace_card, size=42, bg=t.SURFACE_ALT)
-        people.pack(side="left", padx=(t.s(11), t.s(8)))
-        copy = tk.Frame(workspace_card, bg=t.SURFACE_ALT, cursor="hand2")
-        copy.pack(side="left", fill="both", expand=True, pady=t.s(10))
-        title_row = tk.Frame(copy, bg=t.SURFACE_ALT, cursor="hand2")
-        title_row.pack(fill="x")
-        tk.Label(title_row, text="默认工作空间", bg=t.SURFACE_ALT, fg=t.INK,
-                 font=self.fonts.small_bold, cursor="hand2").pack(side="left")
-        tk.Label(title_row, text="本地", bg=t.TERRACOTTA_SOFT, fg=t.TERRACOTTA,
-                 font=self.fonts.caption, padx=t.s(5), cursor="hand2").pack(
-            side="left", padx=t.s(8))
-        self._ws_path_label = tk.Label(copy, text="连接后显示", bg=t.SURFACE_ALT,
-                                       fg=t.INK_MUTED, font=self.fonts.caption,
-                                       cursor="hand2")
-        self._ws_path_label.pack(anchor="w", pady=(t.s(4), 0))
-        chevron = tk.Label(workspace_card, text="›", bg=t.SURFACE_ALT, fg=t.INK_SOFT,
-                           font=self.fonts.display_md, cursor="hand2")
-        chevron.pack(side="right", padx=t.s(12))
-        for widget in (workspace_card, people, copy, title_row,
-                       self._ws_path_label, chevron):
-            widget.bind("<Button-1>",
-                        lambda _event: self.app.show_settings_page("common"), add="+")
-            workspace_card.watch(widget)
 
         new_chat = FlatButton(
             header_zone, "＋  新建对话", self.new_chat, font=self.fonts.small_bold,
             variant="primary", height=42, radius=10, parent_bg=t.SIDEBAR)
         new_chat.pack(fill="x", padx=t.s(18), pady=(t.s(13), t.s(18)))
 
-        self.backend_switch_button = FlatButton(
-            header_zone, "", self.app.toggle_backend_context,
-            font=self.fonts.caption, variant="outline", height=32, radius=8,
-            parent_bg=t.SIDEBAR)
-        self.refresh_backend_switch_button()
+        FlatButton(
+            header_zone, "个人任务", self.show_personal_tasks,
+            font=self.fonts.small_bold, variant="outline", height=36,
+            radius=9, parent_bg=t.SIDEBAR,
+        ).pack(fill="x", padx=t.s(18), pady=(0, t.s(13)))
 
-        self._section_heading(header_zone, "长期项目")
+        self._section_heading(header_zone, "个人项目")
         proj_actions = tk.Frame(header_zone, bg=t.SIDEBAR)
         proj_actions.pack(fill="x", padx=t.s(18), pady=(0, t.s(4)))
         FlatButton(
             proj_actions, "＋  新建项目", self._new_project, font=self.fonts.caption,
             variant="outline", height=32, radius=8, parent_bg=t.SIDEBAR,
-        ).pack(side="left", fill="x", expand=True, padx=(0, t.s(5)))
-        FlatButton(
-            proj_actions, "团队协作", self._open_team_collab, font=self.fonts.caption,
-            variant="soft", height=32, radius=8, parent_bg=t.SIDEBAR,
-        ).pack(side="right", fill="x", expand=True, padx=(t.s(5), 0))
+        ).pack(fill="x")
         self.project_box = tk.Frame(header_zone, bg=t.SIDEBAR)
         self.project_box.pack(fill="x", padx=t.s(10), pady=(t.s(3), t.s(10)))
         self.refresh_projects()
@@ -859,6 +840,54 @@ class ChatView(tk.Frame):
                  fg=t.INK_MUTED, font=self.fonts.caption).pack(
             side="right", padx=(t.s(10), t.s(18)))
 
+    def _build_personal_tasks_page(self) -> None:
+        self.personal_tasks_page.columnconfigure(0, weight=1)
+        self.personal_tasks_page.rowconfigure(1, weight=1)
+        heading = tk.Frame(self.personal_tasks_page, bg=t.CANVAS, height=t.s(82))
+        heading.grid(row=0, column=0, sticky="ew", padx=t.s(28))
+        heading.grid_propagate(False)
+        title = tk.Frame(heading, bg=t.CANVAS)
+        title.pack(side="left", fill="y")
+        tk.Label(title, text="个人任务", bg=t.CANVAS, fg=t.INK,
+                 font=self.fonts.display_md).pack(anchor="w", pady=(t.s(13), 0))
+        tk.Label(title, text="仅显示当前个人后端中属于你的私人任务。",
+                 bg=t.CANVAS, fg=t.INK_MUTED,
+                 font=self.fonts.caption).pack(anchor="w", pady=(t.s(2), 0))
+        actions = tk.Frame(heading, bg=t.CANVAS)
+        actions.pack(side="right", pady=t.s(18))
+        FlatButton(actions, "刷新", self._request_jobs_refresh,
+                   font=self.fonts.caption, variant="outline", height=30,
+                   parent_bg=t.CANVAS).pack(side="right", padx=(t.s(6), 0))
+        FlatButton(actions, "返回对话", self.show_chat_view,
+                   font=self.fonts.caption, variant="ghost", height=30,
+                   parent_bg=t.CANVAS).pack(side="right")
+        separator(self.personal_tasks_page, color=t.LINE_FAINT).grid(
+            row=0, column=0, sticky="sew")
+        self.personal_tasks_scroll = ScrollArea(self.personal_tasks_page, bg=t.CANVAS,
+                                                 scrollbar=True)
+        self.personal_tasks_scroll.grid(row=1, column=0, sticky="nsew",
+                                        padx=(t.s(24), t.s(20)), pady=t.s(14))
+        self._render_personal_tasks()
+
+    def show_personal_tasks(self) -> None:
+        if self._team_context():
+            self.app.toast("团队任务请在团队空间的「任务」页面查看")
+            return
+        self._showing_personal_tasks = True
+        self.personal_tasks_page.grid()
+        self.personal_tasks_page.tkraise()
+        self.toolbar_title.configure(text="个人任务")
+        self._request_jobs_refresh()
+        self._render_personal_tasks()
+
+    def show_chat_view(self) -> None:
+        self._showing_personal_tasks = False
+        self.personal_tasks_page.grid_remove()
+        self.toolbar_title.configure(text=(
+            self.bridge.sessions[self.bridge.current_sid].title
+            if self.bridge.current_sid in self.bridge.sessions else "新对话"))
+        self._show_messages() if self.message_count else self._show_empty()
+
     # ------------------------------------------------------------- job panel
     def _build_job_panel(self) -> None:
         self.panel = tk.Frame(self, bg=t.SURFACE_ALT, width=t.s(302))
@@ -872,7 +901,7 @@ class ChatView(tk.Frame):
         head.pack(fill="x", padx=t.s(18), pady=(t.s(14), t.s(10)))
         kicker(head, "执行面板", font=self.fonts.kicker, bg=t.SURFACE_ALT,
                fg=t.INK_SOFT).pack(side="left")
-        FlatButton(head, "收起", self._toggle_panel, font=self.fonts.caption,
+        FlatButton(head, "返回对话", self.show_chat_view, font=self.fonts.caption,
                    variant="ghost", height=24, padx=8, parent_bg=t.SURFACE_ALT
                    ).pack(side="right")
 
@@ -914,19 +943,16 @@ class ChatView(tk.Frame):
             anchor="w", pady=t.s(4))
 
     def _render_jobs_empty(self) -> None:
-        tk.Label(self.jobs_box, text="我的任务 · 0\n团队任务 · 0\n\n用「! 任务」把长任务派发到异步队列。",
+        tk.Label(self.jobs_box, text="个人任务 · 0\n\n用「! 任务」把个人长任务派发到异步队列。",
                  bg=t.SURFACE_ALT, fg=t.INK_FAINT, font=self.fonts.caption,
                  justify="left", anchor="w", wraplength=t.s(250)).pack(
             anchor="w", pady=t.s(4))
 
     def _toggle_panel(self) -> None:
-        self.panel_pinned = not self.panel_pinned
-        if self.panel_pinned:
-            if self._narrow_mode and self.sidebar_visible:
-                self._toggle_sidebar()
-            self.panel.grid()
+        if self._showing_personal_tasks:
+            self.show_chat_view()
         else:
-            self.panel.grid_remove()
+            self.show_personal_tasks()
 
     def _toggle_sidebar(self, *, manual: bool = True) -> None:
         if manual:
@@ -966,14 +992,7 @@ class ChatView(tk.Frame):
             if not self.sidebar_visible:
                 self._toggle_sidebar(manual=False)
             self._sidebar_auto_hidden = False
-        narrow = width < t.s(1050)
-        if narrow != self._narrow_mode:
-            self._narrow_mode = narrow
-            # 窄窗自动收起右侧任务面板，侧栏保持用户手动状态
-            if narrow and self.panel_pinned:
-                self.panel.grid_remove()
-            elif not narrow and self.panel_pinned:
-                self.panel.grid()
+        self._narrow_mode = width < t.s(1050)
         # Wait for resize to settle before measuring every visible message.
         if self._wrap_job is not None:
             self.after_cancel(self._wrap_job)
@@ -989,10 +1008,10 @@ class ChatView(tk.Frame):
             pass
 
     def _auto_open_panel(self) -> None:
-        if not self.panel_pinned:
-            self.panel_pinned = True
-            if not self._narrow_mode:
-                self.panel.grid()
+        # Task status is available from the explicit personal-task page; tool
+        # events must not resize the chat into a third permanent column.
+        if self._showing_personal_tasks:
+            self._render_personal_tasks()
 
     # ------------------------------------------------------------- todo view
     def render_todos(self, todos) -> None:
@@ -1008,6 +1027,7 @@ class ChatView(tk.Frame):
             child.destroy()
         if not self._todos:
             self._render_todo_empty()
+            self._auto_open_panel()
             return
         self._auto_open_panel()
         done = sum(1 for x in self._todos if str(x.get("status")) == "done")
@@ -1087,7 +1107,12 @@ class ChatView(tk.Frame):
 
     # ------------------------------------------------- server jobs (后台任务)
     def refresh_jobs(self, jobs: list[dict]) -> None:
-        jobs = jobs or []
+        jobs = personal_jobs(jobs or [])
+        self._personal_jobs = jobs
+        if self._selected_personal_job:
+            selected_id = str(self._selected_personal_job.get("id") or "")
+            self._selected_personal_job = next(
+                (row for row in jobs if str(row.get("id") or "") == selected_id), None)
         signature = tuple(
             (job.get("id"), job.get("status"), job.get("title"),
              job.get("visibility"), job.get("is_mine"),
@@ -1107,9 +1132,7 @@ class ChatView(tk.Frame):
             self._jobs_active = False
             return
         active = False
-        mine = [job for job in jobs if job.get("visibility") != "team"
-                and job.get("is_mine")]
-        team = [job for job in jobs if job.get("visibility") == "team"]
+        mine = jobs
 
         def heading(label: str, count: int) -> None:
             head = tk.Frame(self.jobs_box, bg=t.SURFACE_ALT)
@@ -1152,9 +1175,7 @@ class ChatView(tk.Frame):
                 tk.Label(col, text=title, bg=t.SURFACE, fg=t.INK_SOFT,
                          font=self.fonts.caption, anchor="w", justify="left",
                          wraplength=t.s(170)).pack(anchor="w", fill="x")
-                identity = (f"团队 · 发起人 {job.get('owner_name') or job.get('owner') or '成员'}"
-                            if job.get("visibility") == "team" else "私人任务")
-                tk.Label(col, text=identity, bg=t.SURFACE, fg=t.INK_FAINT,
+                tk.Label(col, text="私人任务", bg=t.SURFACE, fg=t.INK_FAINT,
                          font=self.fonts.kicker, anchor="w", justify="left",
                          wraplength=t.s(170)).pack(anchor="w", fill="x")
                 bar = ProgressBar(col, width=160, height=4, bg=t.SURFACE,
@@ -1177,26 +1198,108 @@ class ChatView(tk.Frame):
                         font=self.fonts.caption, variant="ghost", height=22,
                         padx=6, parent_bg=t.SURFACE).pack(anchor="e",
                                                               pady=(t.s(2), 0))
-                elif (job.get("visibility") == "team" and job.get("is_mine")
-                      and job.get("change_id")):
-                    FlatButton(
-                        right, "提交变更",
-                        lambda item=dict(job): self._submit_team_change(item),
-                        font=self.fonts.caption, variant="soft", height=22,
-                        padx=6, parent_bg=t.SURFACE).pack(anchor="e",
-                                                              pady=(t.s(2), 0))
 
-        render_group(mine, "我的任务")
-        render_group(team, "团队任务")
+        render_group(mine, "个人任务")
         self._jobs_active = active
         if active and self._jobs_refresh_job is None:
             self._jobs_refresh_job = self.after(
                 5000, self._request_jobs_refresh)
+        if self._showing_personal_tasks:
+            self._render_personal_tasks()
 
     def _request_jobs_refresh(self) -> None:
         self._jobs_refresh_job = None
+        path = ("/api/v1/jobs?limit=200&scope=team" if self._team_context()
+                else "/api/v1/jobs?limit=20")
         self.bridge.submit("jobs",
-                           lambda: ("ok", self.bridge.client.get("/api/v1/jobs?limit=20")))
+                           lambda: ("ok", self.bridge.client.get(path)))
+
+    def _render_personal_tasks(self) -> None:
+        scroll = getattr(self, "personal_tasks_scroll", None)
+        if scroll is None:
+            return
+        page = scroll.inner
+        for child in page.winfo_children():
+            child.destroy()
+        if self._team_context():
+            tk.Label(page, text="个人任务只在个人空间显示。",
+                     bg=t.CANVAS, fg=t.WARNING,
+                     font=self.fonts.body).pack(anchor="w", padx=t.s(12), pady=t.s(12))
+            return
+        todos = getattr(self, "_todos", [])
+        if todos:
+            activity = tk.Frame(page, bg=t.SURFACE_ALT, padx=t.s(12), pady=t.s(10))
+            activity.pack(fill="x", pady=(0, t.s(10)))
+            done = sum(1 for item in todos if str(item.get("status") or "") == "done")
+            tk.Label(activity, text=f"当前会话计划 · {done}/{len(todos)} 已完成",
+                     bg=t.SURFACE_ALT, fg=t.INK, font=self.fonts.small_bold).pack(
+                         anchor="w", pady=(0, t.s(5)))
+            for item in todos:
+                row = tk.Frame(activity, bg=t.SURFACE_ALT)
+                row.pack(fill="x", pady=t.s(2))
+                status = str(item.get("status") or "pending")
+                TodoIcon(row, status=status, bg=t.SURFACE_ALT).pack(
+                    side="left", padx=(0, t.s(7)))
+                tk.Label(row, text=str(item.get("title") or "计划事项"),
+                         bg=t.SURFACE_ALT, fg=t.INK_SOFT, font=self.fonts.caption,
+                         anchor="w", justify="left", wraplength=max(
+                             t.s(340), self.winfo_width() - t.s(430))).pack(
+                                 side="left", fill="x", expand=True)
+        if not self._personal_jobs:
+            tk.Label(page, text="还没有个人后台任务。\n在个人对话输入以「!」开头的任务，可将长任务放入个人队列。",
+                     bg=t.CANVAS, fg=t.INK_FAINT, font=self.fonts.body,
+                     anchor="w", justify="left").pack(fill="x", padx=t.s(10), pady=t.s(12))
+            return
+        for job in self._personal_jobs:
+            row = tk.Frame(page, bg=t.SURFACE, highlightbackground=t.LINE_FAINT,
+                           highlightthickness=1, padx=t.s(12), pady=t.s(9), cursor="hand2")
+            row.pack(fill="x", pady=(0, t.s(8)))
+            status = str(job.get("status") or "queued")
+            heading = tk.Frame(row, bg=t.SURFACE)
+            heading.pack(fill="x")
+            tk.Label(heading, text=str(job.get("title") or "个人任务"),
+                     bg=t.SURFACE, fg=t.INK, font=self.fonts.small_bold,
+                     anchor="w").pack(side="left", fill="x", expand=True)
+            tk.Label(heading, text=JOB_STATUS_CN.get(status, status),
+                     bg=t.SURFACE, fg=JOB_STATUS_COLOR.get(status, t.INK_MUTED),
+                     font=self.fonts.caption).pack(side="right")
+            created = str(job.get("created_at") or job.get("created") or "")
+            tk.Label(row, text=(f"私人任务 · {created}" if created else "私人任务"),
+                     bg=t.SURFACE, fg=t.INK_MUTED,
+                     font=self.fonts.caption, anchor="w").pack(fill="x", pady=(t.s(4), 0))
+            for widget in (row, heading, *row.winfo_children(), *heading.winfo_children()):
+                widget.bind("<Button-1>", lambda _event, item=dict(job):
+                            self._select_personal_job(item), add="+")
+        if self._selected_personal_job:
+            selected_id = str(self._selected_personal_job.get("id") or "")
+            selected = next((row for row in self._personal_jobs
+                             if str(row.get("id") or "") == selected_id), None)
+            if selected:
+                detail = tk.Frame(page, bg=t.SURFACE_ALT, padx=t.s(12), pady=t.s(10))
+                detail.pack(fill="x", pady=(t.s(2), t.s(10)))
+                tk.Label(detail, text="任务详情", bg=t.SURFACE_ALT, fg=t.INK,
+                         font=self.fonts.small_bold).pack(anchor="w")
+                status = str(selected.get("status") or "queued")
+                result = str(selected.get("result") or selected.get("output") or "").strip()
+                error = str(selected.get("error") or selected.get("detail") or "").strip()
+                text = (f"状态：{JOB_STATUS_CN.get(status, status)}\n" +
+                        (f"错误：{error}" if error else
+                         f"结果：{result}" if result else "任务仍在执行或尚无结果。"))
+                tk.Label(detail, text=text, bg=t.SURFACE_ALT, fg=t.INK_SOFT,
+                         font=self.fonts.caption, anchor="w", justify="left",
+                         wraplength=max(t.s(320), self.winfo_width() - t.s(390))).pack(
+                             fill="x", pady=(t.s(5), 0))
+                if status in {"queued", "running", "waiting_confirm"}:
+                    FlatButton(detail, "取消任务",
+                               lambda jid=selected.get("id"): self._cancel_job(jid),
+                               font=self.fonts.caption, variant="outline", height=28,
+                               parent_bg=t.SURFACE_ALT).pack(anchor="w", pady=(t.s(7), 0))
+
+    def _select_personal_job(self, job: dict) -> None:
+        if job.get("visibility") == "team":
+            return
+        self._selected_personal_job = job
+        self._render_personal_tasks()
 
     def _cancel_job(self, job_id) -> None:
         if not job_id:
@@ -1220,9 +1323,6 @@ class ChatView(tk.Frame):
             self._mem_line.configure(
                 text=f"{mem.get('l1_memories', 0)} 条记忆" if mem.get("enabled")
                 else "未启用", fg=t.INK_SOFT)
-            ws = str(data.get("workspace") or "")
-            self._ws_path_label.configure(
-                text=ws.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or "—")
             if data.get("model"):
                 self.model_chip.set_text(
                     f"{fit_text(self.fonts.small_bold, str(data['model']), t.s(190))} ▾")
@@ -1291,9 +1391,10 @@ class ChatView(tk.Frame):
     def refresh_projects(self) -> None:
         for child in self.project_box.winfo_children():
             child.destroy()
-        selected = next((p for p in self.bridge.projects
+        projects = [p for p in self.bridge.projects if not p.get("is_team")]
+        selected = next((p for p in projects
                          if str(p.get("id") or "") == self.bridge.active_project_id), None)
-        target = (f"派活目标：{'团队' if selected.get('is_team') else '个人'}项目 · "
+        target = (f"个人派活项目 · "
                   f"{selected.get('title') or '项目'}" if selected else "派活目标：未指定")
         target_row = tk.Frame(self.project_box, bg=t.SIDEBAR)
         target_row.pack(fill="x", padx=t.s(9), pady=(0, t.s(3)))
@@ -1306,43 +1407,36 @@ class ChatView(tk.Frame):
                              font=self.fonts.caption, cursor="hand2")
             clear.pack(side="right")
             clear.bind("<Button-1>", lambda _event: self._select_project(""), add="+")
-        if not self.bridge.projects:
-            tk.Label(self.project_box, text="暂无长期项目", bg=t.SIDEBAR,
+        if not projects:
+            tk.Label(self.project_box, text="暂无个人项目", bg=t.SIDEBAR,
                      fg=t.INK_FAINT, font=self.fonts.caption).pack(
                 anchor="w", padx=t.s(12), pady=t.s(3))
             return
-        for item in self.bridge.projects[-6:]:
+        for item in projects[-6:]:
             status = str(item.get("status") or "planning")
-            kind = "团队" if item.get("is_team") else "个人"
             row = SidebarItem(
                 self.project_box,
                 title=fit_text(self.fonts.small, str(item.get("title") or "项目"),
                                t.s(216)),
                 font=self.fonts.small,
                 command=lambda pid=item.get("id"): self._select_project(pid),
-                meta=f"{kind} · {PROJECT_STATUS_CN.get(status, status)}",
-                meta_color=t.TERRACOTTA if item.get("is_team") else PROJECT_STATUS_COLOR.get(status, t.INK_MUTED),
+                meta=f"个人 · {PROJECT_STATUS_CN.get(status, status)}",
+                meta_color=PROJECT_STATUS_COLOR.get(status, t.INK_MUTED),
                 show_dot=True)
             row.pack(fill="x", pady=1)
             row.set_active(str(item.get("id")) == self.bridge.active_project_id)
         tk.Label(
             self.project_box,
-            text="项目只绑定到后台派活；普通对话仍属于当前私人会话。",
+            text="个人项目只用于你自己的后台任务。团队项目请到团队空间选择。",
             bg=t.SIDEBAR, fg=t.INK_FAINT, font=self.fonts.caption,
             wraplength=t.s(255), justify="left",
         ).pack(anchor="w", padx=t.s(9), pady=(t.s(4), 0))
 
     def _open_team_collab(self) -> None:
-        project_id = str(self.bridge.active_project_id or "")
-        project = next((p for p in self.bridge.projects if str(p.get("id")) == project_id), None)
-        if not project:
-            self.app.toast("请先选择一个团队项目")
-            return
-        if not project.get("is_team"):
-            self.app.toast("当前项目是个人项目，请切换到团队项目")
-            return
-        open_team_collab(self, self.app, self.fonts, self.bridge.client,
-                         project_id, str(project.get("title") or "团队项目"))
+        self.app.show_team()
+        team_view = getattr(self.app, "team_workspace_view", None)
+        if team_view is not None:
+            team_view.show_page("changes")
 
     def _select_project(self, project_id) -> None:
         setter = getattr(self.app, "set_active_project", None)
@@ -1365,19 +1459,7 @@ class ChatView(tk.Frame):
         button = getattr(self, "backend_switch_button", None)
         if button is None:
             return
-        team_origin = str(getattr(self.app, "_team_backend_origin", "") or "").rstrip("/")
-        if not team_origin:
-            button.pack_forget()
-            return
-        current = self.bridge.client.base.rstrip("/")
-        if current == team_origin:
-            text = "← 切回个人对话"
-        else:
-            name = str(getattr(self.app, "_team_backend_name", "团队 Hub") or "团队 Hub")
-            text = f"进入 {name} →"
-        button.set_text(text[:24])
-        if not button.winfo_manager():
-            button.pack(fill="x", padx=t.s(18), pady=(0, t.s(10)))
+        button.pack_forget()
 
     def prepare_backend_context_switch(self) -> str:
         self._save_draft()
@@ -1436,6 +1518,9 @@ class ChatView(tk.Frame):
         self.refresh_projects()
 
     def _new_project(self) -> None:
+        if self._team_context():
+            self.app.toast("请切换到团队空间，在项目管理中创建团队项目")
+            return
         dlg = tk.Toplevel(self.app.root)
         dlg.title("新建项目")
         dlg.configure(bg=t.HEADER)
@@ -1443,9 +1528,9 @@ class ChatView(tk.Frame):
         dlg.grab_set()
         card = tk.Frame(dlg, bg=t.HEADER, padx=t.s(18), pady=t.s(16))
         card.pack(fill="both", expand=True)
-        tk.Label(card, text="新建长期项目", bg=t.HEADER, fg=t.INK,
+        tk.Label(card, text="新建个人项目", bg=t.HEADER, fg=t.INK,
                  font=self.fonts.display_md).pack(anchor="w")
-        tk.Label(card, text="类型在创建时确定；团队项目启用多人复核。",
+        tk.Label(card, text="个人项目只用于你的私人后台任务。团队项目请在团队空间的项目管理中创建。",
                  bg=t.HEADER, fg=t.INK_MUTED, font=self.fonts.caption,
                  wraplength=t.s(320), justify="left").pack(
             anchor="w", pady=(t.s(6), t.s(10)))
@@ -1463,15 +1548,6 @@ class ChatView(tk.Frame):
             card, textvariable=goal_var, bg=t.SURFACE, fg=t.INK,
             insertbackground=t.INK, relief="flat", font=self.fonts.body)
         goal_entry.pack(fill="x", ipady=t.s(6), pady=(t.s(4), t.s(10)))
-        team_var = tk.BooleanVar(value=False)
-        team_row = tk.Frame(card, bg=t.HEADER)
-        team_row.pack(fill="x", pady=(t.s(2), t.s(12)))
-        tk.Checkbutton(
-            team_row, text="团队项目（敏感操作需多人复核）",
-            variable=team_var, bg=t.HEADER, fg=t.INK_SOFT,
-            activebackground=t.HEADER, activeforeground=t.INK,
-            selectcolor=t.SURFACE, font=self.fonts.small,
-        ).pack(anchor="w")
         actions = tk.Frame(card, bg=t.HEADER)
         actions.pack(fill="x")
 
@@ -1481,14 +1557,7 @@ class ChatView(tk.Frame):
                 self.app.toast("请输入项目名称")
                 return
             goal = goal_var.get().strip()
-            is_team = bool(team_var.get())
             dlg.destroy()
-            if is_team:
-                from .project_hub_view import open_project_hub
-                open_project_hub(self, self.app, self.fonts, self.bridge.client,
-                                 initial_name=title, initial_description=goal)
-                self.app.toast("团队项目需在 Hub 项目中心完成创建和手动认领")
-                return
             self.bridge.submit("project_create", lambda: self.bridge.client.post(
                 "/api/v1/projects", {
                     "title": title,
@@ -1672,6 +1741,21 @@ class ChatView(tk.Frame):
             self.app.toast("Venus 正在执行，可点上方「停止」", duration=2600)
             return
         dispatch = text.startswith("!") or text.lower().startswith("/dispatch ")
+        if self._team_context():
+            if not dispatch:
+                self.app.toast("团队空间请用「! 任务」派活；个人对话请切回个人空间")
+                return
+            if not self.bridge.active_project_id:
+                self.app.toast("请先选择并认领一个团队项目作为派活目标")
+                return
+            task = text[1:].strip() if text.startswith("!") else text[len("/dispatch "):].strip()
+            if not task:
+                self.app.toast("请填写任务内容")
+                return
+            self.input_box.delete("1.0", "end")
+            self._update_placeholder()
+            self.bridge.dispatch(task, agent_preference=self.agent_name)
+            return
         if self.bridge.current_sid is None:
             if self._pending_visible:
                 self._clear_thread()
@@ -1789,8 +1873,7 @@ class ChatView(tk.Frame):
                 self._set_streaming(False)
                 self.bridge.submit("sessions",
                                    lambda: ("ok", self.bridge.client.get("/api/v1/sessions")))
-                self.bridge.submit("health",
-                                   lambda: ("ok", self.bridge.client.get("/api/v1/health")))
+                self.bridge.refresh_health()
             elif kind == "stream_error":
                 if self._turn is not None:
                     body = self._turn["body"]
@@ -2204,6 +2287,9 @@ class ChatView(tk.Frame):
         return "break"
 
     def new_chat(self) -> None:
+        if self._team_context():
+            self.app.toast("团队空间没有私有对话；请切回个人空间新建对话")
+            return
         if self._creating_session:
             self.app.toast("正在创建对话…", duration=2200)
             return

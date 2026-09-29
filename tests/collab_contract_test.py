@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("PCAGENT_DISABLE_MCP", "1")
 os.environ.setdefault("PCAGENT_ALLOW_TEST_HOST", "1")
@@ -149,6 +150,22 @@ T.save_collab_config({
     "tool_required": {"delete_file": 2},
 })
 check("team project enables multi-vote", T.required_votes("delete_file") == 2, "")
+
+standard_cfg = T.load_collab_config()
+T.save_collab_config({**standard_cfg, "single_member_demo_confirmations": True})
+with patch.object(T, "load_users", return_value=[
+        {"id": "u_a", "enrollment_managed": True}]):
+    with patch.object(T, "active_users", return_value=[{"id": "u_a"}]):
+        check("normal one-member Hub still requires two votes",
+              T.required_votes("run_shell", project_id=team_proj["created"]["id"]) == 2, "")
+        check("isolated demo one-member Hub accepts one vote",
+              T.required_votes("run_shell", project_id=team_proj["created"]["id"],
+                               isolated_demo=True) == 1, "")
+    with patch.object(T, "active_users", return_value=[{"id": "u_a"}, {"id": "u_b"}]):
+        check("second member automatically restores two votes",
+              T.required_votes("run_shell", project_id=team_proj["created"]["id"],
+                               isolated_demo=True) == 2, "")
+T.save_collab_config(standard_cfg)
 
 confirm_results: list[str | None] = []
 

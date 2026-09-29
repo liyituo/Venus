@@ -7,6 +7,7 @@ import threading
 import urllib.error
 import urllib.request
 from typing import Any, Callable
+from urllib.parse import quote, urlparse
 
 from .config_store import llm_base, team_token_for_base, token_for_base
 
@@ -42,6 +43,8 @@ class ApiClient:
         self._use_default_token = use_default_token
         self._deny_redirects = deny_redirects
         self._no_redirect_opener = urllib.request.build_opener(_DenyRedirectHandler())
+        self._tailnet_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _DenyRedirectHandler())
 
     def _headers(self) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
@@ -62,6 +65,11 @@ class ApiClient:
         return h
 
     def open(self, request: urllib.request.Request, *, timeout: float):
+        host = (urlparse(self.base).hostname or "").casefold()
+        if host.endswith(".ts.net"):
+            # MagicDNS resolves inside the tailnet. A system HTTPS proxy cannot
+            # reach it and must never receive a team device credential.
+            return self._tailnet_opener.open(request, timeout=timeout)
         is_team_origin, _token = team_token_for_base(self.base)
         if self._deny_redirects or is_team_origin:
             return self._no_redirect_opener.open(request, timeout=timeout)
@@ -76,9 +84,11 @@ class ApiClient:
         timeout: float = 15,
     ) -> tuple[int, dict]:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-        req = urllib.request.Request(
-            self.base + path, data=data, method=method, headers=self._headers(),
-        )
+        # Project IDs can contain Chinese characters; urllib requires an ASCII
+        # URL while existing percent escapes and query separators stay intact.
+        url = quote(self.base + path, safe=":/?&=%+@")
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers=self._headers())
         try:
             with self.open(req, timeout=timeout) as resp:
                 body = resp.read()

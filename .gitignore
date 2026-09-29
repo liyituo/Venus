@@ -34,3 +34,6 @@ tools/
 /tmp/
 /output/
 
+# 本机录屏提词器含实际 Tailnet 地址与电脑路径，仅保留在本机。
+/docs/venuschat-本机双人演示-录制提词与操作教程.md
+

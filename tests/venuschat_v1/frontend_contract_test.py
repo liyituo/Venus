@@ -38,11 +38,16 @@ def main() -> None:
     assert "from chat_theme" not in combined
     assert "class VenusChatV1" in files["app.py"]
     assert "class ChatView" in files["chat_view.py"]
+    assert "class TeamWorkspaceView" in files["team_workspace_view.py"]
     assert "class SettingsView" in files["settings_view.py"]
     assert "今天，想完成什么？" in files["chat_view.py"]
     assert "backend_bridge" in files["chat_view.py"] or "ApiClient" in combined
-    assert "我的任务" in files["chat_view.py"] and "团队任务" in files["chat_view.py"]
-    assert "open_team_collab" in files["chat_view.py"]
+    assert "show_personal_tasks" in files["chat_view.py"]
+    assert "personal_jobs" in files["chat_view.py"]
+    assert '"版本与审阅"' in files["team_workspace_view.py"]
+    assert "派发团队任务" in files["team_workspace_view.py"]
+    assert "成员" in files["team_workspace_view.py"]
+    assert "self._team_jobs = []" in files["team_workspace_view.py"]
     assert "class TeamCollabWindow" in files["team_collab_view.py"]
     assert "threading.Thread" in files["team_collab_view.py"]
     assert "/review" in files["team_collab_view.py"]
@@ -55,11 +60,37 @@ def main() -> None:
     assert 'self.app.bridge.submit("settings_team"' in files["settings_view.py"]
     assert '"status": "submitting"' in files["settings_view.py"]
     assert 'removeprefix("app_")' in files["settings_view.py"]
-    assert "切回个人对话" in files["chat_view.py"]
+    assert '("personal", "个人空间", self.show_personal)' in files["app.py"]
+    assert '("team", "团队空间", self.show_team)' in files["app.py"]
+    assert "self.team_workspace_view.on_projects(code, data)" in files["app.py"]
+    assert "self.team_workspace_view.on_jobs(data.get(\"jobs\") or [])" in files["app.py"]
     assert "派活目标：未指定" in files["chat_view.py"]
     assert "团队任务必须只发送派发内容" in files["backend_bridge.py"] or "Never forward the" in files["backend_bridge.py"]
     assert '"project_id": None' in files["backend_bridge.py"]
     assert "switch_backend_context" in files["app.py"]
+    app_routes = files["app.py"]
+    personal_route = app_routes.split("    def show_personal", 1)[1].split(
+        "    def show_team", 1)[0]
+    assert personal_route.index("switch_backend_context") < personal_route.index(
+        'self._current_space = "personal"')
+    team_route = app_routes.split("    def show_team", 1)[1].split(
+        "    def return_from_settings", 1)[0]
+    switched_team_route = team_route.split(
+        "if self.client.base.rstrip(\"/\") != self._team_backend_origin:", 1)[1]
+    assert switched_team_route.index("switch_backend_context") < switched_team_route.index(
+        'self._current_space = "team"')
+    assert "return_from_settings()" in app_routes.split(
+        "    def _escape", 1)[1].split("def build_parser", 1)[0]
+    assert "self.team_workspace_view" in app_routes.split(
+        "    def _top_view", 1)[1].split("# Toast", 1)[0]
+    assert "limit=200&scope=team" in files["team_workspace_view.py"]
+    assert "after(800" not in files["team_workspace_view.py"]
+    team_jobs_event = files["team_workspace_view.py"].split(
+        "    def on_jobs", 1)[1].split("    def on_dispatch", 1)[0]
+    assert "_render_task_queue()" in team_jobs_event
+    assert "_render_page()" not in team_jobs_event
+    assert "selected_change_after_refresh" in files["team_workspace_view.py"]
+    assert "can_cancel_team_job" in files["team_workspace_view.py"]
     assert "class ProjectHubWindow" in files["project_hub_view.py"]
     detail_widget = _TextWidgetStub()
     render_call_detail(detail_widget, {"status": "approved"})
@@ -83,8 +114,8 @@ def main() -> None:
     assert "list_hub_users" in files["project_api.py"]
     assert "复制此 Hub 终端码 VN" in files["project_hub_view.py"]
     assert '"/api/v1/projects/active"' in files["app.py"]
-    assert "open_project_hub" in files["chat_view.py"]
-    assert "手动认领" in files["chat_view.py"]
+    assert "open_project_hub" in files["team_workspace_view.py"]
+    assert "手动输入认领码" in files["project_hub_view.py"]
     assert "project_preference_key" in files["config_store.py"]
     assert "此 Hub 终端码（VN）" in files["settings_view.py"]
     assert "terminal_identity" in combined
@@ -98,8 +129,8 @@ def main() -> None:
     assert 'if installation_code and installation_code != self._installation_code:' in files["settings_view.py"]
     assert "打开 Agent 任务面板" in files["project_hub_view.py"]
     agent_nav = files["project_hub_view.py"].split("    def open_agent_tasks(self)", 1)[1].split("    def _selected_project", 1)[0]
-    assert agent_nav.index("self.withdraw()") < agent_nav.index("self.app.show_chat()")
-    assert agent_nav.index("chat_view._request_jobs_refresh()") < agent_nav.index("self.destroy()")
+    assert agent_nav.index("self.withdraw()") < agent_nav.index("self.app.show_team()")
+    assert agent_nav.index('team_view.show_page("tasks")') < agent_nav.index("self.destroy()")
     assert "self.deiconify()" in agent_nav and "self.lift()" in agent_nav
     assert "Worker 派活与审批使用独立队列" in files["project_hub_view.py"]
     assert "_set_action_buttons_busy" in files["project_hub_view.py"]

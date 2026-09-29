@@ -73,6 +73,11 @@ if [[ -n "$hub_host" ]]; then
   host_args=(--host "$hub_host")
 fi
 hub_host="$(python3 "$helper" resolve-host "${host_args[@]}")"
+serve_peer="$(tailscale ip -4 | head -n 1)"
+if [[ -z "$serve_peer" ]]; then
+  echo "ERROR: Cannot detect this node's Tailscale IPv4 address." >&2
+  exit 1
+fi
 python3 "$helper" serve --host "$hub_host" --dry-run >/dev/null
 
 if ((dry_run)); then
@@ -92,7 +97,7 @@ unit_dir="$HOME/.config/systemd/user"
 mkdir -p "$config_dir" "$unit_dir" "$repo_root/.venus"
 chmod 700 "$config_dir" "$repo_root/.venus"
 tmp_env="$config_dir/hub.env.tmp.$$"
-printf 'VENUS_TEAM_HOST=%s\n' "$hub_host" > "$tmp_env"
+printf 'VENUS_TEAM_HOST=%s\nVENUS_TEAM_SERVE_PEER=%s\n' "$hub_host" "$serve_peer" > "$tmp_env"
 chmod 600 "$tmp_env"
 mv -f -- "$tmp_env" "$config_dir/hub.env"
 install -m 0644 "$unit_source" "$unit_dir/venus-hub.service"

@@ -449,13 +449,17 @@ class ProjectHubWindow(tk.Toplevel):
     def open_agent_tasks(self) -> None:
         self.withdraw()
         try:
-            self.app.show_chat()
-            chat_view = getattr(self.app, "chat_view", None)
-            if chat_view is None:
-                raise RuntimeError("对话任务面板暂不可用")
-            if not getattr(chat_view, "panel_pinned", False):
-                chat_view._toggle_panel()
-            chat_view._request_jobs_refresh()
+            team_view = getattr(self.app, "team_workspace_view", None)
+            if team_view is not None and team_view.connected:
+                self.app.show_team()
+                team_view.show_page("tasks")
+            else:
+                self.app.show_personal()
+                chat_view = getattr(self.app, "chat_view", None)
+                if chat_view is None:
+                    raise RuntimeError("个人任务页面暂不可用")
+                chat_view.show_personal_tasks()
+                chat_view._request_jobs_refresh()
         except Exception as exc:
             self.deiconify()
             self.lift()

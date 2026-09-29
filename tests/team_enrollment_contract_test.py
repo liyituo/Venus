@@ -59,6 +59,7 @@ def run() -> tuple[int, int]:
     L.ISOLATED = True
     L.TEAM_SERVE_MODE = True
     L.TEAM_SERVE_HOST = HOST
+    L.TEAM_SERVE_PROXY_PEER = "100.101.102.103"
     L.AUTH_TOKEN = ""
     legacy_token = "legacy-user-token-do-not-trust"
     T.save_users([{"id": "u_legacy", "name": "Legacy", "role": "admin",
@@ -85,6 +86,20 @@ def run() -> tuple[int, int]:
           and uninitialized_public.json().get("initialized") is False
           and not uninitialized_public.json().get("team_id")
           and uninitialized_public.json().get("serve_host") == HOST)
+    default_https_port = client.get("/api/v1/team/public", headers={
+        "Host": f"{HOST}:443", "Tailscale-User-Login": "alice@example.com"})
+    check("Serve HTTPS default port preserves trusted identity",
+          default_https_port.status_code == 200
+          and default_https_port.json().get("tailscale_login") == "alice@example.com")
+    serve_peer = TestClient(L.app, client=("100.101.102.103", 52103))
+    other_tailnet_peer = TestClient(L.app, client=("100.101.102.104", 52104))
+    check("only configured local tailnet proxy IP can provide Serve identity",
+          serve_peer.get("/api/v1/team/public", headers={
+              "Host": HOST, "Tailscale-User-Login": "alice@example.com",
+          }).json().get("tailscale_login") == "alice@example.com"
+          and other_tailnet_peer.get("/api/v1/team/public", headers={
+              "Host": HOST, "Tailscale-User-Login": "alice@example.com",
+          }).status_code == 403)
     malformed_secret = "invite-secret-must-not-be-echoed-" * 12
     invalid_request = client.post("/api/v1/team/join-requests",
                                   headers=headers("alice@example.com"), json={
@@ -97,13 +112,16 @@ def run() -> tuple[int, int]:
           invalid_request.text)
     wrong_host = client.get("/api/v1/team/public", headers={
         "Host": "hub.example.ts.net.evil", "Tailscale-User-Login": "alice@example.com"})
+    wrong_port = client.get("/api/v1/team/public", headers={
+        "Host": f"{HOST}:444", "Tailscale-User-Login": "alice@example.com"})
     remote_bootstrap = TestClient(L.app, client=("192.168.1.22", 52102)).post(
         "/api/v1/team/bootstrap",
         headers={"Host": LOCAL, "X-Team-Bootstrap-Token": bootstrap_token},
         json={"team_name": "Wrong", "admin_login": "alice@example.com",
               "admin_name": "Alice", "device_name": "Hub"})
     check("Serve identity requires the exact configured Host and loopback bootstrap",
-          wrong_host.status_code == 403 and remote_bootstrap.status_code == 403
+          wrong_host.status_code == 403 and wrong_port.status_code == 403
+          and remote_bootstrap.status_code == 403
           and bool(E.bootstrap_credential_local()))
     init = client.post("/api/v1/team/bootstrap", headers={
         "Host": LOCAL, "X-Team-Bootstrap-Token": bootstrap_token,

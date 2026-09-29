@@ -155,11 +155,30 @@ class BackendBridge:
             self.ui("stream_delta", self._stream_text())
 
     # Bootstrap ----------------------------------------------------------------
+    def _team_context(self) -> bool:
+        try:
+            return bool(team_connection(self.client.base))
+        except ValueError:
+            return False
+
+    def refresh_health(self) -> None:
+        # The full health response contains machine-wide details and is not
+        # exposed through Tailscale Serve. Its small ready response carries
+        # only the state the team workspace needs to enable dispatch.
+        path = "/api/v1/ready" if self._team_context() else "/api/v1/health"
+        self.submit("health", lambda: ("ok", self.client.get(
+            path, timeout=8)))
+
     def refresh_all(self) -> None:
-        self.submit("health", lambda: ("ok", self.client.get("/api/v1/health", timeout=6)))
-        self.submit("sessions", lambda: ("ok", self.client.get("/api/v1/sessions", timeout=8)))
-        self.submit("projects", lambda: ("ok", self.client.get("/api/v1/projects", timeout=8)))
-        self.submit("jobs", lambda: ("ok", self.client.get("/api/v1/jobs?limit=20", timeout=8)))
+        self.refresh_health()
+        if self._team_context():
+            # Shared Hub sessions are intentionally not exposed through Serve.
+            self.submit("sessions", lambda: ("ok", (200, {"sessions": []})))
+        else:
+            self.submit("sessions", lambda: ("ok", self.client.get("/api/v1/sessions", timeout=8)))
+        if not self._team_context():
+            self.submit("projects", lambda: ("ok", self.client.get("/api/v1/projects", timeout=8)))
+            self.submit("jobs", lambda: ("ok", self.client.get("/api/v1/jobs?limit=20", timeout=8)))
 
     def _apply_health(self, code: int, data: dict) -> None:
         if code == 200:
@@ -193,7 +212,7 @@ class BackendBridge:
         # The legacy personal server has process-global selection, which must
         # never override this client's locally selected dispatch target.
         project_ids = {str(row.get("id") or "") for row in self.projects}
-        if "active" in data and team_connection(self.client.base):
+        if "active" in data and self._team_context():
             server_active = str(data.get("active") or "")
             self.active_project_id = server_active if server_active in project_ids else ""
             save_active_project_for_origin(self.client.base, self.active_project_id)
@@ -332,13 +351,13 @@ class BackendBridge:
     def dispatch(self, text: str, sess: SessionState | None = None,
                  *, agent_preference: str = "") -> None:
         sess = sess or (self.sessions.get(self.current_sid or -1) if self.current_sid else None)
-        if not sess:
-            self.ui("toast", "请先选择会话")
-            return
         selected_project = next(
             (row for row in self.projects
              if str(row.get("id") or "") == self.active_project_id), None)
         team_dispatch = bool(selected_project and selected_project.get("is_team"))
+        if not team_dispatch and not sess:
+            self.ui("toast", "请先选择会话")
+            return
         # A team job is shared with every project member. Never forward the
         # private conversation history that happened to be open when the
         # user selected a team project; only the explicitly dispatched task
@@ -355,7 +374,7 @@ class BackendBridge:
                 "session_id": None if team_dispatch else sess.sid,
                 "title": text[:80],
                 "project_id": project_id,
-                "request_id": f"v1-job-{sess.sid}-{uuid.uuid4().hex}",
+                "request_id": f"v1-job-{sess.sid if sess else 'team'}-{uuid.uuid4().hex}",
             }))
         self.submit("dispatch", _do)
 

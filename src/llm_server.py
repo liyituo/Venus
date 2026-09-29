@@ -342,6 +342,7 @@ class ConfirmModeRequest(BaseModel):
 ISOLATED = False
 TEAM_SERVE_MODE = False
 TEAM_SERVE_HOST = ""
+TEAM_SERVE_PROXY_PEER = ""
 
 # ---- 文件/系统工具安全限制 ----
 MAX_FILE_SIZE = 200_000      # read_file 单文件上限（字节）
@@ -1457,14 +1458,27 @@ def _test_peer(peer: str) -> bool:
             and peer in ("testserver", "testclient", "localhost"))
 
 
+def _is_team_serve_host_header(host: str) -> bool:
+    """Accept the configured Serve hostname with its optional HTTPS port."""
+    raw = str(host or "").strip().casefold()
+    return bool(TEAM_SERVE_HOST and raw in {
+        TEAM_SERVE_HOST, f"{TEAM_SERVE_HOST}:443",
+    })
+
+
+def _is_team_serve_proxy_peer(peer: str) -> bool:
+    """Serve may connect from this node's own Tailscale IP on Windows."""
+    return bool(_is_loopback(peer) or _test_peer(peer)
+                or (TEAM_SERVE_PROXY_PEER and peer == TEAM_SERVE_PROXY_PEER))
+
+
 def _trusted_serve_login(request: Request) -> str:
     """Tailscale identity is trusted only behind configured loopback Serve."""
     if not (TEAM_SERVE_MODE and ISOLATED and TEAM_SERVE_HOST):
         return ""
     peer = str(getattr(getattr(request, "client", None), "host", "") or "")
-    raw_host = str(request.headers.get("host", "") or "").strip().casefold()
-    proxy_peer = _is_loopback(peer) or _test_peer(peer)
-    if not proxy_peer or raw_host != TEAM_SERVE_HOST:
+    proxy_peer = _is_team_serve_proxy_peer(peer)
+    if not proxy_peer or not _is_team_serve_host_header(request.headers.get("host", "")):
         return ""
     value = str(request.headers.get("Tailscale-User-Login", "") or "").strip()
     # Reject tagged nodes (Serve leaves this header empty) and malformed input.
@@ -1507,15 +1521,14 @@ async def host_guard(request, call_next):
     request_host = _parse_host_header(request.headers.get("host", ""))
     test_peer = _test_peer(peer)
     if TEAM_SERVE_MODE:
-        # In Serve mode the backend must bind to loopback. Serve's peer is a
-        # loopback proxy, while the public Host must exactly match the one
-        # configured at startup. Direct LAN/tailnet sockets are always denied.
+        # The backend binds to loopback. On Windows, Serve can connect from
+        # this node's own tailnet IP; accept only that explicit proxy peer.
         local_peer = _is_loopback(peer) or test_peer
-        raw_host = str(request.headers.get("host", "") or "").strip().casefold()
-        serve_host = bool(local_peer and TEAM_SERVE_HOST
-                          and raw_host == TEAM_SERVE_HOST)
+        serve_peer = _is_team_serve_proxy_peer(peer)
+        serve_host = bool(serve_peer and TEAM_SERVE_HOST
+                          and _is_team_serve_host_header(request.headers.get("host", "")))
         local_host = bool(local_peer and request_host in _LOOPBACK_HOSTS)
-        if not ISOLATED or not local_peer or not (serve_host or local_host):
+        if not ISOLATED or not (serve_host or local_host):
             return JSONResponse(status_code=403,
                                 content={"detail": "Hub 仅接受本机或配置的 Tailscale Serve 代理请求"})
         origin = request.headers.get("origin")
@@ -3472,7 +3485,14 @@ async def set_workspace(req: WorkspaceUpdate) -> dict:
 
 @app.get("/api/v1/ready", summary="LLM 后端轻量就绪检查")
 async def ready() -> dict:
-    return {"ok": True, "service": "venus-llm", "version": APP_VERSION}
+    cfg = load_config()
+    return {
+        "ok": True,
+        "service": "venus-llm",
+        "version": APP_VERSION,
+        "configured": bool(cfg.get("api_url") and cfg.get("api_key")),
+        "model": cfg.get("model") or "",
+    }
 
 
 @app.get("/api/v1/health", summary="LLM 后端健康检查")
@@ -5954,7 +5974,8 @@ def _wait_confirm(request_id: str, timeout: float = CONFIRM_TIMEOUT,
     ev = threading.Event()
     project_id = _bound_project_id()
     required = team_collab.required_votes(
-        tool_name or "unknown", project_id=project_id)
+        tool_name or "unknown", project_id=project_id,
+        isolated_demo=ISOLATED)
     eligible_reviewers: set[str] = set()
     policy_version = 0
     if TEAM_SERVE_MODE and project_id:
@@ -7730,7 +7751,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                            "options": ["yes", "no"],
                                            "plan": plan_steps,
                                            "required": team_collab.required_votes(
-                                               "create_plan", project_id=_bound_project_id()),
+                                               "create_plan", project_id=_bound_project_id(),
+                                               isolated_demo=ISOLATED),
                                            "approvals": {}}))
                             choice = _wait_confirm(ask_id, timeout=PLAN_CONFIRM_TIMEOUT,
                                                    task_id=task_id, tool_name="create_plan",
@@ -7786,7 +7808,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                        "options": ["yes", "no"],
                                        "diff": _confirm_question(fn["name"], args)[1],
                                        "required": team_collab.required_votes(
-                                           fn["name"], project_id=_bound_project_id()),
+                                           fn["name"], project_id=_bound_project_id(),
+                                           isolated_demo=ISOLATED),
                                        "approvals": {}}))
                         choice = _wait_confirm(ask_id, task_id=task_id,
                                                tool_name=fn["name"], cancel_event=cancel)
@@ -7817,7 +7840,8 @@ def _agent_loop(api_url: str, headers: dict, messages: list[dict],
                                        "question": question,
                                        "options": ["yes", "no"], "diff": diff,
                                        "required": team_collab.required_votes(
-                                           fn["name"], project_id=_bound_project_id()),
+                                           fn["name"], project_id=_bound_project_id(),
+                                           isolated_demo=ISOLATED),
                                        "approvals": {}}))
                         choice = _wait_confirm(ask_id, task_id=task_id,
                                                tool_name=fn["name"], cancel_event=cancel)
@@ -8540,8 +8564,11 @@ if __name__ == "__main__":
                         help="启用单团队 Tailscale Serve 身份代理模式（必须同时使用 --isolated）")
     parser.add_argument("--team-host", default="",
                         help="Tailscale Serve 的精确 HTTPS 主机名，例如 hub.example.ts.net")
+    parser.add_argument("--team-serve-peer", default="",
+                        help="本机 Tailscale IP；当 Serve 以此地址连接 loopback 后端时使用")
     args = parser.parse_args()
     team_host = str(args.team_host or "").strip().lower()
+    team_serve_peer = str(args.team_serve_peer or "").strip()
     if args.team_serve:
         if not args.isolated:
             parser.error("--team-serve 必须与 --isolated 一起使用")
@@ -8553,6 +8580,8 @@ if __name__ == "__main__":
                 not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", team_host) or
                 ".." in team_host):
             parser.error("--team-host 须是精确的 Tailscale HTTPS 域名（*.ts.net）")
+        if team_serve_peer and not _is_tailnet_ip(team_serve_peer):
+            parser.error("--team-serve-peer 须是本机 Tailscale IP 地址")
     elif team_enrollment.is_initialized():
         parser.error("此 Hub 已初始化团队，必须使用 --isolated --team-serve --team-host")
     # 安全要求：绑定非回环地址时必须提供 token（否则拒绝启动）
@@ -8565,6 +8594,7 @@ if __name__ == "__main__":
     ISOLATED = args.isolated
     TEAM_SERVE_MODE = args.team_serve
     TEAM_SERVE_HOST = team_host if args.team_serve else ""
+    TEAM_SERVE_PROXY_PEER = team_serve_peer if args.team_serve else ""
     if TEAM_SERVE_MODE:
         try:
             if team_enrollment.ensure_bootstrap_credential():

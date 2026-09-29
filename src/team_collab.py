@@ -139,8 +139,9 @@ def team_enabled() -> bool:
     return team_mode_active()
 
 
-def required_votes(tool_name: str, *, project_id: str | None = None) -> int:
-    """团队项目 + Hub 协作就绪时对敏感工具要求 N 票；个人项目始终 1 票。"""
+def required_votes(tool_name: str, *, project_id: str | None = None,
+                   isolated_demo: bool = False) -> int:
+    """团队项目敏感工具按 Hub 策略投票；个人项目始终 1 票。"""
     def _count(value: Any, fallback: int) -> int:
         try:
             return max(1, min(100, int(value)))
@@ -171,6 +172,12 @@ def required_votes(tool_name: str, *, project_id: str | None = None) -> int:
     managed_team = any(row.get("enrollment_managed") for row in load_users())
     active_count = len(active_users())
     if managed_team and active_count < 2:
+        # An isolated demo Hub can explicitly opt into one-person tool
+        # confirmations. A normal Hub fails closed, and the configured
+        # multi-person threshold returns when a second member joins.
+        if (isolated_demo and active_count == 1
+                and cfg.get("single_member_demo_confirmations") is True):
+            return 1
         return max(2, configured)
     return configured if team_mode_active() else 1
 

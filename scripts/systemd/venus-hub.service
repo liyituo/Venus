@@ -8,7 +8,7 @@ EnvironmentFile=%h/.config/venus-hub/hub.env
 Environment=PYTHONUTF8=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=NO_PROXY=localhost,127.0.0.1
-ExecStart=%h/venus-hub/.venv/bin/python -u %h/venus-hub/src/llm_server.py --host 127.0.0.1 --port 8001 --isolated --team-serve --team-host ${VENUS_TEAM_HOST}
+ExecStart=%h/venus-hub/.venv/bin/python -u %h/venus-hub/src/llm_server.py --host 127.0.0.1 --port 8001 --isolated --team-serve --team-host ${VENUS_TEAM_HOST} --team-serve-peer ${VENUS_TEAM_SERVE_PEER}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

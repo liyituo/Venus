@@ -1036,7 +1036,11 @@ class SettingsView(tk.Frame):
         self._dirty_pages.clear()
         self._page_ready = False
         self._needs_reload = True
-        self.app.show_chat()
+        return_to_settings = getattr(self.app, "return_from_settings", None)
+        if callable(return_to_settings):
+            return_to_settings()
+        else:
+            self.app.show_chat()
 
     def on_open(self) -> None:
         if self._needs_reload:

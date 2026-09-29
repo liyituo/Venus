@@ -80,7 +80,9 @@ cd src
 
 打开后在「设置」里填 API 地址和 Key，点「连接」验证。任意 OpenAI 兼容接口都能接，DeepSeek 填 `https://api.deepseek.com`。也可以命令行方式：`cp chat_config.example.json chat_config.json` 后填 Key（样例文件无密钥，安全入库）。
 
-**团队协作：**团队 Hub 必须通过 Tailscale Serve HTTPS 运行；管理员邀请指定 Tailscale 登录名，成员申请后由管理员审核。不要复用模型 API Key 作为团队凭证。部署和两台电脑完整演示见 [`docs/collaboration-plan.md`](docs/collaboration-plan.md) 与 [`docs/venuschat-v1.md`](docs/venuschat-v1.md)。
+**桌面空间：**顶栏可在「个人空间」与「团队空间」间切换。个人空间保留私人对话、个人项目与个人任务；团队空间按当前项目提供「任务」「版本与审阅」「成员」三个页面。团队任务直接在「任务」页输入正文并派发；在已完成任务的详情中提交变更，再到「版本与审阅」核对 SHA、差异、审批票数并合并。「项目管理」用于创建、认领和邀请，「设置 → 团队与成员」用于 Hub 身份与设备审批。单机演示路线见 [`4 分钟团队模式录制稿`](docs/venuschat-本机Hub-4分钟团队模式录制稿.md)。
+
+**团队协作：**团队 Hub 必须通过 Tailscale Serve HTTPS 运行；管理员邀请指定 Tailscale 登录名，成员申请后由管理员审核。不要复用模型 API Key 作为团队凭证。部署说明见 [`docs/collaboration-plan.md`](docs/collaboration-plan.md) 与 [`docs/venuschat-v1.md`](docs/venuschat-v1.md)。
 
 ### 本地 AI 额度桌面组件
 
@@ -161,7 +163,7 @@ CLI 里 `/help` 看全部命令；`/model` 换模型，`/confirm-mode` 切确认
 
 #### 团队项目版本协作
 
-团队项目的版本仓库按需初始化在 Hub 数据目录 `.venus/team_projects/<project_id>/repo/`。初始化 API 必须收到明确的 `shared_paths`，仅从 Hub 配置的工作区复制这些安全文件；不会导入整个工作区。团队任务自动获得独立分支和 worktree，且不关联成员私人会话或记忆；个人任务保持原工作区行为。成员通过 VenusChat「团队协作」查看差异、审阅和合并；任务发起人从后台任务卡片提交明确的文件路径集合。
+团队项目的版本仓库按需初始化在 Hub 数据目录 `.venus/team_projects/<project_id>/repo/`。初始化 API 必须收到明确的 `shared_paths`，仅从 Hub 配置的工作区复制这些安全文件；不会导入整个工作区。团队任务自动获得独立分支和 worktree，且不关联成员私人会话或记忆；个人任务保持原工作区行为。成员通过 VenusChat「团队空间 → 版本与审阅」查看差异、审阅和合并；任务发起人从「团队空间 → 任务」中已完成任务的详情提交明确的文件路径集合。
 
 | 端点 | 作用 |
 | --- | --- |
