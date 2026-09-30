@@ -160,11 +160,8 @@ def main() -> None:
     assert "X-Api-Token" not in headers
     assert ApiClient(hub, use_default_token=False)._headers() == {"Content-Type": "application/json"}
 
-    try:
-        C.normalize_team_origin("http://hub.example.ts.net")
-        raise AssertionError("remote HTTP Hub was accepted")
-    except ValueError:
-        pass
+    assert C.normalize_team_origin("http://192.0.2.10:8001") == "http://192.0.2.10:8001"
+    assert C.normalize_team_origin("192.0.2.10") == "http://192.0.2.10:8001"
     assert C.normalize_team_origin("http://127.0.0.1:8001") == "http://127.0.0.1:8001"
     redirect = _DenyRedirectHandler()
     assert redirect.redirect_request(None, None, 302, "Found", {}, "https://other.invalid/") is None

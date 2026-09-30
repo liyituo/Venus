@@ -252,7 +252,7 @@ def main() -> None:
     launcher = (ROOT / "scripts/Start-VenusChat.ps1").read_text(encoding="utf-8")
     assert "Get-GuiProcess" in launcher
     assert "Start-Process -FilePath $pythonwExe" in launcher
-    assert "Get-LocalBackendState" in launcher
+    assert "Get-LocalBackendState" not in launcher
     assert "Read-Host" not in launcher
     app_source = (ROOT / "src/venuschat_v1/app.py").read_text(encoding="utf-8")
     assert "local_hub_base and initial_base == local_hub_base" in app_source

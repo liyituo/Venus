@@ -646,12 +646,13 @@ def claim_device(application_id: str, *, tailscale_login: str,
             "team": public_team(), "user_id": row.get("user_id")}
 
 
-def authenticate_device_result(token: str, tailscale_login: str) -> tuple[dict | None, str]:
+def authenticate_device_result(token: str, tailscale_login: str, *,
+                               require_network_identity: bool = True) -> tuple[dict | None, str]:
     raw = str(token or "").strip()
     login = normalize_login(tailscale_login)
     if not raw:
         return None, "缺少团队设备凭证"
-    if not login:
+    if require_network_identity and not login:
         return None, "缺少可信的 Tailscale 用户身份"
     users = team_collab.load_users()
     with _LOCK:
@@ -664,7 +665,7 @@ def authenticate_device_result(token: str, tailscale_login: str) -> tuple[dict |
             user = next((u for u in users if u.get("id") == device.get("user_id")), None)
             if not user or user.get("status", "active") != "active":
                 return None, "团队成员已停用"
-            if normalize_login(str(user.get("tailscale_login") or "")) != login:
+            if require_network_identity and normalize_login(str(user.get("tailscale_login") or "")) != login:
                 return None, "当前 Tailscale 身份与此设备凭证不匹配"
             now = _now()
             if now - float(device.get("last_used_at") or 0) >= 60:
@@ -682,6 +683,30 @@ def authenticate_device_result(token: str, tailscale_login: str) -> tuple[dict |
 
 def authenticate_device(token: str, tailscale_login: str) -> dict | None:
     return authenticate_device_result(token, tailscale_login)[0]
+
+
+def direct_invite_login(code: str) -> str:
+    """A direct invitation is a bearer secret assigned by the administrator.
+
+    The stored member label is not an externally verified email/network identity.
+    The existing approval and one-use claim checks still apply.
+    """
+    with _LOCK:
+        invite = _invite_by_code(_load_access(), code)
+        if not invite:
+            raise EnrollmentError(401, "邀请码无效")
+        return str(invite.get("expected_login") or "")
+
+
+def direct_application_login(application_id: str, claim_secret: str) -> str:
+    """Status and claim require the applicant's secret, never just their label."""
+    target = _safe_id(application_id, "加入申请")
+    with _LOCK:
+        row = next((r for r in _load_access()["applications"] if r.get("id") == target), None)
+        if (not row or not claim_secret or not hmac.compare_digest(
+                str(row.get("claim_secret_hash") or ""), team_collab.hash_token(claim_secret))):
+            raise EnrollmentError(401, "申请凭证无效")
+        return str(row.get("actual_login") or "")
 
 
 def current_identity(user_id: str, device_id: str) -> dict:

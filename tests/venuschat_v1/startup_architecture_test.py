@@ -45,19 +45,18 @@ def main() -> None:
             "/api/v1/team/public"} <= api_routes
 
     gui = (ROOT / "scripts/Start-VenusChat.ps1").read_text(encoding="utf-8")
-    assert "Get-LocalBackendState" in gui
-    assert gui.index("'@") < gui.index("function Get-LocalBackendState")
+    assert "Get-LocalBackendState" not in gui
     assert "Read-Host" not in gui
-    assert "VENUS_STARTUP_LOCAL_STATE" in gui
+    assert "VENUS_STARTUP_LOCAL_STATE" not in gui
     assert "Start-Process -FilePath $pythonwExe" in gui
     startup = (ROOT / "src/venuschat_v1/startup_backend.py").read_text(encoding="utf-8")
-    assert "启动本机后端" in startup and "填写远程地址" in startup
+    assert "启动本机后端" in startup and "配置服务器连接" in startup
     assert startup.index("def start_local(self)") < startup.index(
         "start_local_backend(self.base)")
     import venuschat_v1.startup_backend as startup_backend  # noqa: E402
     normalize_remote_origin = startup_backend.normalize_remote_origin
-    assert normalize_remote_origin("https://hub.example/") == "https://hub.example"
-    for bad in ("", "http://localhost:8001", "http://127.0.0.2:8001",
+    assert normalize_remote_origin("https://hub.example/") == "https://hub.example:8001"
+    for bad in ("", "http://0.0.0.0:8001",
                 "https://user:secret@hub.example",
                 "https://hub.example/path", "https://hub.example?token=x"):
         try:
@@ -66,21 +65,26 @@ def main() -> None:
             pass
         else:
             raise AssertionError(f"accepted invalid remote origin: {bad!r}")
-    with patch.object(startup_backend, "StartupBackendDialog") as dialog:
-        os.environ["VENUS_STARTUP_LOCAL_BASE"] = "http://127.0.0.1:8001"
-        os.environ["VENUS_STARTUP_LOCAL_STATE"] = "down"
-        startup_backend.show_startup_backend_prompt(SimpleNamespace(root=None))
-        dialog.assert_called_once()
-        os.environ["VENUS_STARTUP_LOCAL_BASE"] = "http://127.0.0.1:8001"
-        os.environ["VENUS_STARTUP_LOCAL_STATE"] = "ready"
-        startup_backend.show_startup_backend_prompt(SimpleNamespace(root=None))
-        dialog.assert_called_once()
+    # Both local and remote use the selected endpoint, regardless of launcher hints.
+    for base in ("http://127.0.0.1:8001", "http://192.0.2.1:8001", "https://hub.example:8001"):
+        assert normalize_remote_origin(base) == base
+        fake_app = SimpleNamespace(client=SimpleNamespace(base=base),
+                                   root=SimpleNamespace(after=lambda delay, callback: callback()))
+        def immediate_thread(*, target, **kwargs):
+            return SimpleNamespace(start=target)
+        for ready in (True, False):
+            with patch.object(startup_backend, "StartupBackendDialog") as dialog, \
+                    patch.object(startup_backend, "probe_backend", return_value=ready) as probe, \
+                    patch.object(startup_backend.threading, "Thread", side_effect=immediate_thread):
+                startup_backend.show_startup_backend_prompt(fake_app)
+                probe.assert_called_once_with(base)
+                assert dialog.call_count == (0 if ready else 1)
     assert "Start-VenusChat.ps1" in (ROOT / "scripts/启动VenusChat V1.bat").read_text(encoding="utf-8")
     assert not (ROOT / "scripts/一键启动控制台.bat").exists()
     assert not (ROOT / "scripts/Start-VenusConsole.ps1").exists()
 
     if os.name == "nt":
-        paths = [str(ROOT / "scripts/Start-VenusChat.ps1")]
+        paths = [str(ROOT / "scripts" / name) for name in ("Start-VenusChat.ps1", "Start-VenusServer.ps1", "start_team_hub.ps1", "check_team_hub.ps1")]
         quoted = ",".join("'" + path.replace("'", "''") + "'" for path in paths)
         command = ("$errors = @(); foreach ($path in @(" + quoted + ")) { "
                    "$tokens = $null; $parseErrors = $null; "

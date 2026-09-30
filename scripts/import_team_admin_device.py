@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 os.umask(0o077)
 
 
-HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.ts\.net$")
+
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -37,12 +35,8 @@ def _read_transfer(path: Path) -> dict:
     if not isinstance(value, dict) or value.get("format") != "venus-team-admin-transfer-v1":
         raise ValueError("Unrecognized Venus admin transfer format")
     origin = str(value.get("origin") or "")
-    parsed = urlsplit(origin)
-    host = (parsed.hostname or "").casefold()
-    if (parsed.scheme != "https" or not HOST_RE.fullmatch(host) or ".." in host
-            or parsed.username or parsed.password or parsed.path not in ("", "/")
-            or parsed.query or parsed.fragment or parsed.port not in (None, 443)):
-        raise ValueError("Transfer Hub must be an HTTPS *.ts.net origin")
+    from venuschat_v1.config_store import normalize_team_origin
+    origin = normalize_team_origin(origin)
     team = value.get("team")
     user = value.get("user")
     if not isinstance(team, dict) or not isinstance(user, dict):
@@ -51,35 +45,17 @@ def _read_transfer(path: Path) -> dict:
             or not user.get("id") or user.get("role") != "admin"
             or not value.get("device_id") or not value.get("device_token")):
         raise ValueError("Transfer is missing admin device information")
-    value["origin"] = f"https://{host}"
+    value["origin"] = origin
     return value
 
 
 def _verify_remote_device(origin: str, token: str) -> tuple[int, dict]:
-    request = urllib.request.Request(
-        origin + "/api/v1/team/me",
-        headers={"Accept": "application/json", "X-Team-Device-Token": token},
-        method="GET",
-    )
-    opener = urllib.request.build_opener(
-        NoRedirectHandler(), urllib.request.ProxyHandler({})
-    )
-    try:
-        with opener.open(request, timeout=12) as response:
-            status = response.status
-            body = response.read(64 * 1024)
-    except urllib.error.HTTPError as exc:
-        status = exc.code
-        body = exc.read(64 * 1024)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError("Could not verify this device through Tailscale HTTPS") from exc
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError("Hub returned invalid verification data") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Hub returned an unexpected verification response")
-    return status, payload
+    from venuschat_v1.api_client import ApiClient
+    client = ApiClient(origin, token=token, token_header="X-Team-Device-Token",
+                       use_default_token=False, deny_redirects=True,
+                       password=os.environ.get("VENUS_SERVER_PASSWORD"),
+                       ca_file=os.environ.get("VENUS_TLS_CA_FILE"))
+    return client.get("/api/v1/team/me", timeout=12)
 
 
 def main() -> int:
@@ -112,9 +88,14 @@ def main() -> int:
                 or returned_user.get("role") != "admin"
                 or returned_team.get("team_id") != team.get("team_id")
                 or returned_device.get("id") != transfer.get("device_id")):
-            print("ERROR: Hub rejected the device token or Tailscale identity. No credentials were imported.", file=sys.stderr)
+            print("ERROR: Hub rejected the device token or connection password. No credentials were imported.", file=sys.stderr)
             return 1
 
+        if "VENUS_SERVER_PASSWORD" in os.environ or "VENUS_TLS_CA_FILE" in os.environ:
+            from venuschat_v1.connection_store import save_connection
+            password = os.environ.get("VENUS_SERVER_PASSWORD", "")
+            save_connection(transfer["origin"], password_enabled=bool(password), password=password,
+                            ca_file=os.environ.get("VENUS_TLS_CA_FILE", ""))
         save_team_connection({
             "origin": transfer["origin"],
             "team_id": str(team["team_id"]),

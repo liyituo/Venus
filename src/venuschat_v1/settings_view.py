@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from . import theme as t
 from .api_client import ApiClient, installation_code_confirmation
+from .connection_dialog import ConnectionDialog
 from .config_store import (
     clear_team_device_token,
     delete_team_claim_secret,
@@ -98,7 +99,7 @@ PAGE_META = {
     "integrations": ("MCP 与浏览器", "查看外部工具连接与浏览器状态"),
     "extensions": ("扩展", "管理本地扩展、Skill 与工具资产"),
     "diagnostics": ("诊断与用量", "查看运行健康、上下文与 Token 用量"),
-    "advanced": ("高级", "配置本地服务地址"),
+    "advanced": ("高级", "配置本地或远程服务器地址"),
     "team": ("团队与成员", "邀请成员、申请加入、管理设备和查看信任状态"),
     "projects": ("项目中心", "管理当前 Hub 的项目、认领、邀请与成员授权"),
 }
@@ -230,7 +231,7 @@ GENERIC_PAGES = {
             "本地服务地址；保存后写入 chat_config.json。",
             (
                 ("field", "Desktop URL", "http://127.0.0.1:8000", "本地地址"),
-                ("field", "Agent URL", "http://127.0.0.1:8001", "本地地址"),
+                ("field", "Agent URL", "http://127.0.0.1:8001", "本地或远程地址"),
             ),
         ),
     ),
@@ -399,6 +400,9 @@ class SettingsView(tk.Frame):
         self._needs_reload = True
 
     def _build_sidebar(self) -> None:
+        FlatButton(self.sidebar, "连接服务器 · TLS / 密码",
+                   lambda: ConnectionDialog(self.app), font=self.fonts.small,
+                   variant="outline", parent_bg=t.SIDEBAR).pack(fill="x", padx=t.s(24), pady=t.s(12))
         tk.Label(
             self.sidebar,
             text="设置中心",
@@ -1267,7 +1271,7 @@ class SettingsView(tk.Frame):
         last_origin = str(last[-1].get("origin") or "") if last and isinstance(last[-1], dict) else ""
 
         section, body = self._section(
-            page, "连接 Hub", "先核对 Hub 和可信网络身份，再申请、审批并领取此 Hub 的设备凭证。")
+            page, "连接 Hub", "本地和远程均使用地址与端口连接；加入团队后领取独立设备凭证。")
         self._team_status_label = tk.Label(
             body, text="状态：仅本机可用 · 尚未连接 Hub", bg=t.CANVAS, fg=t.INK_MUTED,
             font=self.fonts.body_medium, anchor="w")
@@ -1291,8 +1295,9 @@ class SettingsView(tk.Frame):
             bg=t.CANVAS, fg=t.INK_SOFT,
             font=self.fonts.small, anchor="w", justify="left", wraplength=t.s(900))
         self._team_hub_label.pack(fill="x", pady=(0, t.s(7)))
-        self._team_field(body, "Hub HTTPS 地址", last_origin,
-                         "https://hub.example.ts.net")
+        self._team_field(body, "Hub 地址", last_origin,
+                         "http://192.168.1.10:8001")
+        self._team_button_row(body, (("配置地址、TLS 与密码", self._configure_team_connection, "outline"),))
         self._team_button_row(body, (("复制本机安装码", self.copy_installation_code, "outline"),))
         primary, _refresh = self._team_button_row(body, (
             ("核对 Hub", self._team_primary_action, "primary"),
@@ -1310,15 +1315,15 @@ class SettingsView(tk.Frame):
         section, body = self._section(
             page, "Hub 本机初始化", "仅在 Hub 电脑使用；启动凭证从本机 secure_store 读取，不显示给受邀成员。")
         self._team_field(body, "团队名称", "", "例如 Venus 产品组")
-        self._team_field(body, "管理员 Tailscale 登录名", "", "必须与当前 Serve 身份一致")
+        self._team_field(body, "管理员账号", "", "团队内唯一的账号标识")
         self._team_field(body, "管理员显示名", "", "团队内显示名")
-        self._team_field(body, "Hub 本机地址", "http://127.0.0.1:8001", "仅 loopback HTTP")
+        self._team_field(body, "Hub 本机地址", "http://127.0.0.1:8001", "仅本机地址，HTTP 或 HTTPS")
         self._team_button_row(body, (("在本机初始化团队", self._bootstrap_team, "outline"),))
         self._finish_section(section)
 
         section, body = self._section(
             page, "管理员邀请与申请审核", "邀请码有效 24 小时且仅能使用一次。明文只在创建后弹窗显示一次。")
-        self._team_field(body, "受邀 Tailscale 登录名", "", "例如 member@example.com")
+        self._team_field(body, "受邀成员账号", "", "例如 member@example.com")
         role_row = self._row_shell(body, "邀请角色")
         role = SelectField(role_row, ("member", "admin"), font=self.fonts.body,
                            value="member")
@@ -1352,7 +1357,7 @@ class SettingsView(tk.Frame):
                              placeholder=placeholder, show="•" if secret else "")
         field.grid(row=0, column=1, sticky="ew")
         self._team_fields[label] = field
-        if label == "Hub HTTPS 地址":
+        if label == "Hub 地址":
             field.variable.trace_add("write", lambda *_args: self._clear_team_hub_confirmation())
         return field
 
@@ -1388,9 +1393,19 @@ class SettingsView(tk.Frame):
         field = self._team_fields.get(label)
         return str(field.get()).strip() if field is not None else ""
 
+    def _configure_team_connection(self) -> None:
+        try:
+            base = self._team_origin()
+        except ValueError:
+            base = "http://127.0.0.1:8001"
+        def connected(origin, info):
+            self._team_fields["Hub 地址"].set(origin)
+            self._check_team_hub()
+        ConnectionDialog(self.app, base, on_connected=connected)
+
     def _team_origin(self) -> str:
         try:
-            return normalize_team_origin(self._team_value("Hub HTTPS 地址"))
+            return normalize_team_origin(self._team_value("Hub 地址"))
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -1515,7 +1530,7 @@ class SettingsView(tk.Frame):
         self._team_hub_label.configure(
             text=(f"Hub：{origin or '尚未核对'}\n"
                   f"团队：{team.get('team_name') or '—'} · team_id：{team.get('team_id') or record.get('team_id') or '—'}\n"
-                  f"可信网络身份：{trusted_identity} · 用户：{user_text}\n"
+                  f"连接方式：{team.get('connection_mode') or trusted_identity} · 用户：{user_text}\n"
                   f"本机安装码（VI，公开标识）：{code_text}\n"
                   f"申请绑定状态：{binding_text}\n"
                   f"此 Hub 终端码（VN）：{display_text}\n"
@@ -1564,7 +1579,7 @@ class SettingsView(tk.Frame):
                 return
             try:
                 origin = normalize_team_origin(str(connections[-1].get("origin") or ""))
-                self._team_fields["Hub HTTPS 地址"].set(origin)
+                self._team_fields["Hub 地址"].set(origin)
             except Exception:
                 self._set_team_status("未连接")
                 return
@@ -1575,6 +1590,9 @@ class SettingsView(tk.Frame):
                 return {"origin": origin, "public_code": pub_code, "public": public}
             record = team_connection(origin, str(public.get("team_id") or ""))
             if record and record.get("application_id") and not record.get("device_id"):
+                client = ApiClient(origin, token=team_claim_secret(origin, record["application_id"]),
+                                   token_header="X-Team-Claim-Secret", use_default_token=False,
+                                   deny_redirects=True)
                 code, status = client.get(
                     f"/api/v1/team/join-requests/{record['application_id']}", timeout=8)
                 return {"origin": origin, "public_code": pub_code, "public": public,
@@ -1635,7 +1653,7 @@ class SettingsView(tk.Frame):
             installation_code = str(saved.get("installation_code") or "")
         else:
             installation_code = self._installation_code
-        prompt = (f"确认把加入申请发送到此 HTTPS Hub？\n\n"
+        prompt = (f"确认把加入申请发送到此 Hub？\n\n"
                   f"团队：{team.get('team_name') or '未知'}\n"
                   f"team_id：{team.get('team_id') or '未知'}\n"
                   f"地址：{origin}\n"
@@ -1770,7 +1788,7 @@ class SettingsView(tk.Frame):
             self.app.toast(str(exc), duration=4200)
             return
         name = self._team_value("团队名称")
-        login = self._team_value("管理员 Tailscale 登录名").casefold()
+        login = self._team_value("管理员账号").casefold()
         admin_name = self._team_value("管理员显示名")
         if not name or not login or not admin_name:
             self.app.toast("请填写团队名、管理员登录名和显示名")
@@ -1781,11 +1799,11 @@ class SettingsView(tk.Frame):
         if actual_login and login != actual_login:
             self.app.toast(f"管理员登录名与 Serve 身份不符：当前身份是 {actual_login}", duration=5000)
             return
-        if not local_base.startswith("http://") or urlparse(local_base).hostname not in {"127.0.0.1", "localhost", "::1"}:
-            self.app.toast("初始化接口必须使用 Hub 本机 HTTP loopback 地址")
+        if urlparse(local_base).hostname not in {"127.0.0.1", "localhost", "::1"}:
+            self.app.toast("初始化接口必须使用 Hub 本机地址")
             return
         identity_note = (f"本机 Serve 身份：{actual_login}" if actual_login
-                         else "Serve 未返回本机身份；请再次确认登录名拼写正确")
+                         else "直连模式：请确认管理员账号标识")
         if not messagebox.askyesno("初始化 Venus 团队",
                                    f"将在此 Hub 创建一次性团队：\n{name}\n{origin}\n管理员：{login}\n{identity_note}",
                                    parent=self):
@@ -1804,9 +1822,12 @@ class SettingsView(tk.Frame):
             local_code, local_info = local_check.get("/api/v1/team/public", timeout=6)
             expected_host = (urlparse(origin).hostname or "").casefold()
             if (local_code != 200 or local_info.get("initialized") is not False
-                    or str(local_info.get("serve_host") or "").casefold() != expected_host):
+                    or (local_info.get("connection_mode") == "direct"
+                        and local_info.get("instance_id") != (confirmed.get("team") or {}).get("instance_id"))
+                    or (local_info.get("connection_mode") != "direct"
+                        and str(local_info.get("serve_host") or "").casefold() != expected_host)):
                 return {"code": 409, "data": {"detail":
-                        "本机后端不是此 HTTPS Hub 的未初始化 Serve 实例；未发送启动凭证"},
+                        "本机后端不是可初始化的 Hub；未发送启动凭证"},
                         "origin": origin}
             code, data = local.post("/api/v1/team/bootstrap", {
                 "team_name": name, "admin_login": login,
@@ -1844,10 +1865,10 @@ class SettingsView(tk.Frame):
         if not record:
             self.app.toast("请先加入并连接此团队")
             return
-        login = self._team_value("受邀 Tailscale 登录名")
+        login = self._team_value("受邀成员账号")
         role = self._team_value("邀请角色") or "member"
         if not login:
-            self.app.toast("请填写受邀人的 Tailscale 登录名")
+            self.app.toast("请填写受邀成员账号")
             return
         def work():
             client = self._team_member_client(origin, str(record.get("team_id") or ""))
@@ -2014,17 +2035,19 @@ class SettingsView(tk.Frame):
     def _friendly_team_error(code: int, data: dict) -> str:
         detail = str(data.get("detail") or "") if isinstance(data, dict) else ""
         if code == 0:
-            return "无法连接 Hub，请检查 Tailscale 在线状态和 HTTPS 地址"
+            return "无法连接 Hub，请检查地址、端口和 TLS 证书设置"
         if code in (301, 302, 303, 307, 308):
-            return "Hub 地址发生跳转，已阻止凭证跨源发送；请使用管理员提供的 HTTPS 地址"
+            return "Hub 地址发生跳转，已阻止凭证跨源发送；请使用管理员提供的服务器地址"
         if code == 401:
             if "成员已停用" in detail:
                 return "已停用：请联系管理员重新邀请"
+            if "连接密码" in detail:
+                return "连接密码错误，请在连接设置中更新密码"
             if "Tailscale" in detail or "身份" in detail:
-                return "当前 Tailscale 登录身份与此团队成员不匹配"
+                return "当前身份与此团队成员不匹配"
             return "凭证失效或申请尚未授权，请刷新状态或联系管理员"
         if code == 403 and ("登录名" in detail or "身份" in detail):
-            return "身份不匹配：邀请码指定的 Tailscale 登录名与当前账号不同"
+            return "身份不匹配：邀请码与当前成员不匹配"
         if code == 410:
             return detail or "邀请码或设备领取已过期/使用"
         if code == 429:
@@ -2429,7 +2452,7 @@ class SettingsView(tk.Frame):
             return "POST", "/api/v1/workspace", {"path": get("默认工作区")}
         if page == "advanced":
             return "LOCAL", "", {"daemon_base": self._valid_url(get("Desktop URL"), "Desktop URL", local=True),
-                                   "llm_base": self._valid_url(get("Agent URL"), "Agent URL", local=True)}
+                                   "llm_base": self._valid_url(get("Agent URL"), "Agent URL")}
         raise ValueError("当前页面没有可保存的设置")
 
     def _handle_save_result(self, payload) -> None:

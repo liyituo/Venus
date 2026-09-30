@@ -269,6 +269,9 @@ class VenusChatV1:
         current = self.client.base.rstrip("/")
         if self._team_backend_origin and current == self._team_backend_origin:
             target = self._personal_backend_base
+            if not target:
+                self.toast("本机 8001 已用于团队 Hub，请先配置独立的个人服务器地址", duration=5000)
+                return
             label = "个人对话"
         elif self._team_backend_origin:
             target = self._team_backend_origin

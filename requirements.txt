@@ -7,3 +7,4 @@ pynput>=1.7.6   # 可选：紧急止停全局热键（Ctrl+Alt+Shift+X），不�
 fastmcp==3.4.6
 mcp==1.29.0
 pydantic-settings
+cryptography  # 可选 TLS 的自签名证书生成工具

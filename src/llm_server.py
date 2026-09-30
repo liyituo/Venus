@@ -20,6 +20,7 @@ LLM API 后端 — 把 Chat 前端的聊天请求转发到任意 OpenAI 兼容�
 from __future__ import annotations
 
 import argparse
+import base64
 import asyncio
 import contextvars
 import difflib
@@ -80,6 +81,7 @@ import agent_jobs as _agent_jobs  # noqa: E402
 import schedule_store as _schedules  # noqa: E402
 import plan_store as _plans  # noqa: E402
 from dispatch_router import analyze_dispatch  # noqa: E402
+from direct_connection import PasswordGate, PASSWORD_HEADER, normalize_origin
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -342,6 +344,10 @@ class ConfirmModeRequest(BaseModel):
 ISOLATED = False
 TEAM_SERVE_MODE = False
 TEAM_SERVE_HOST = ""
+DIRECT_MODE = False  # Set by the command-line entry point; legacy imports keep their contract.
+DIRECT_ALLOWED_HOSTS: set[str] = set()
+CONNECTION_PASSWORD = PasswordGate()
+CONNECTION_INSTANCE = uuid.uuid4().hex
 
 # ---- 文件/系统工具安全限制 ----
 MAX_FILE_SIZE = 200_000      # read_file 单文件上限（字节）
@@ -1145,14 +1151,14 @@ def _require_team_admin(request: Request) -> dict:
 @app.get("/api/v1/team/public", summary="查看 Hub 团队名称与 team_id")
 async def team_public_info(request: Request) -> dict:
     if not TEAM_SERVE_MODE:
-        raise HTTPException(404, "Hub 未启用 Tailscale Serve 入队模式")
+        raise HTTPException(404, "此服务未启用团队模式")
     if not team_enrollment.is_initialized():
         return {"ok": True, "initialized": False, "team_id": "", "team_name": "",
-                "serve_host": TEAM_SERVE_HOST,
+                "serve_host": TEAM_SERVE_HOST, "connection_mode": "direct" if DIRECT_MODE else "tailscale_serve", "instance_id": CONNECTION_INSTANCE,
                 "tailscale_login": _trusted_login(request)}
     return {"ok": True, "initialized": True,
             **_enrollment_call(team_enrollment.public_team),
-            "serve_host": TEAM_SERVE_HOST,
+            "serve_host": TEAM_SERVE_HOST, "connection_mode": "direct" if DIRECT_MODE else "tailscale_serve", "instance_id": CONNECTION_INSTANCE,
             "tailscale_login": _trusted_login(request)}
 
 
@@ -1161,7 +1167,7 @@ async def team_bootstrap(req: TeamBootstrapRequest, request: Request) -> dict:
     peer = str(getattr(getattr(request, "client", None), "host", "") or "")
     host = request.headers.get("host", "")
     if not TEAM_SERVE_MODE or not ISOLATED:
-        raise HTTPException(403, "团队初始化仅支持 --isolated --team-serve Hub")
+        raise HTTPException(403, "团队初始化需要以 --team 启动 Hub")
     if not _is_loopback(peer) or not _is_loopback(host):
         raise HTTPException(403, "团队只能从 Hub 本机初始化")
     credential = request.headers.get("X-Team-Bootstrap-Token", "")
@@ -1175,16 +1181,20 @@ async def team_bootstrap(req: TeamBootstrapRequest, request: Request) -> dict:
 
 @app.post("/api/v1/team/join/preview", summary="核对邀请码归属与 Tailscale 身份")
 async def team_join_preview(req: TeamJoinPreviewRequest, request: Request) -> dict:
+    login = (_enrollment_call(team_enrollment.direct_invite_login, req.invite_code)
+             if DIRECT_MODE else _trusted_login(request))
     return {"ok": True, **_enrollment_call(
         team_enrollment.preview_invite, code=req.invite_code,
-        tailscale_login=_trusted_login(request))}
+        tailscale_login=login)}
 
 
 @app.post("/api/v1/team/join-requests", summary="提交团队加入申请")
 async def team_join_request(req: TeamJoinRequest, request: Request) -> dict:
+    login = (_enrollment_call(team_enrollment.direct_invite_login, req.invite_code)
+             if DIRECT_MODE else _trusted_login(request))
     result = _enrollment_call(
         team_enrollment.submit_application, code=req.invite_code,
-        tailscale_login=_trusted_login(request), display_name=req.display_name,
+        tailscale_login=login, display_name=req.display_name,
         device_name=req.device_name, claim_secret=req.claim_secret,
         request_id=req.request_id, installation_code=req.installation_code)
     return {"ok": True, **result}
@@ -1193,18 +1203,23 @@ async def team_join_request(req: TeamJoinRequest, request: Request) -> dict:
 @app.get("/api/v1/team/join-requests/{application_id}",
          summary="申请人查询自己的加入状态")
 async def team_join_status(application_id: str, request: Request) -> dict:
+    login = (_enrollment_call(team_enrollment.direct_application_login, application_id,
+                              request.headers.get("X-Team-Claim-Secret", ""))
+             if DIRECT_MODE else _trusted_login(request))
     return {"ok": True, **_enrollment_call(
         team_enrollment.application_status, application_id,
-        tailscale_login=_trusted_login(request))}
+        tailscale_login=login)}
 
 
 @app.post("/api/v1/team/join-requests/{application_id}/claim",
           summary="申请人一次性领取已批准的设备凭证")
 async def team_join_claim(application_id: str, req: TeamClaimRequest,
                            request: Request) -> dict:
+    login = (_enrollment_call(team_enrollment.direct_application_login, application_id,
+                              req.claim_secret) if DIRECT_MODE else _trusted_login(request))
     result = _enrollment_call(
         team_enrollment.claim_device, application_id,
-        tailscale_login=_trusted_login(request), claim_secret=req.claim_secret,
+        tailscale_login=login, claim_secret=req.claim_secret,
         installation_code=req.installation_code)
     return {"ok": True, **result}
 
@@ -1461,6 +1476,27 @@ def _trusted_serve_login(request: Request) -> str:
     return value.casefold()
 
 
+def _direct_host_allowed(request: Request) -> bool:
+    """Accept literal IPs/configured DNS; browser origins must match exactly."""
+    raw = request.headers.get("host", "")
+    try:
+        origin = normalize_origin(f"{request.url.scheme}://{raw}", default_port=None)
+        host = _parse_host_header(raw)
+        try:
+            literal = not ipaddress.ip_address(host).is_unspecified
+        except ValueError:
+            literal = False
+        if not (literal or host in _LOOPBACK_HOSTS or host in DIRECT_ALLOWED_HOSTS
+                or (_test_peer(str(getattr(request.client, "host", ""))) and host == "testserver")):
+            return False
+        browser_origin = request.headers.get("origin")
+        if browser_origin and normalize_origin(browser_origin, default_port=None) != origin:
+            return False
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _team_serve_api_allowed(method: str, path: str) -> bool:
     """Keep a shared Hub's legacy machine-wide APIs off the team surface.
 
@@ -1491,6 +1527,10 @@ async def host_guard(request, call_next):
     - --isolated 下可选放行 Tailscale tailnet 地址，且必须配置精确 Hub Host 或使用 tailnet IP；
     - 远程请求随后仍须通过团队成员 token 鉴权。
     """
+    if DIRECT_MODE:
+        if not _direct_host_allowed(request):
+            return JSONResponse(status_code=403, content={"detail": "服务器地址或 Origin 未获允许"})
+        return await call_next(request)
     peer = str(getattr(getattr(request, "client", None), "host", "") or "")
     request_host = _parse_host_header(request.headers.get("host", ""))
     test_peer = _test_peer(peer)
@@ -1572,12 +1612,26 @@ async def log_requests(request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request, call_next):
+    if DIRECT_MODE:
+        if not _direct_host_allowed(request):
+            return JSONResponse(status_code=403, content={"detail": "服务器地址或 Origin 未获允许"})
+        peer = str(getattr(request.client, "host", "") or "")
+        try:
+            supplied = base64.b64decode(request.headers.get(PASSWORD_HEADER, ""),
+                                       validate=True).decode("utf-8")
+        except (ValueError, UnicodeError):
+            supplied = ""
+        status = await asyncio.to_thread(CONNECTION_PASSWORD.check, supplied, peer)
+        if status != 200:
+            return JSONResponse(status_code=status, content={"detail": (
+                "密码尝试过于频繁，请稍后重试" if status == 429 else "需要正确的连接密码")})
     if TEAM_SERVE_MODE:
         peer = str(getattr(getattr(request, "client", None), "host", "") or "")
         host = _parse_host_header(request.headers.get("host", ""))
         local_peer = _is_loopback(peer) or _test_peer(peer)
         is_bootstrap = request.url.path == "/api/v1/team/bootstrap"
-        is_public = request.method == "GET" and request.url.path == "/api/v1/team/public"
+        is_public = request.method == "GET" and (request.url.path == "/api/v1/team/public"
+                    or (DIRECT_MODE and request.url.path == "/api/v1/ready"))
         is_preview = request.method == "POST" and request.url.path == "/api/v1/team/join/preview"
         is_join_post = request.method == "POST" and request.url.path == "/api/v1/team/join-requests"
         is_join_status = (request.method == "GET" and
@@ -1595,6 +1649,12 @@ async def auth_middleware(request, call_next):
             request.state.trusted_tailscale_login = _trusted_serve_login(request)
             return await call_next(request)
         if is_preview or is_join_post or is_join_status or is_claim:
+            if DIRECT_MODE:
+                try:
+                    team_enrollment._check_join_rate_limit("direct:" + peer)
+                except team_enrollment.EnrollmentError as exc:
+                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+                return await call_next(request)
             login = _trusted_serve_login(request)
             if not login:
                 return JSONResponse(status_code=401,
@@ -1604,16 +1664,17 @@ async def auth_middleware(request, call_next):
         if not team_enrollment.is_initialized():
             return JSONResponse(status_code=401,
                                 content={"detail": "Hub 尚未初始化团队"})
-        login = _trusted_serve_login(request)
+        login = "" if DIRECT_MODE else _trusted_serve_login(request)
         token = request.headers.get("X-Team-Device-Token", "")
-        user, auth_detail = team_enrollment.authenticate_device_result(token, login)
+        user, auth_detail = team_enrollment.authenticate_device_result(
+            token, login, require_network_identity=not DIRECT_MODE)
         if not user:
             return JSONResponse(status_code=401,
                                 content={"detail": auth_detail})
         request.state.trusted_tailscale_login = login
         request.state.user = user
         local_hub_admin = (str(user.get("role") or "").lower() == "admin"
-                           and not login)
+                           and local_peer and host in _LOOPBACK_HOSTS and not login)
         if (not _team_serve_api_allowed(request.method, request.url.path)
                 and not local_hub_admin):
             return JSONResponse(status_code=403,
@@ -1621,7 +1682,7 @@ async def auth_middleware(request, call_next):
         return await call_next(request)
 
     peer = str(getattr(getattr(request, "client", None), "host", "") or "")
-    if _is_tailnet_ip(peer):
+    if not DIRECT_MODE and _is_tailnet_ip(peer):
         raw_team_token = (request.headers.get("X-User-Token", "")
                           or request.headers.get("X-Api-Token", ""))
         if not team_collab.match_token(raw_team_token):
@@ -3460,7 +3521,10 @@ async def set_workspace(req: WorkspaceUpdate) -> dict:
 
 @app.get("/api/v1/ready", summary="LLM 后端轻量就绪检查")
 async def ready() -> dict:
-    return {"ok": True, "service": "venus-llm", "version": APP_VERSION}
+    return {"ok": True, "service": "venus-llm", "version": APP_VERSION,
+            "mode": "team" if TEAM_SERVE_MODE else "personal",
+            "connection_mode": "direct" if DIRECT_MODE else "legacy",
+            "password_required": CONNECTION_PASSWORD.enabled}
 
 
 @app.get("/api/v1/health", summary="LLM 后端健康检查")
@@ -8513,12 +8577,10 @@ def _extract_reply(data: dict) -> str:
 _agent_jobs.set_job_handler(_execute_agent_job)
 
 
-if __name__ == "__main__":
-    import uvicorn
-
+def build_server_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LLM Backend")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="监听地址；Linux 虚拟机等远程访问时用 0.0.0.0")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="监听地址，默认 0.0.0.0；仅本机使用可设 127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--token", default="",
                         help="启用 token 鉴权（远程访问时强烈建议设置）")
@@ -8528,7 +8590,44 @@ if __name__ == "__main__":
                         help="启用单团队 Tailscale Serve 身份代理模式（必须同时使用 --isolated）")
     parser.add_argument("--team-host", default="",
                         help="Tailscale Serve 的精确 HTTPS 主机名，例如 hub.example.ts.net")
+    parser.add_argument("--team", action="store_true", help="启用直连团队 Hub（自动隔离执行）")
+    parser.add_argument("--password", action="store_true", help="启动时交互输入连接密码")
+    parser.add_argument("--password-env", default="VENUS_SERVER_PASSWORD",
+                        help="从指定环境变量读取可选连接密码，未设置则不启用")
+    parser.add_argument("--tls-cert", default="", help="可选 TLS PEM 证书")
+    parser.add_argument("--tls-key", default="", help="TLS PEM 私钥，必须与证书一起设置")
+    parser.add_argument("--public-host", action="append", default=[],
+                        help="允许的访问域名，可重复指定；直接通过 IP 访问无需设置")
+    return parser
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import getpass
+    import ssl
+
+    parser = build_server_parser()
     args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("端口须为 1–65535")
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("TLS 证书和私钥必须一起设置")
+    if args.team and args.team_serve:
+        parser.error("--team 与旧 --team-serve 不能同时使用")
+    if args.tls_cert:
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(args.tls_cert, args.tls_key)
+        except (OSError, ssl.SSLError):
+            parser.error("无法加载 TLS 证书或私钥")
+    direct_password = (getpass.getpass("连接密码：") if args.password
+                       else os.environ.get(args.password_env, ""))
+    if args.password and not direct_password:
+        parser.error("已选择密码认证，密码不能为空")
+    if len(direct_password) > 1024:
+        parser.error("连接密码过长")
+    if not args.team_serve and (args.team or team_enrollment.is_initialized()):
+        args.team = True
+        args.isolated = True
     team_host = str(args.team_host or "").strip().lower()
     if args.team_serve:
         if not args.isolated:
@@ -8541,17 +8640,13 @@ if __name__ == "__main__":
                 not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", team_host) or
                 ".." in team_host):
             parser.error("--team-host 须是精确的 Tailscale HTTPS 域名（*.ts.net）")
-    elif team_enrollment.is_initialized():
-        parser.error("此 Hub 已初始化团队，必须使用 --isolated --team-serve --team-host")
-    # 安全要求：绑定非回环地址时必须提供 token（否则拒绝启动）
-    if not _is_loopback(args.host) and not args.token:
-        print(f"错误：绑定非回环地址（{args.host}）时必须提供 --token 鉴权，"
-              f"否则任何局域网内主机都能控制本机。\n"
-              f"请加 --token <随机字符串> 后重试，或改回 127.0.0.1。")
-        sys.exit(1)
     AUTH_TOKEN = args.token   # 模块级赋值即修改全局
     ISOLATED = args.isolated
-    TEAM_SERVE_MODE = args.team_serve
+    DIRECT_MODE = not args.team_serve
+    DIRECT_ALLOWED_HOSTS = {host.strip().lower() for host in args.public_host if host.strip()}
+    CONNECTION_PASSWORD = PasswordGate(direct_password if DIRECT_MODE else "")
+    del direct_password
+    TEAM_SERVE_MODE = args.team or args.team_serve
     TEAM_SERVE_HOST = team_host if args.team_serve else ""
     if TEAM_SERVE_MODE:
         try:
@@ -8589,8 +8684,13 @@ if __name__ == "__main__":
     # Windows（含 Mirrored 共享网络栈的 WSL）上 TIME_WAIT 连接会阻止 bind：
     # 预绑定 socket 并设 SO_REUSEADDR，避免旧进程退出后端口短暂不可用
     import socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(socket.AF_INET6 if ":" in args.host else socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.host, args.port))
     sock.listen(2048)
-    uvicorn.Server(uvicorn.Config(app, log_level="info")).run(sockets=[sock])
+    log.info("监听 %s:%s · TLS=%s · 连接密码=%s · 团队=%s", args.host, args.port,
+             bool(args.tls_cert), CONNECTION_PASSWORD.enabled, TEAM_SERVE_MODE)
+    uvicorn.Server(uvicorn.Config(
+        app, log_level="info", proxy_headers=False,
+        ssl_certfile=args.tls_cert or None, ssl_keyfile=args.tls_key or None,
+    )).run(sockets=[sock])

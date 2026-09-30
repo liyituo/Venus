@@ -1,4 +1,4 @@
-﻿param(
+﻿﻿param(
     [switch]$InstallShortcut,
     [switch]$NoLaunch
 )
@@ -9,7 +9,6 @@ $pythonExe = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $pythonwExe = Join-Path $repoRoot '.venv\Scripts\pythonw.exe'
 $guiModule = Join-Path $repoRoot 'src\venuschat_v1\__main__.py'
 $probeFile = Join-Path $PSScriptRoot 'probe_venus_backend.py'
-$launcherConfig = Join-Path $repoRoot 'chat_config.json'
 $launcherScript = Join-Path $PSScriptRoot 'Start-VenusChat.ps1'
 $iconFile = Join-Path $repoRoot 'assets\venuschat.ico'
 $markerFile = Join-Path $repoRoot '.venus\venuschat-gui.json'
@@ -66,12 +65,6 @@ public static class VenusWindow {
     }
 }
 
-function Get-LocalBackendState([string]$baseUrl) {
-    & $pythonExe $probeFile --base $baseUrl --timeout 2 *> $null
-    if ($LASTEXITCODE -eq 0) { return 'ready' }
-    if ($LASTEXITCODE -eq 1) { return 'down' }
-    return 'other'
-}
 
 try {
     if (-not (Test-Path -LiteralPath $guiModule) -or
@@ -103,25 +96,7 @@ try {
         exit 0
     }
 
-    $localPort = 8001
-    if (Test-Path -LiteralPath $launcherConfig) {
-        try {
-            $cfg = Get-Content -Raw -LiteralPath $launcherConfig | ConvertFrom-Json
-            if (([string]$cfg.team_hub_local_base).TrimEnd('/') -eq 'http://127.0.0.1:8001') {
-                $localPort = 8002
-            } elseif ([string]$cfg.llm_base -match '^http://(?:127\.0\.0\.1|localhost):(\d+)$') {
-                $localPort = [int]$Matches[1]
-            } elseif ([string]$cfg.personal_llm_base -match '^http://(?:127\.0\.0\.1|localhost):(\d+)$') {
-                $localPort = [int]$Matches[1]
-            }
-        } catch { }
-    }
-    $env:VENUS_STARTUP_LOCAL_BASE = "http://127.0.0.1:$localPort"
-    $env:VENUS_STARTUP_LOCAL_STATE = Get-LocalBackendState $env:VENUS_STARTUP_LOCAL_BASE
-    if ($env:VENUS_STARTUP_LOCAL_STATE -ne 'ready') {
-        Write-Host '本机后端不可用；VenusChat 将在窗口内提供连接选项。'
-    }
-
+    # The GUI probes its selected local/remote connection, including TLS and password.
     Write-Host '打开 VenusChat…'
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $guiStdout = Join-Path $logDir 'gui.out.log'

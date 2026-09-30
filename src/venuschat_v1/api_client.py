@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import base64
+import ssl
 import threading
 import urllib.error
 import urllib.request
 from typing import Any, Callable
 
 from .config_store import llm_base, team_token_for_base, token_for_base
+from .connection_store import connection_password, tls_context
+from direct_connection import PASSWORD_HEADER
 
 
 def installation_code_confirmation(data: dict, expected_code: str = "") -> tuple[str, bool]:
@@ -35,16 +39,32 @@ class _DenyRedirectHandler(urllib.request.HTTPRedirectHandler):
 class ApiClient:
     def __init__(self, base: str | None = None, *, token: str | None = None,
                  token_header: str | None = None, use_default_token: bool = True,
-                 deny_redirects: bool = False) -> None:
+                 deny_redirects: bool = False, password: str | None = None,
+                 ca_file: str | None = None) -> None:
         self.base = (base or llm_base()).rstrip("/")
         self._explicit_token = token
         self._explicit_token_header = token_header
         self._use_default_token = use_default_token
         self._deny_redirects = deny_redirects
-        self._no_redirect_opener = urllib.request.build_opener(_DenyRedirectHandler())
+        self._connection_password = password
+        self._transport_error = None
+        handlers = [_DenyRedirectHandler()]
+        if self.base.startswith("https://"):
+            try:
+                context = (tls_context(self.base) if ca_file is None
+                           else ssl.create_default_context(cafile=ca_file or None))
+                handlers.append(urllib.request.HTTPSHandler(context=context))
+            except (OSError, ValueError) as exc:
+                # A moved/deleted CA file must leave the settings UI usable.
+                self._transport_error = f"TLS 信任证书无法加载：{exc}"
+        self._no_redirect_opener = urllib.request.build_opener(*handlers)
 
     def _headers(self) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
+        password = (connection_password(self.base) if self._connection_password is None
+                    else self._connection_password)
+        if password:
+            h[PASSWORD_HEADER] = base64.b64encode(password.encode("utf-8")).decode("ascii")
         if self._explicit_token_header:
             if self._explicit_token:
                 h[self._explicit_token_header] = self._explicit_token
@@ -62,10 +82,10 @@ class ApiClient:
         return h
 
     def open(self, request: urllib.request.Request, *, timeout: float):
-        is_team_origin, _token = team_token_for_base(self.base)
-        if self._deny_redirects or is_team_origin:
-            return self._no_redirect_opener.open(request, timeout=timeout)
-        return urllib.request.urlopen(request, timeout=timeout)
+        # A connection is always bound to its configured origin, including SSE.
+        if self._transport_error:
+            raise ValueError(self._transport_error)
+        return self._no_redirect_opener.open(request, timeout=timeout)
 
     def request(
         self,

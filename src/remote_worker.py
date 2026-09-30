@@ -1,6 +1,6 @@
 """Opt-in Windows Remote Worker client.
 
-The process makes outbound HTTPS requests to an already configured Hub and
+The process makes outbound HTTP(S) requests to an already configured Hub and
 does not listen on a port. The local grant contains scope only; the existing
 Hub device token remains in ``secure_store`` and is never put in arguments,
 worker grant files, or diagnostic output.
@@ -23,7 +23,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 from data_paths import data_dir
 
@@ -68,20 +67,12 @@ def canonical_args_digest(args: dict) -> str:
 
 
 def _normalize_https_origin(origin: str) -> str:
+    """Compatibility name; Worker now shares the HTTP(S) connection policy."""
     from venuschat_v1.config_store import normalize_team_origin
-    raw = str(origin or "").strip()
-    parsed = urlsplit(raw)
-    if (parsed.scheme.lower() != "https" or not parsed.hostname
-            or parsed.username or parsed.password or parsed.query or parsed.fragment
-            or parsed.path not in ("", "/")):
-        raise RemoteWorkerError("Worker 只接受已配置的 HTTPS Hub origin")
     try:
-        normalized = normalize_team_origin(raw)
-    except Exception as exc:
+        return normalize_team_origin(str(origin or "").strip())
+    except ValueError as exc:
         raise RemoteWorkerError("Hub origin 无效") from exc
-    if not normalized.startswith("https://"):
-        raise RemoteWorkerError("Worker 不会向 HTTP Hub 发送设备凭证")
-    return normalized
 
 
 def _read_grants(path: Path | None = None) -> list[dict]:
@@ -249,7 +240,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HubClient:
-    """Small HTTPS client with proxy and redirect handling disabled."""
+    """HTTP(S) client using the desktop connection password and trust settings."""
 
     def __init__(self, origin: str, token: str, *, timeout: float = 10):
         self.origin = _normalize_https_origin(origin)
@@ -257,17 +248,25 @@ class HubClient:
         if not self._token:
             raise RemoteWorkerError("Hub 设备凭证不可用")
         self.timeout = max(1.0, min(float(timeout), 30.0))
-        self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect())
+        from venuschat_v1.connection_store import tls_context
+        handlers = [urllib.request.ProxyHandler({}), _NoRedirect()]
+        if self.origin.startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(context=tls_context(self.origin)))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def request(self, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
         if not path.startswith("/api/v1/worker/"):
             raise RemoteWorkerError("拒绝请求 Worker API 以外的 Hub 路径")
         body = None if payload is None else _canonical_json(payload).encode("utf-8")
+        import base64
+        from direct_connection import PASSWORD_HEADER
+        from venuschat_v1.connection_store import connection_password
+        headers = {"Content-Type": "application/json", "X-Team-Device-Token": self._token}
+        password = connection_password(self.origin)
+        if password:
+            headers[PASSWORD_HEADER] = base64.b64encode(password.encode("utf-8")).decode("ascii")
         req = urllib.request.Request(
-            self.origin + path, data=body, method=method.upper(),
-            headers={"Content-Type": "application/json",
-                     "X-Team-Device-Token": self._token})
+            self.origin + path, data=body, method=method.upper(), headers=headers)
         try:
             with self._opener.open(req, timeout=self.timeout) as response:
                 raw = response.read(_MAX_READ_BYTES + 1)

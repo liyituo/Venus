@@ -142,7 +142,7 @@ class ProjectHubWindow(tk.Toplevel):
         content = self.body.inner
 
         section, body = self._section(content, "连接与终端身份")
-        self.origin_field = self._field(body, "Hub HTTPS 地址", origin,
+        self.origin_field = self._field(body, "Hub 地址", origin,
                                         "https://hub.example.ts.net")
         self.status = tk.Label(body, text="尚未刷新", bg=t.CANVAS,
                                fg=t.INK_MUTED, font=fonts.body, anchor="w")
@@ -1333,7 +1333,7 @@ class ProjectHubWindow(tk.Toplevel):
     def _friendly_error(code: int, data: dict) -> str:
         detail = str((data or {}).get("detail") or "") if isinstance(data, dict) else ""
         if code == 0:
-            return f"无法连接 Hub：{detail or '检查 Tailscale 在线状态和 HTTPS 地址'}"
+            return f"无法连接 Hub：{detail or '检查服务器地址、端口和 TLS 设置'}"
         if code == 401:
             return "Hub 设备凭证失效或本机尚未注册；请在“团队与成员”中连接并注册本机。"
         if code == 403:
@@ -1347,7 +1347,7 @@ class ProjectHubWindow(tk.Toplevel):
         if code == 429:
             return detail or "认领尝试次数已达上限，请联系项目创建者。"
         if code in (301, 302, 303, 307, 308):
-            return "Hub 地址发生跳转，已阻止凭证跨源发送；请使用正确的 HTTPS 地址。"
+            return "Hub 地址发生跳转，已阻止凭证跨源发送；请使用正确的服务器地址。"
         return detail or f"Hub 请求失败（HTTP {code}）。"
 
     def destroy(self) -> None:

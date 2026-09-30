@@ -8,7 +8,6 @@ import sys
 import threading
 import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = _REPO_ROOT / "chat_config.json"
@@ -117,7 +116,7 @@ def personal_backend_for_team(origin: str, previous: str = "",
         value = str(candidate or "").rstrip("/")
         if value and value not in hub_origins:
             return value
-    fallback = ("http://127.0.0.1:8002"
+    fallback = (""
                 if local_hub == "http://127.0.0.1:8001"
                 else "http://127.0.0.1:8001")
     return fallback
@@ -212,24 +211,10 @@ def token_for_base(base_url: str) -> str:
 
 
 def normalize_team_origin(value: str, *, allow_loopback_http: bool = True) -> str:
-    raw = str(value or "").strip().rstrip("/")
-    parsed = urlparse(raw)
-    if (parsed.scheme not in ("https", "http") or not parsed.hostname
-            or parsed.username or parsed.password or parsed.query or parsed.fragment
-            or parsed.path not in ("", "/")):
-        raise ValueError("Hub 地址必须是纯 HTTPS origin，例如 https://hub.example.ts.net")
-    host = parsed.hostname.casefold()
-    loopback = host in {"127.0.0.1", "localhost", "::1"}
-    if parsed.scheme != "https" and not (allow_loopback_http and loopback):
-        raise ValueError("远程团队 Hub 必须使用 HTTPS；HTTP 仅允许 127.0.0.1 / localhost")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Hub 地址端口无效") from exc
-    netloc = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    if port:
-        netloc += f":{port}"
-    return f"{parsed.scheme.casefold()}://{netloc}"
+    from direct_connection import normalize_origin
+    # Preserve explicit historical origins for stored credentials; bare hosts
+    # use the same 8001 default as the new connection dialog.
+    return normalize_origin(value, default_port=None if "://" in value else 8001)
 
 
 def _team_secret_key(origin: str, team_id: str) -> str:

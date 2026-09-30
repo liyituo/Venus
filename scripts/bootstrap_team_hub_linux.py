@@ -9,6 +9,10 @@ for encrypted transfer to the administrator's private Venus terminal.
 
 from __future__ import annotations
 
+import argparse
+import base64
+import getpass
+import ssl
 import json
 import os
 import sys
@@ -21,6 +25,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ORIGIN = "http://127.0.0.1:8001"
+LOCAL_CA_FILE = ""
 PUBLIC_PATH = "/api/v1/team/public"
 BOOTSTRAP_PATH = "/api/v1/team/bootstrap"
 TRANSFER_DIR = Path.home() / ".local" / "state" / "venus-hub"
@@ -37,6 +42,9 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def _request(path: str, *, payload: dict[str, Any] | None = None,
              credential: str = "") -> tuple[int, dict[str, Any]]:
     headers = {"Accept": "application/json"}
+    password = os.environ.get("VENUS_SERVER_PASSWORD", "")
+    if password:
+        headers["X-Venus-Password"] = base64.b64encode(password.encode()).decode()
     data = None
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -47,7 +55,10 @@ def _request(path: str, *, payload: dict[str, Any] | None = None,
         LOCAL_ORIGIN + path, data=data, headers=headers,
         method="POST" if payload is not None else "GET",
     )
-    opener = urllib.request.build_opener(NoRedirectHandler(), urllib.request.ProxyHandler({}))
+    handlers = [NoRedirectHandler(), urllib.request.ProxyHandler({})]
+    if LOCAL_ORIGIN.startswith("https://"):
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=LOCAL_CA_FILE or None)))
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(request, timeout=10) as response:
             status = response.status
@@ -88,6 +99,21 @@ def _write_transfer(fd: int, payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    global LOCAL_ORIGIN, LOCAL_CA_FILE
+    from direct_connection import normalize_origin
+    from urllib.parse import urlsplit
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--origin", default="", help="客户端访问的服务器地址，默认端口 8001")
+    parser.add_argument("--local-base", default=LOCAL_ORIGIN)
+    parser.add_argument("--ca-file", default="")
+    parser.add_argument("--password", action="store_true")
+    args = parser.parse_args()
+    LOCAL_ORIGIN = normalize_origin(args.local_base)
+    LOCAL_CA_FILE = args.ca_file
+    if urlsplit(LOCAL_ORIGIN).hostname not in {"127.0.0.1", "localhost", "::1"}:
+        parser.error("初始化必须连接 Hub 本机地址")
+    if args.password:
+        os.environ["VENUS_SERVER_PASSWORD"] = getpass.getpass("Connection password: ")
     if os.name != "posix" or not hasattr(os, "geteuid"):
         print("ERROR: This bootstrap helper is for Linux only.", file=sys.stderr)
         return 1
@@ -99,26 +125,24 @@ def main() -> int:
     pending_path: Path | None = None
     try:
         from team_enrollment import bootstrap_credential_local, normalize_login
-        from team_hub_linux import resolve_host
-
-        host = resolve_host(None)
+        origin = normalize_origin(args.origin or input("Public server IP or URL: "))
         status, public_info = _request(PUBLIC_PATH)
         if status != 200 or public_info.get("ok") is not True:
             raise RuntimeError("The local Hub health endpoint is unavailable")
-        if public_info.get("serve_host") != host:
-            raise RuntimeError("The local Hub host does not match this Tailscale node")
+        if public_info.get("connection_mode") != "direct":
+            raise RuntimeError("Start the Hub with --team for direct enrollment")
         if public_info.get("initialized") is True:
             raise RuntimeError("This Hub is already initialized; bootstrap is one-time")
         if public_info.get("initialized") is not False:
             raise RuntimeError("The local Hub did not report an uninitialized state")
 
         team_name = input("Team name: ").strip()
-        admin_login = input("Admin Tailscale login (email): ").strip().casefold()
+        admin_login = input("Admin account label: ").strip().casefold()
         admin_name = input("Admin display name: ").strip()
         if not team_name or len(team_name) > 100:
             raise RuntimeError("Team name must be 1–100 characters")
         if not normalize_login(admin_login):
-            raise RuntimeError("Enter a valid Tailscale login")
+            raise RuntimeError("Enter a valid member account label")
         if not admin_name or len(admin_name) > 80:
             raise RuntimeError("Admin display name must be 1–80 characters")
 
@@ -170,7 +194,7 @@ def main() -> int:
             )
         transfer = {
             "format": "venus-team-admin-transfer-v1",
-            "origin": f"https://{host}",
+            "origin": origin,
             "team": {
                 "team_id": str(team.get("team_id") or ""),
                 "team_name": str(team.get("team_name") or team.get("name") or team_name),
